@@ -1,27 +1,44 @@
-name: Pump scan
+name: Telegram Pump Bot 24/7
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
-  workflow_dispatch:
+    # Автоперезапуск каждые 5 часов для поддержания непрерывной работы 24/7
+    - cron: "0 */5 * * *"
+  workflow_dispatch: # Ручной запуск кнопкой "Run workflow"
+
+concurrency:
+  group: telegram-pump-bot
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
-  scan:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 330 # 5.5 часов непрерывной работы (лимит одной задачи GitHub — 6 часов)
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Run Pump Scan (Oneshot)
+      - name: Run Telegram Bot 24/7
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MIN_SCORE: "62"
-          NOTIFY_EMPTY: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
-        run: python pump_bot.py --oneshot
+          RUN_MODE: bot
+        run: python pump_bot.py --bot
+
+      - name: Save portfolio state
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add bot_state.json
+          git diff --staged --quiet || (git commit -m "Auto-save bot state [skip ci]" && git push)
