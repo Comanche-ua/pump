@@ -683,7 +683,19 @@ def load_state() -> dict:
         print(f"Не удалось прочитать {STATE_FILE}: {e}", file=sys.stderr)
     return d
 
-def save_state(state: dict) -> None:
+def _git_sync_state() -> None:
+    """Фоновая фиксация изменений состояния в репозиторий GitHub при работе в CI."""
+    try:
+        import subprocess
+        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], capture_output=True, timeout=5)
+        subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], capture_output=True, timeout=5)
+        subprocess.run(["git", "add", STATE_FILE], capture_output=True, timeout=5)
+        subprocess.run(["git", "commit", "-m", "Auto-update portfolio [skip ci]"], capture_output=True, timeout=5)
+        subprocess.run(["git", "push"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+def save_state(state: dict, sync_git: bool = False) -> None:
     with STATE_LOCK:
         # Очищаем устаревшие алерты (старше 24ч)
         cutoff = int(time.time()) - 86400
@@ -696,6 +708,9 @@ def save_state(state: dict) -> None:
             os.replace(tmp, STATE_FILE)
         except Exception as e:
             print(f"Не удалось сохранить {STATE_FILE}: {e}", file=sys.stderr)
+
+        if sync_git and os.environ.get("GITHUB_ACTIONS") == "true":
+            threading.Thread(target=_git_sync_state, daemon=True).start()
 
 def normalize_symbol(raw: str) -> str:
     s = raw.strip().upper().replace(" ", "").replace("/", "")
@@ -737,14 +752,14 @@ def portfolio_add(state: dict, symbol: str, qty: float, price: float) -> Tuple[f
     else:
         new_qty, new_avg = qty, price
         state["portfolio"][symbol] = {"qty": qty, "avg_price": price, "added_at": int(time.time())}
-    save_state(state)
+    save_state(state, sync_git=True)
     return new_qty, new_avg
 
 def portfolio_remove(state: dict, symbol: str) -> bool:
     symbol = normalize_symbol(symbol)
     if symbol in state["portfolio"]:
         state["portfolio"].pop(symbol, None)
-        save_state(state)
+        save_state(state, sync_git=True)
         return True
     return False
 
@@ -1252,10 +1267,12 @@ def autoscan_worker(token: str, stop_event: threading.Event) -> None:
             # Список чатов для оповещения
             env_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
             target_chats: Set[str] = set()
-            if env_chat:
+            if env_chat and (env_chat.lstrip("-").isdigit() or env_chat.startswith("@")):
                 target_chats.add(env_chat)
             for c in state.get("allowed_chats", []):
-                target_chats.add(str(c))
+                cid_str = str(c).strip()
+                if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
+                    target_chats.add(cid_str)
 
             for sig in active_signals:
                 if sig.alert_key in sent_alerts:
@@ -1847,9 +1864,13 @@ def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
         sent_alerts: dict = state.setdefault("sent_alerts", {})
         sent_count = 0
 
-        target_chats: Set[str] = {chat_id}
+        target_chats: Set[str] = set()
+        if chat_id and (chat_id.lstrip("-").isdigit() or chat_id.startswith("@")):
+            target_chats.add(chat_id)
         for c in state.get("allowed_chats", []):
-            target_chats.add(str(c))
+            cid_str = str(c).strip()
+            if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
+                target_chats.add(cid_str)
 
         for sig in active_signals:
             if sig.alert_key in sent_alerts:
