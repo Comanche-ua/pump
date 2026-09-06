@@ -1,0 +1,14 @@
+{
+  "portfolio": {},
+  "settings": {
+    "min_score": 62.0,
+    "min_quote_volume": 1500000.0,
+    "autoscan": true,
+    "scan_interval_sec": 300,
+    "filter_level": "strong_and_watch"
+  },
+  "sent_alerts": {},
+  "allowed_chats": [
+    "12345"
+  ]
+}

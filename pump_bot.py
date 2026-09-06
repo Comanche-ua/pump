@@ -998,6 +998,17 @@ def send_telegram(
     body = api_call(token, "sendMessage", payload)
     if body.get("ok"):
         return body["result"]["message_id"]
+
+    # Если Telegram жалуется на HTML-разметку (например некорректный тег) - шлем чистым текстом
+    err_desc = body.get("description", "")
+    if "parse entities" in err_desc.lower():
+        payload.pop("parse_mode", None)
+        body = api_call(token, "sendMessage", payload)
+        if body.get("ok"):
+            return body["result"]["message_id"]
+
+    if err_desc and "blocked by the user" not in err_desc.lower():
+        print(f"⚠️ Ошибка sendMessage в chat {chat_id}: {err_desc}", file=sys.stderr)
     return None
 
 def edit_message(
@@ -1018,7 +1029,15 @@ def edit_message(
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     body = api_call(token, "editMessageText", payload)
-    return bool(body.get("ok"))
+    if body.get("ok"):
+        return True
+
+    err_desc = body.get("description", "")
+    if "parse entities" in err_desc.lower():
+        payload.pop("parse_mode", None)
+        body = api_call(token, "editMessageText", payload)
+        return bool(body.get("ok"))
+    return False
 
 def answer_callback(token: str, callback_id: str, text: Optional[str] = None, show_alert: bool = False) -> bool:
     payload: Dict[str, Any] = {"callback_query_id": callback_id}
@@ -1040,13 +1059,21 @@ def set_bot_commands(token: str) -> bool:
     res = api_call(token, "setMyCommands", {"commands": commands})
     return bool(res.get("ok"))
 
-def get_updates(token: str, offset: int, timeout: int = 20) -> List[dict]:
-    body = api_call(token, "getUpdates", {
-        "offset": offset,
-        "timeout": timeout,
-        "allowed_updates": ["message", "callback_query"],
-    }, timeout=timeout + 5)
-    return body.get("result", []) if body.get("ok") else []
+def get_updates(token: str, offset: int, timeout: int = 15) -> List[dict]:
+    payload: Dict[str, Any] = {"timeout": timeout}
+    if offset > 0:
+        payload["offset"] = offset
+    body = api_call(token, "getUpdates", payload, timeout=timeout + 10)
+    if not body.get("ok"):
+        desc = body.get("description", "")
+        if desc:
+            if "conflict" in desc.lower():
+                print(f"⚠️ Telegram webhook активен! Сбрасываю webhook для режима polling...", file=sys.stderr)
+                api_call(token, "deleteWebhook", {"drop_pending_updates": False})
+            else:
+                print(f"⚠️ Ошибка getUpdates: {desc}", file=sys.stderr)
+        return []
+    return body.get("result", [])
 
 def format_alert(sig: PumpSignal) -> str:
     tf = next((t for t in sig.by_tf if t.timeframe == sig.best_tf), sig.by_tf[0])
@@ -1249,20 +1276,20 @@ def run_bot(token: str) -> None:
     scan_thread = threading.Thread(target=autoscan_worker, args=(token, stop_event), daemon=True)
     scan_thread.start()
 
+    # Сбрасываем старый webhook при старте, чтобы getUpdates гарантированно работал
+    api_call(token, "deleteWebhook", {"drop_pending_updates": False})
+
     # FSM context: chat_id -> {"state": str, "data": dict}
     user_fsm: Dict[str, dict] = {}
-    last_offset = drop_pending_updates(token)
+    last_offset = 0
 
     print("Бот успешно запущен. Ожидание входящих сообщений (long polling)...")
 
     def is_authorized(chat_id_str: str) -> bool:
-        if not primary_chat and not allowed_env and not state["allowed_chats"]:
-            return True
-        return (
-            chat_id_str == primary_chat
-            or chat_id_str in allowed_env
-            or chat_id_str in state["allowed_chats"]
-        )
+        # Если задан явный белый список TELEGRAM_ALLOWED_CHATS, то проверяем его
+        if allowed_env:
+            return chat_id_str in allowed_env or (primary_chat and chat_id_str == primary_chat)
+        return True
 
     try:
         while True:
@@ -1279,6 +1306,8 @@ def run_bot(token: str) -> None:
                     msg = cb.get("message", {})
                     chat_id = str(msg.get("chat", {}).get("id", sender.get("id", "")))
                     msg_id = msg.get("message_id")
+                    user_tag = sender.get("username") or sender.get("first_name") or chat_id
+                    print(f"🔘 [Callback @{user_tag} ({chat_id})]: {cb_data}")
 
                     if not is_authorized(chat_id):
                         answer_callback(token, cb_id, "Доступ ограничен.", show_alert=True)
@@ -1429,14 +1458,17 @@ def run_bot(token: str) -> None:
                 msg = upd["message"]
                 text = msg.get("text", "").strip()
                 chat_id = str(msg["chat"]["id"])
+                sender = msg.get("from", {})
+                user_tag = sender.get("username") or sender.get("first_name") or chat_id
+                print(f"📩 [Message @{user_tag} ({chat_id})]: {text}")
 
-                # Автоматическая регистрация chat_id при первом /start
-                if text.startswith("/start"):
-                    if chat_id not in state["allowed_chats"]:
-                        state["allowed_chats"].append(chat_id)
-                        save_state(state)
+                # Автоматически регистрируем chat_id для получения алертов автоскана
+                if chat_id not in state["allowed_chats"]:
+                    state["allowed_chats"].append(chat_id)
+                    save_state(state)
 
                 if not is_authorized(chat_id):
+                    print(f"⛔ Доступ запрещён для {chat_id}")
                     send_telegram(
                         token,
                         chat_id,
@@ -1444,9 +1476,14 @@ def run_bot(token: str) -> None:
                     )
                     continue
 
+                clean_text = text.strip()
+                cmd = clean_text.split()[0].lower().split("@")[0] if clean_text else ""
+                text_lower = clean_text.lower()
+
                 # Обработка отмены в любом состоянии
-                if text in ("❌ Отмена", "/cancel"):
+                if cmd == "/cancel" or "отмена" in text_lower:
                     user_fsm.pop(chat_id, None)
+                    print(f"-> Отмена действия для {chat_id}")
                     send_telegram(
                         token,
                         chat_id,
@@ -1567,7 +1604,8 @@ def run_bot(token: str) -> None:
                         continue
 
                 # ── Основные команды и Reply-кнопки ──
-                if text in ("/start", "start"):
+                if cmd == "/start" or text_lower in ("/start", "start"):
+                    print(f"-> Отправка приветствия для {chat_id}")
                     welcome_text = (
                         "👋 <b>Добро пожаловать в Pump Pulse Scanner 2.0!</b>\n\n"
                         "Я непрерывно сканирую спотовый рынок Binance на предмет зарождения "
@@ -1577,27 +1615,55 @@ def run_bot(token: str) -> None:
                     )
                     send_telegram(token, chat_id, welcome_text, reply_markup=main_keyboard())
 
-                elif text in ("🔍 Скан сейчас", "/scan"):
+                elif cmd == "/scan" or "скан" in text_lower:
+                    print(f"-> Запуск ручного сканирования для {chat_id}")
                     execute_scan_and_report(token, chat_id, state)
 
-                elif text in ("💼 Портфель", "/portfolio"):
+                elif cmd in ("/portfolio", "/port") or "портфель" in text_lower:
+                    print(f"-> Отправка портфеля для {chat_id}")
                     port_text = format_portfolio(state)
                     send_telegram(token, chat_id, port_text, reply_markup=portfolio_inline_kb())
 
-                elif text in ("➕ Добавить актив", "/add"):
-                    user_fsm[chat_id] = {"state": "waiting_portfolio_input", "data": {}}
-                    prompt_text = (
-                        "➕ <b>Добавление актива в портфель</b>\n\n"
-                        "Отправьте тикер, количество и цену (опционально):\n"
-                        "<code>ТИКЕР КОЛИЧЕСТВО [ЦЕНА]</code>\n\n"
-                        "<b>Примеры:</b>\n"
-                        "• <code>SOL 2.5 140.5</code> — 2.5 SOL по $140.5\n"
-                        "• <code>BTC 0.05</code> — текущая цена возьмётся с Binance!\n\n"
-                        "Или нажмите <b>«❌ Отмена»</b>."
-                    )
-                    send_telegram(token, chat_id, prompt_text, reply_markup=cancel_keyboard())
+                elif cmd == "/add" or "добавить" in text_lower:
+                    args = clean_text.split()[1:]
+                    if len(args) >= 2:
+                        raw_sym = args[0].upper()
+                        sym = normalize_symbol(raw_sym)
+                        try:
+                            qty = float(args[1])
+                            price = float(args[2]) if len(args) >= 3 else (get_price(sym) or 0.0)
+                            if qty <= 0 or price <= 0:
+                                raise ValueError
+                            new_qty, new_avg = portfolio_add(state, sym, qty, price)
+                            print(f"-> Добавлен актив {sym} для {chat_id}")
+                            send_telegram(
+                                token,
+                                chat_id,
+                                f"✅ <b>Актив {base_asset(sym)} успешно добавлен!</b>\n\n"
+                                f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
+                                f"• Вход: <code>{fmt_price(new_avg)} USDT</code>\n"
+                                f"• Сумма позиции: <code>{(new_qty * new_avg):,.2f} USDT</code>",
+                                reply_markup=main_keyboard(),
+                            )
+                            send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
+                        except Exception:
+                            send_telegram(token, chat_id, "⚠️ Ошибка формата. Пример: <code>/add SOL 2.5 140.5</code>", reply_markup=main_keyboard())
+                    else:
+                        print(f"-> Диалог добавления актива для {chat_id}")
+                        user_fsm[chat_id] = {"state": "waiting_portfolio_input", "data": {}}
+                        prompt_text = (
+                            "➕ <b>Добавление актива в портфель</b>\n\n"
+                            "Отправьте тикер, количество и цену (опционально):\n"
+                            "<code>ТИКЕР КОЛИЧЕСТВО [ЦЕНА]</code>\n\n"
+                            "<b>Примеры:</b>\n"
+                            "• <code>SOL 2.5 140.5</code> — 2.5 SOL по $140.5\n"
+                            "• <code>BTC 0.05</code> — текущая цена возьмётся с Binance!\n\n"
+                            "Или нажмите <b>«❌ Отмена»</b>."
+                        )
+                        send_telegram(token, chat_id, prompt_text, reply_markup=cancel_keyboard())
 
-                elif text in ("🗑 Удалить актив", "/del"):
+                elif cmd in ("/del", "/delete") or "удалить" in text_lower:
+                    print(f"-> Диалог удаления для {chat_id}")
                     del_kb = remove_asset_inline_kb(state)
                     if del_kb:
                         send_telegram(
@@ -1614,7 +1680,8 @@ def run_bot(token: str) -> None:
                             reply_markup=main_keyboard(),
                         )
 
-                elif text in ("⚙️ Настройки", "/settings"):
+                elif cmd == "/settings" or "настройк" in text_lower:
+                    print(f"-> Открытие настроек для {chat_id}")
                     send_telegram(
                         token,
                         chat_id,
@@ -1622,12 +1689,13 @@ def run_bot(token: str) -> None:
                         reply_markup=settings_inline_kb(state),
                     )
 
-                elif text in ("ℹ️ Помощь", "/help"):
+                elif cmd == "/help" or "помощь" in text_lower or "справка" in text_lower:
+                    print(f"-> Отправка справки для {chat_id}")
                     send_telegram(token, chat_id, HELP_TEXT, reply_markup=main_keyboard())
 
                 else:
-                    # Если отправлен тикер (например SOL или BTCUSDT), выдаем по нему мини-инфо
-                    cand_sym = normalize_symbol(text)
+                    print(f"-> Запрос инфо по тикеру: {clean_text}")
+                    cand_sym = normalize_symbol(clean_text)
                     pr = get_price(cand_sym)
                     if pr is not None:
                         base = base_asset(cand_sym)
