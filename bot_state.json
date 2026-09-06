@@ -5,8 +5,17 @@
     "min_quote_volume": 1500000.0,
     "autoscan": true,
     "scan_interval_sec": 300,
-    "filter_level": "strong_and_watch"
+    "filter_level": "strong_and_watch",
+    "auto_trade": false,
+    "trade_amount_usdt": 11.0,
+    "take_profit_pct": 3.0,
+    "max_open_trades": 3,
+    "trade_min_score": 74.0
   },
+  "active_trades": {},
+  "trade_history": [],
   "sent_alerts": {},
-  "allowed_chats": []
+  "allowed_chats": [
+    "1920596593"
+  ]
 }
