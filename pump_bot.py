@@ -874,11 +874,12 @@ def binance_signed_request(
     except Exception as e:
         return {"error": str(e)}
 
-def get_spot_balances(state: Optional[dict] = None) -> Dict[str, float]:
-    """Возвращает словарь свободных спотовых балансов {актив: свободный_объем}."""
+def get_spot_balances(state: Optional[dict] = None) -> Tuple[Dict[str, float], Optional[str]]:
+    """Возвращает (словарь_балансов, текст_ошибки_если_есть)."""
     res = binance_signed_request("GET", "/api/v3/account", state=state)
     if "error" in res or "balances" not in res:
-        return {}
+        err_msg = res.get("error", "Неизвестная ошибка")
+        return {}, str(err_msg)
     balances: Dict[str, float] = {}
     for b in res["balances"]:
         free = float(b.get("free", 0))
@@ -886,11 +887,11 @@ def get_spot_balances(state: Optional[dict] = None) -> Dict[str, float]:
         total = free + locked
         if total > 0.000001:
             balances[b["asset"]] = free
-    return balances
+    return balances, None
 
 def get_free_usdt_balance(state: Optional[dict] = None) -> float:
     """Возвращает свободный баланс USDT на спотовом кошельке Binance."""
-    balances = get_spot_balances(state=state)
+    balances, _ = get_spot_balances(state=state)
     return balances.get("USDT", 0.0)
 
 _symbol_filters_cache: Dict[str, dict] = {}
@@ -1984,25 +1985,37 @@ def run_bot(token: str) -> None:
                     edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data == "trade:balance":
-                free_usdt = get_free_usdt_balance(state)
-                bals = get_spot_balances(state)
-                if not bals and free_usdt == 0.0:
+                bals, err = get_spot_balances(state)
+                free_usdt = bals.get("USDT", 0.0)
+                if err or (not bals and free_usdt == 0.0):
                     api_k, api_s = get_api_credentials(state)
                     if not api_k or not api_s:
                         answer_callback(token, cb_id, "Ключи Binance не настроены!", show_alert=True)
                         send_telegram(
                             token,
                             chat_id,
-                            "⚠️ <b>Ключи Binance API не настроены.</b>\n\n"
-                            "Укажите их в <code>.env</code> или отправьте команду:\n"
+                            "⚠️ <b>Ключи Binance API ещё не настроены.</b>\n\n"
+                            "Чтобы бот мог проверять баланс и торговать, отправьте в чат команду:\n"
                             "<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
-                            "<i>(Убедитесь, что включена опция «Включить спотовую и маржинальную торговлю», а вывод заблокирован).</i>",
+                            "Или добавьте их в GitHub Secrets / файл <code>.env</code>:\n"
+                            "<code>BINANCE_API_KEY=...</code>\n"
+                            "<code>BINANCE_API_SECRET=...</code>",
                         )
                     else:
-                        answer_callback(token, cb_id, "Ошибка получения баланса Binance", show_alert=True)
+                        answer_callback(token, cb_id, f"Ошибка: {err or 'нет связи'}", show_alert=True)
+                        send_telegram(
+                            token,
+                            chat_id,
+                            f"❌ <b>Ошибка ответа биржи Binance:</b>\n\n"
+                            f"<code>{err}</code>\n\n"
+                            f"<b>Что проверить:</b>\n"
+                            f"1. Верно ли скопированы API Key и Secret (без пробелов).\n"
+                            f"2. Включена ли галочка <b>«Включить спотовую и маржинальную торговлю»</b> в настройках ключа на Binance.\n"
+                            f"3. Нет ли на ключе ограничения по белому списку IP (IP Access Restriction).",
+                        )
                 else:
                     bal_items = [f"• <b>{k}:</b> {fmt_qty(v)}" for k, v in sorted(bals.items()) if v > 0.0001]
-                    bal_str = "\n".join(bal_items[:12]) if bal_items else "<i>Нет активов с ненулевым остатком</i>"
+                    bal_str = "\n".join(bal_items[:15]) if bal_items else "<i>Нет активов с положительным балансом</i>"
                     answer_callback(token, cb_id, f"Свободно USDT: {free_usdt:,.2f}")
                     send_telegram(
                         token,
@@ -2655,7 +2668,7 @@ def run_test_trade() -> None:
     can_trade = acc.get("canTrade", False)
     print(f"✅ Успешная авторизация! Спотовая торговля разрешена: {'🟢 ДА' if can_trade else '🔴 НЕТ'}")
 
-    bals = get_spot_balances(state)
+    bals, _ = get_spot_balances(state)
     free_usdt = bals.get("USDT", 0.0)
     print(f"• Свободный баланс USDT для сделок: {free_usdt:,.2f} USDT")
 
