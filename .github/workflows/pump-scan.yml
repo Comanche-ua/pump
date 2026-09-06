@@ -16,8 +16,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Восстановление состояния (история алертов, чтобы не спамить дублями)
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: bot_state.json
+          key: pump-bot-state-${{ github.run_id }}
+          restore-keys: |
+            pump-bot-state-
+
       - name: Run scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python pump_bot.py
+          RUN_MODE: "oneshot"
+        run: python pump_bot.py --oneshot
