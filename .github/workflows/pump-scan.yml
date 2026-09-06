@@ -10,24 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Восстановление состояния (история алертов, чтобы не спамить дублями)
-      - name: Restore state cache
-        uses: actions/cache@v4
-        with:
-          path: bot_state.json
-          key: pump-bot-state-${{ github.run_id }}
-          restore-keys: |
-            pump-bot-state-
-
-      - name: Run scan
+      - name: Run Pump Scan (Oneshot)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RUN_MODE: "oneshot"
+          MIN_SCORE: "62"
+          NOTIFY_EMPTY: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: python pump_bot.py --oneshot
