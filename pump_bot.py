@@ -22,6 +22,7 @@ import math
 import json
 import signal
 import threading
+import traceback
 import concurrent.futures as cf
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple, Any, Set
@@ -152,8 +153,10 @@ class PumpSignal:
 
 # ───────────────────────── Formatters ─────────────────────────
 
-def fmt_price(val: float) -> str:
+def fmt_price(val: Optional[float]) -> str:
     """Адаптивное форматирование цены (для BTC и для микро-токенов типа PEPE)."""
+    if val is None:
+        return "—"
     if val == 0:
         return "0.00"
     abs_val = abs(val)
@@ -165,15 +168,19 @@ def fmt_price(val: float) -> str:
         return f"{val:.6f}".rstrip("0").rstrip(".")
     return f"{val:.8f}".rstrip("0").rstrip(".")
 
-def fmt_qty(val: float) -> str:
+def fmt_qty(val: Optional[float]) -> str:
     """Форматирование количества актива без лишних нулей."""
+    if val is None:
+        return "0"
     if val >= 1000:
         return f"{val:,.4f}".rstrip("0").rstrip(".")
     if val >= 1:
         return f"{val:.4f}".rstrip("0").rstrip(".")
     return f"{val:.8f}".rstrip("0").rstrip(".")
 
-def fmt_pct(val: float) -> str:
+def fmt_pct(val: Optional[float]) -> str:
+    if val is None:
+        return "—"
     return f"{val:+.2f}%"
 
 # ───────────────────────── Indicators ─────────────────────────
@@ -815,9 +822,13 @@ def main_keyboard() -> dict:
 
 def cancel_keyboard() -> dict:
     return {
-        "keyboard": [[{"text": "❌ Отмена"}]],
+        "keyboard": [
+            [{"text": "❌ Отмена"}],
+            [{"text": "🔍 Скан сейчас"}, {"text": "💼 Портфель"}],
+            [{"text": "⚙️ Настройки"}, {"text": "ℹ️ Помощь"}],
+        ],
         "resize_keyboard": True,
-        "one_time_keyboard": True,
+        "is_persistent": True,
     }
 
 def portfolio_inline_kb() -> dict:
@@ -827,6 +838,9 @@ def portfolio_inline_kb() -> dict:
                 {"text": "🔄 Обновить цены", "callback_data": "port:refresh"},
                 {"text": "➕ Добавить", "callback_data": "port:add"},
                 {"text": "🗑 Удалить", "callback_data": "port:del"},
+            ],
+            [
+                {"text": "🔙 Вернуть меню кнопок", "callback_data": "menu:main"},
             ]
         ]
     }
@@ -892,6 +906,7 @@ def settings_inline_kb(state: dict) -> dict:
             ],
             [
                 {"text": "🔄 Обновить статус", "callback_data": "settings:refresh"},
+                {"text": "🔙 Вернуть меню кнопок", "callback_data": "menu:main"},
             ]
         ]
     }
@@ -1117,69 +1132,93 @@ def execute_scan_and_report(token: str, chat_id: str | int, state: dict) -> None
         "🔍 <i>Сканирую спотовый рынок Binance (USDT пары)... Пожалуйста, подождите.</i>"
     )
 
-    s = state["settings"]
-    signals, meta, top_candidates = run_scan(
-        min_score=s.get("min_score"),
-        min_quote_volume=s.get("min_quote_volume"),
-    )
-
-    btc_info = meta.get("btc", {})
-    btc_p = btc_info.get("price")
-    btc_c = btc_info.get("change24h")
-    btc_line = f"BTC: {fmt_price(btc_p)} USDT ({fmt_pct(btc_c)})" if btc_p is not None else ""
-
-    filter_level = s.get("filter_level", "strong_and_watch")
-    if filter_level == "strong_only":
-        filtered_signals = [sig for sig in signals if sig.grade == "strong"]
-    else:
-        filtered_signals = [sig for sig in signals if sig.grade in ("strong", "watch")]
-
-    duration_sec = meta["duration_ms"] / 1000.0
-
-    if filtered_signals:
-        summary_text = (
-            f"✅ <b>Сканирование завершено за {duration_sec:.1f}с</b>\n\n"
-            f"• Проверено пар: <code>{meta['universe']}</code>\n"
-            f"• Отобрано кандидатов: <code>{meta['candidates']}</code>\n"
-            f"• Порог Score: <code>{meta['min_score']:.0f}</code>\n"
-            f"• Найдено импульсов: <b>{len(filtered_signals)}</b>\n"
-            f"• Рынок: <i>{btc_line}</i>\n\n"
-            f"Ниже представлены подробные сигналы:"
+    try:
+        s = state["settings"]
+        signals, meta, top_candidates = run_scan(
+            min_score=s.get("min_score"),
+            min_quote_volume=s.get("min_quote_volume"),
         )
-        if status_msg_id:
-            edit_message(token, chat_id, status_msg_id, summary_text)
-        else:
-            send_telegram(token, chat_id, summary_text)
 
-        for sig in filtered_signals[:5]:
-            card_text = format_alert(sig)
-            kb = signal_inline_kb(sig)
-            send_telegram(token, chat_id, card_text, reply_markup=kb)
-            time.sleep(0.15)
-    else:
-        # Если сигналов выше порога нет, показываем ближайших кандидатов (пульс рынка)
-        top_lines = []
-        for i, c in enumerate(top_candidates[:4], 1):
-            top_lines.append(
-                f"{i}. <b>{c['base']}</b> — Score <code>{c['best_score']:.0f}</code> "
-                f"({c['best_tf']}), объём {c['vol_ratio']:.1f}×, 24ч {fmt_pct(c['change_24h'])}"
+        btc_info = meta.get("btc", {})
+        btc_p = btc_info.get("price")
+        btc_c = btc_info.get("change24h")
+        btc_line = f"BTC: {fmt_price(btc_p)} USDT ({fmt_pct(btc_c)})" if btc_p is not None else ""
+
+        filter_level = s.get("filter_level", "strong_and_watch")
+        if filter_level == "strong_only":
+            filtered_signals = [sig for sig in signals if sig.grade == "strong"]
+        else:
+            filtered_signals = [sig for sig in signals if sig.grade in ("strong", "watch")]
+
+        duration_sec = meta["duration_ms"] / 1000.0
+
+        if filtered_signals:
+            summary_text = (
+                f"✅ <b>Сканирование завершено за {duration_sec:.1f}с</b>\n\n"
+                f"• Проверено пар: <code>{meta['universe']}</code>\n"
+                f"• Отобрано кандидатов: <code>{meta['candidates']}</code>\n"
+                f"• Порог Score: <code>{meta['min_score']:.0f}</code>\n"
+                f"• Найдено импульсов: <b>{len(filtered_signals)}</b>\n"
+                f"• Рынок: <i>{btc_line}</i>\n\n"
+                f"Ниже представлены подробные сигналы:"
             )
-        cand_block = "\n".join(top_lines) if top_lines else "<i>Нет данных</i>"
+            if status_msg_id:
+                edit_message(token, chat_id, status_msg_id, summary_text)
+            else:
+                send_telegram(token, chat_id, summary_text)
 
-        report_text = (
-            f"🔍 <b>Результаты сканирования ({duration_sec:.1f}с)</b>\n\n"
-            f"• Проверено спотовых пар: <code>{meta['universe']}</code>\n"
-            f"• Активных кандидатов: <code>{meta['candidates']}</code>\n"
-            f"• Текущий порог сигнала: <code>{meta['min_score']:.0f}</code>\n"
-            f"• Сигналов выше порога: <b>0</b> <i>(рынок спокойный)</i>\n"
-            f"• Рыночный фон: <i>{btc_line}</i>\n\n"
-            f"<b>Ближайшие кандидаты по активности:</b>\n{cand_block}\n\n"
-            f"💡 <i>Совет: если хотите видеть более ранние движения, снизьте MIN_SCORE в Настройках до 55.</i>"
-        )
-        if status_msg_id:
-            edit_message(token, chat_id, status_msg_id, report_text)
+            for sig in filtered_signals[:5]:
+                card_text = format_alert(sig)
+                kb = signal_inline_kb(sig)
+                send_telegram(token, chat_id, card_text, reply_markup=kb)
+                time.sleep(0.15)
+
+            send_telegram(
+                token,
+                chat_id,
+                f"🔘 Найдено импульсов: <b>{len(filtered_signals)}</b>. Главное меню активно:",
+                reply_markup=main_keyboard(),
+            )
         else:
-            send_telegram(token, chat_id, report_text)
+            # Если сигналов выше порога нет, показываем ближайших кандидатов (пульс рынка)
+            top_lines = []
+            for i, c in enumerate(top_candidates[:4], 1):
+                top_lines.append(
+                    f"{i}. <b>{c['base']}</b> — Score <code>{c['best_score']:.0f}</code> "
+                    f"({c['best_tf']}), объём {c['vol_ratio']:.1f}×, 24ч {fmt_pct(c['change_24h'])}"
+                )
+            cand_block = "\n".join(top_lines) if top_lines else "<i>Нет данных</i>"
+
+            report_text = (
+                f"🔍 <b>Результаты сканирования ({duration_sec:.1f}с)</b>\n\n"
+                f"• Проверено спотовых пар: <code>{meta['universe']}</code>\n"
+                f"• Активных кандидатов: <code>{meta['candidates']}</code>\n"
+                f"• Текущий порог сигнала: <code>{meta['min_score']:.0f}</code>\n"
+                f"• Сигналов выше порога: <b>0</b> <i>(рынок спокойный)</i>\n"
+                f"• Рыночный фон: <i>{btc_line}</i>\n\n"
+                f"<b>Ближайшие кандидаты по активности:</b>\n{cand_block}\n\n"
+                f"💡 <i>Совет: если хотите видеть более ранние движения, снизьте MIN_SCORE в Настройках до 55.</i>"
+            )
+            if status_msg_id:
+                edit_message(token, chat_id, status_msg_id, report_text)
+            else:
+                send_telegram(token, chat_id, report_text)
+
+            send_telegram(
+                token,
+                chat_id,
+                "🔘 Сканирование завершено. Главное меню активно:",
+                reply_markup=main_keyboard(),
+            )
+    except Exception as e:
+        print(f"❌ Ошибка сканирования: {e}", file=sys.stderr)
+        traceback.print_exc()
+        send_telegram(
+            token,
+            chat_id,
+            f"⚠️ <b>Ошибка при сканировании рынка:</b>\n<code>{e}</code>\n\nПожалуйста, повторите попытку через минуту.",
+            reply_markup=main_keyboard(),
+        )
 
 # ───────────────────────── Фоновый автоскан ─────────────────────────
 
@@ -1291,427 +1330,484 @@ def run_bot(token: str) -> None:
             return chat_id_str in allowed_env or (primary_chat and chat_id_str == primary_chat)
         return True
 
-    try:
-        while True:
-            updates = get_updates(token, offset=last_offset, timeout=20)
-            for upd in updates:
-                last_offset = upd["update_id"] + 1
+    def handle_update(upd: dict) -> None:
+        nonlocal state
+        # ── 1. Обработка Callback Query (нажатия на Inline-кнопки) ──
+        if "callback_query" in upd:
+            cb = upd["callback_query"]
+            cb_id = cb["id"]
+            cb_data = cb.get("data", "")
+            sender = cb.get("from", {})
+            msg = cb.get("message", {})
+            chat_id = str(msg.get("chat", {}).get("id", sender.get("id", "")))
+            msg_id = msg.get("message_id")
+            user_tag = sender.get("username") or sender.get("first_name") or chat_id
+            print(f"🔘 [Callback @{user_tag} ({chat_id})]: {cb_data}")
 
-                # ── 1. Обработка Callback Query (нажатия на Inline-кнопки) ──
-                if "callback_query" in upd:
-                    cb = upd["callback_query"]
-                    cb_id = cb["id"]
-                    cb_data = cb.get("data", "")
-                    sender = cb.get("from", {})
-                    msg = cb.get("message", {})
-                    chat_id = str(msg.get("chat", {}).get("id", sender.get("id", "")))
-                    msg_id = msg.get("message_id")
-                    user_tag = sender.get("username") or sender.get("first_name") or chat_id
-                    print(f"🔘 [Callback @{user_tag} ({chat_id})]: {cb_data}")
+            if not is_authorized(chat_id):
+                answer_callback(token, cb_id, "Доступ ограничен.", show_alert=True)
+                return
 
-                    if not is_authorized(chat_id):
-                        answer_callback(token, cb_id, "Доступ ограничен.", show_alert=True)
-                        continue
+            state = load_state()
+            settings = state["settings"]
 
-                    state = load_state()
-                    settings = state["settings"]
+            # Изменение порога Score
+            if cb_data == "score:+5":
+                settings["min_score"] = min(95.0, settings["min_score"] + 5)
+                save_state(state)
+                answer_callback(token, cb_id, f"MIN_SCORE: {settings['min_score']:.0f}")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-                    # Изменение порога Score
-                    if cb_data == "score:+5":
-                        settings["min_score"] = min(95.0, settings["min_score"] + 5)
-                        save_state(state)
-                        answer_callback(token, cb_id, f"MIN_SCORE: {settings['min_score']:.0f}")
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            elif cb_data == "score:-5":
+                settings["min_score"] = max(45.0, settings["min_score"] - 5)
+                save_state(state)
+                answer_callback(token, cb_id, f"MIN_SCORE: {settings['min_score']:.0f}")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-                    elif cb_data == "score:-5":
-                        settings["min_score"] = max(45.0, settings["min_score"] - 5)
-                        save_state(state)
-                        answer_callback(token, cb_id, f"MIN_SCORE: {settings['min_score']:.0f}")
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            elif cb_data.startswith("score:set:"):
+                val = float(cb_data.split(":")[-1])
+                settings["min_score"] = val
+                save_state(state)
+                answer_callback(token, cb_id, f"MIN_SCORE установлен на {val:.0f}")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-                    elif cb_data.startswith("score:set:"):
-                        val = float(cb_data.split(":")[-1])
-                        settings["min_score"] = val
-                        save_state(state)
-                        answer_callback(token, cb_id, f"MIN_SCORE установлен на {val:.0f}")
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            elif cb_data == "autoscan:toggle":
+                settings["autoscan"] = not settings.get("autoscan", True)
+                save_state(state)
+                status_str = "включён" if settings["autoscan"] else "выключен"
+                answer_callback(token, cb_id, f"Автоскан {status_str}")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-                    elif cb_data == "autoscan:toggle":
-                        settings["autoscan"] = not settings.get("autoscan", True)
-                        save_state(state)
-                        status_str = "включён" if settings["autoscan"] else "выключен"
-                        answer_callback(token, cb_id, f"Автоскан {status_str}")
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            elif cb_data.startswith("interval:"):
+                sec = int(cb_data.split(":")[-1])
+                settings["scan_interval_sec"] = sec
+                save_state(state)
+                answer_callback(token, cb_id, f"Интервал: {sec // 60} мин")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-                    elif cb_data.startswith("interval:"):
-                        sec = int(cb_data.split(":")[-1])
-                        settings["scan_interval_sec"] = sec
-                        save_state(state)
-                        answer_callback(token, cb_id, f"Интервал: {sec // 60} мин")
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            elif cb_data == "filter:toggle":
+                cur = settings.get("filter_level", "strong_and_watch")
+                settings["filter_level"] = "strong_only" if cur == "strong_and_watch" else "strong_and_watch"
+                save_state(state)
+                mode_str = "Только Strong 🔥" if settings["filter_level"] == "strong_only" else "Strong + Watch ⚡"
+                answer_callback(token, cb_id, f"Фильтр: {mode_str}")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-                    elif cb_data == "filter:toggle":
-                        cur = settings.get("filter_level", "strong_and_watch")
-                        settings["filter_level"] = "strong_only" if cur == "strong_and_watch" else "strong_and_watch"
-                        save_state(state)
-                        mode_str = "Только Strong 🔥" if settings["filter_level"] == "strong_only" else "Strong + Watch ⚡"
-                        answer_callback(token, cb_id, f"Фильтр: {mode_str}")
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            elif cb_data == "settings:refresh":
+                answer_callback(token, cb_id, "Настройки обновлены")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-                    elif cb_data == "settings:refresh":
-                        answer_callback(token, cb_id, "Настройки обновлены")
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            # Управление портфелем через Callback
+            elif cb_data == "port:refresh":
+                answer_callback(token, cb_id, "Цены обновлены")
+                port_text = format_portfolio(state)
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, port_text, reply_markup=portfolio_inline_kb())
 
-                    # Управление портфелем через Callback
-                    elif cb_data == "port:refresh":
-                        answer_callback(token, cb_id, "Цены обновлены")
-                        port_text = format_portfolio(state)
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, port_text, reply_markup=portfolio_inline_kb())
+            elif cb_data == "port:add":
+                answer_callback(token, cb_id)
+                user_fsm[chat_id] = {"state": "waiting_portfolio_input", "data": {}}
+                prompt_text = (
+                    "➕ <b>Добавление актива в портфель</b>\n\n"
+                    "Отправьте сообщение в формате:\n"
+                    "<code>ТИКЕР КОЛИЧЕСТВО [ЦЕНА]</code>\n\n"
+                    "<b>Примеры:</b>\n"
+                    "• <code>SOL 2.5 140.5</code> — 2.5 SOL по $140.5\n"
+                    "• <code>BTC 0.05</code> — 0.05 BTC <i>(цена подставится с биржи автоматически!)</i>\n"
+                    "• <code>PEPE 500000 0.0000115</code>\n\n"
+                    "Для отмены нажмите кнопку <b>«❌ Отмена»</b> ниже."
+                )
+                send_telegram(token, chat_id, prompt_text, reply_markup=cancel_keyboard())
 
-                    elif cb_data == "port:add":
-                        answer_callback(token, cb_id)
-                        user_fsm[chat_id] = {"state": "waiting_portfolio_input", "data": {}}
-                        prompt_text = (
-                            "➕ <b>Добавление актива в портфель</b>\n\n"
-                            "Отправьте сообщение в формате:\n"
-                            "<code>ТИКЕР КОЛИЧЕСТВО [ЦЕНА]</code>\n\n"
-                            "<b>Примеры:</b>\n"
-                            "• <code>SOL 2.5 140.5</code> — 2.5 SOL по $140.5\n"
-                            "• <code>BTC 0.05</code> — 0.05 BTC <i>(цена подставится с биржи автоматически!)</i>\n"
-                            "• <code>PEPE 500000 0.0000115</code>\n\n"
-                            "Для отмены нажмите кнопку <b>«❌ Отмена»</b> ниже."
-                        )
-                        send_telegram(token, chat_id, prompt_text, reply_markup=cancel_keyboard())
-
-                    elif cb_data == "port:del":
-                        del_kb = remove_asset_inline_kb(state)
-                        if del_kb:
-                            answer_callback(token, cb_id)
-                            if msg_id:
-                                edit_message(
-                                    token, chat_id, msg_id,
-                                    "🗑 <b>Выберите актив для удаления из портфеля:</b>",
-                                    reply_markup=del_kb,
-                                )
-                        else:
-                            answer_callback(token, cb_id, "Портфель пуст!", show_alert=True)
-
-                    elif cb_data.startswith("del:"):
-                        sym = cb_data.split(":", 1)[1]
-                        if portfolio_remove(state, sym):
-                            answer_callback(token, cb_id, f"{base_asset(sym)} удалён из портфеля", show_alert=True)
-                        else:
-                            answer_callback(token, cb_id, "Актив не найден.")
-                        port_text = format_portfolio(state)
-                        if msg_id:
-                            edit_message(token, chat_id, msg_id, port_text, reply_markup=portfolio_inline_kb())
-
-                    # Быстрое добавление из карточки сигнала
-                    elif cb_data.startswith("add_coin:"):
-                        parts = cb_data.split(":")
-                        sym = parts[1]
-                        p_val = float(parts[2]) if len(parts) > 2 else (get_price(sym) or 0.0)
-                        user_fsm[chat_id] = {
-                            "state": "waiting_quick_add_qty",
-                            "data": {"symbol": sym, "price": p_val}
-                        }
-                        answer_callback(token, cb_id)
-                        send_telegram(
-                            token,
-                            chat_id,
-                            f"➕ <b>Добавление {base_asset(sym)} в портфель</b>\n\n"
-                            f"Фиксированная цена: <code>{fmt_price(p_val)} USDT</code>\n"
-                            f"Введите желаемое количество монет (например: <code>10</code> или <code>0.5</code>):",
-                            reply_markup=cancel_keyboard(),
-                        )
-
-                    elif cb_data.startswith("factors:"):
-                        parts = cb_data.split(":")
-                        sym = parts[1]
-                        tf = parts[2] if len(parts) > 2 else "15m"
-                        answer_callback(token, cb_id, f"Анализ {base_asset(sym)} ({tf})", show_alert=False)
-                        send_telegram(
-                            token,
-                            chat_id,
-                            f"📊 <b>Детальный разбор индикаторов {base_asset(sym)}/USDT ({tf})</b>\n\n"
-                            f"• Объём vs SMA20: импульс выше среднего\n"
-                            f"• Donchian 20: фиксация пробоя максимумов\n"
-                            f"• Тренд EMA 9/21: бычья структура\n"
-                            f"• Taker Buy Ratio: преобладание покупок по рынку\n"
-                            f"• RSI: в рабочем коридоре без перегрева\n\n"
-                            f"<i>График доступен по кнопкам под сигналом.</i>"
-                        )
-                    continue
-
-                # ── 2. Обработка обычных текстовых сообщений ──
-                if "message" not in upd:
-                    continue
-
-                msg = upd["message"]
-                text = msg.get("text", "").strip()
-                chat_id = str(msg["chat"]["id"])
-                sender = msg.get("from", {})
-                user_tag = sender.get("username") or sender.get("first_name") or chat_id
-                print(f"📩 [Message @{user_tag} ({chat_id})]: {text}")
-
-                # Автоматически регистрируем chat_id для получения алертов автоскана
-                if chat_id not in state["allowed_chats"]:
-                    state["allowed_chats"].append(chat_id)
-                    save_state(state)
-
-                if not is_authorized(chat_id):
-                    print(f"⛔ Доступ запрещён для {chat_id}")
-                    send_telegram(
-                        token,
-                        chat_id,
-                        "⛔ <b>Доступ ограничен.</b> Ваш Chat ID не авторизован для управления ботом.",
-                    )
-                    continue
-
-                clean_text = text.strip()
-                cmd = clean_text.split()[0].lower().split("@")[0] if clean_text else ""
-                text_lower = clean_text.lower()
-
-                # Обработка отмены в любом состоянии
-                if cmd == "/cancel" or "отмена" in text_lower:
-                    user_fsm.pop(chat_id, None)
-                    print(f"-> Отмена действия для {chat_id}")
-                    send_telegram(
-                        token,
-                        chat_id,
-                        "❌ Действие отменено. Главное меню активно.",
-                        reply_markup=main_keyboard(),
-                    )
-                    continue
-
-                # ── Проверка FSM-состояния пользователя ──
-                if chat_id in user_fsm:
-                    fsm = user_fsm[chat_id]
-                    cur_st = fsm.get("state")
-
-                    if cur_st == "waiting_portfolio_input":
-                        # Ожидаем ввод: ТИКЕР КОЛИЧЕСТВО [ЦЕНА]
-                        clean_text = text.replace(",", " ")
-                        tokens = [t.strip() for t in clean_text.split() if t.strip()]
-
-                        if len(tokens) < 2:
-                            send_telegram(
-                                token,
-                                chat_id,
-                                "⚠️ Неверный формат. Введите тикер и количество (и при желании цену входа).\n"
-                                "Пример: <code>SOL 2.5 140.5</code> или <code>BTC 0.05</code>\n\n"
-                                "Для выхода нажмите <b>«❌ Отмена»</b>.",
-                                reply_markup=cancel_keyboard(),
-                            )
-                            continue
-
-                        raw_sym = tokens[0].upper()
-                        sym = normalize_symbol(raw_sym)
-
-                        try:
-                            qty = float(tokens[1])
-                            if qty <= 0:
-                                raise ValueError
-                        except ValueError:
-                            send_telegram(
-                                token,
-                                chat_id,
-                                "⚠️ Ошибка: количество должно быть положительным числом.\nПопробуйте ещё раз:",
-                                reply_markup=cancel_keyboard(),
-                            )
-                            continue
-
-                        if len(tokens) >= 3:
-                            try:
-                                price = float(tokens[2])
-                                if price <= 0:
-                                    raise ValueError
-                            except ValueError:
-                                send_telegram(
-                                    token,
-                                    chat_id,
-                                    "⚠️ Ошибка: цена должна быть положительным числом.\nПопробуйте ещё раз:",
-                                    reply_markup=cancel_keyboard(),
-                                )
-                                continue
-                        else:
-                            # Автоматическое получение текущей цены с Binance
-                            mkt_price = get_price(sym)
-                            if mkt_price is None:
-                                send_telegram(
-                                    token,
-                                    chat_id,
-                                    f"⚠️ Монета <code>{sym}</code> не найдена на споте Binance. "
-                                    f"Проверьте правильность тикера или укажите цену вручную (например: <code>{raw_sym} {qty} 10.5</code>).",
-                                    reply_markup=cancel_keyboard(),
-                                )
-                                continue
-                            price = mkt_price
-
-                        new_qty, new_avg = portfolio_add(state, sym, qty, price)
-                        user_fsm.pop(chat_id, None)
-
-                        send_telegram(
-                            token,
-                            chat_id,
-                            f"✅ <b>Актив успешно сохранён в портфель!</b>\n\n"
-                            f"• Монета: <b>{base_asset(sym)}/USDT</b>\n"
-                            f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
-                            f"• Средняя цена входа: <code>{fmt_price(new_avg)} USDT</code>\n"
-                            f"• Сумма позиции: <code>{(new_qty * new_avg):,.2f} USDT</code>",
-                            reply_markup=main_keyboard(),
-                        )
-                        # Показываем обновленный портфель
-                        send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
-                        continue
-
-                    elif cur_st == "waiting_quick_add_qty":
-                        try:
-                            qty = float(text.replace(",", ".").strip())
-                            if qty <= 0:
-                                raise ValueError
-                        except ValueError:
-                            send_telegram(
-                                token,
-                                chat_id,
-                                "⚠️ Введите корректное положительное число (например, <code>5</code> или <code>0.25</code>):",
-                                reply_markup=cancel_keyboard(),
-                            )
-                            continue
-
-                        sym = fsm["data"]["symbol"]
-                        price = fsm["data"]["price"]
-                        new_qty, new_avg = portfolio_add(state, sym, qty, price)
-                        user_fsm.pop(chat_id, None)
-
-                        send_telegram(
-                            token,
-                            chat_id,
-                            f"✅ <b>Позиция {base_asset(sym)} добавлена!</b>\n\n"
-                            f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
-                            f"• Вход: <code>{fmt_price(new_avg)} USDT</code>",
-                            reply_markup=main_keyboard(),
-                        )
-                        send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
-                        continue
-
-                # ── Основные команды и Reply-кнопки ──
-                if cmd == "/start" or text_lower in ("/start", "start"):
-                    print(f"-> Отправка приветствия для {chat_id}")
-                    welcome_text = (
-                        "👋 <b>Добро пожаловать в Pump Pulse Scanner 2.0!</b>\n\n"
-                        "Я непрерывно сканирую спотовый рынок Binance на предмет зарождения "
-                        "мощных импульсов (пампов) с помощью multi-TF скоринга объёма, "
-                        "пробоев Donchian, ATR, RSI и покупательской агрессии.\n\n"
-                        "<b>Выберите действие в меню ниже:</b>"
-                    )
-                    send_telegram(token, chat_id, welcome_text, reply_markup=main_keyboard())
-
-                elif cmd == "/scan" or "скан" in text_lower:
-                    print(f"-> Запуск ручного сканирования для {chat_id}")
-                    execute_scan_and_report(token, chat_id, state)
-
-                elif cmd in ("/portfolio", "/port") or "портфель" in text_lower:
-                    print(f"-> Отправка портфеля для {chat_id}")
-                    port_text = format_portfolio(state)
-                    send_telegram(token, chat_id, port_text, reply_markup=portfolio_inline_kb())
-
-                elif cmd == "/add" or "добавить" in text_lower:
-                    args = clean_text.split()[1:]
-                    if len(args) >= 2:
-                        raw_sym = args[0].upper()
-                        sym = normalize_symbol(raw_sym)
-                        try:
-                            qty = float(args[1])
-                            price = float(args[2]) if len(args) >= 3 else (get_price(sym) or 0.0)
-                            if qty <= 0 or price <= 0:
-                                raise ValueError
-                            new_qty, new_avg = portfolio_add(state, sym, qty, price)
-                            print(f"-> Добавлен актив {sym} для {chat_id}")
-                            send_telegram(
-                                token,
-                                chat_id,
-                                f"✅ <b>Актив {base_asset(sym)} успешно добавлен!</b>\n\n"
-                                f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
-                                f"• Вход: <code>{fmt_price(new_avg)} USDT</code>\n"
-                                f"• Сумма позиции: <code>{(new_qty * new_avg):,.2f} USDT</code>",
-                                reply_markup=main_keyboard(),
-                            )
-                            send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
-                        except Exception:
-                            send_telegram(token, chat_id, "⚠️ Ошибка формата. Пример: <code>/add SOL 2.5 140.5</code>", reply_markup=main_keyboard())
-                    else:
-                        print(f"-> Диалог добавления актива для {chat_id}")
-                        user_fsm[chat_id] = {"state": "waiting_portfolio_input", "data": {}}
-                        prompt_text = (
-                            "➕ <b>Добавление актива в портфель</b>\n\n"
-                            "Отправьте тикер, количество и цену (опционально):\n"
-                            "<code>ТИКЕР КОЛИЧЕСТВО [ЦЕНА]</code>\n\n"
-                            "<b>Примеры:</b>\n"
-                            "• <code>SOL 2.5 140.5</code> — 2.5 SOL по $140.5\n"
-                            "• <code>BTC 0.05</code> — текущая цена возьмётся с Binance!\n\n"
-                            "Или нажмите <b>«❌ Отмена»</b>."
-                        )
-                        send_telegram(token, chat_id, prompt_text, reply_markup=cancel_keyboard())
-
-                elif cmd in ("/del", "/delete") or "удалить" in text_lower:
-                    print(f"-> Диалог удаления для {chat_id}")
-                    del_kb = remove_asset_inline_kb(state)
-                    if del_kb:
-                        send_telegram(
-                            token,
-                            chat_id,
-                            "🗑 <b>Выберите актив для удаления:</b>",
+            elif cb_data == "port:del":
+                del_kb = remove_asset_inline_kb(state)
+                if del_kb:
+                    answer_callback(token, cb_id)
+                    if msg_id:
+                        edit_message(
+                            token, chat_id, msg_id,
+                            "🗑 <b>Выберите актив для удаления из портфеля:</b>",
                             reply_markup=del_kb,
                         )
-                    else:
-                        send_telegram(
-                            token,
-                            chat_id,
-                            "💼 <b>Портфель пуст!</b> Нечего удалять.",
-                            reply_markup=main_keyboard(),
-                        )
+                else:
+                    answer_callback(token, cb_id, "Портфель пуст!", show_alert=True)
 
-                elif cmd == "/settings" or "настройк" in text_lower:
-                    print(f"-> Открытие настроек для {chat_id}")
+            elif cb_data.startswith("del:"):
+                sym = cb_data.split(":", 1)[1]
+                if portfolio_remove(state, sym):
+                    answer_callback(token, cb_id, f"{base_asset(sym)} удалён из портфеля", show_alert=True)
+                else:
+                    answer_callback(token, cb_id, "Актив не найден.")
+                port_text = format_portfolio(state)
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, port_text, reply_markup=portfolio_inline_kb())
+
+            # Быстрое добавление из карточки сигнала
+            elif cb_data.startswith("add_coin:"):
+                parts = cb_data.split(":")
+                sym = parts[1]
+                p_val = float(parts[2]) if len(parts) > 2 else (get_price(sym) or 0.0)
+                user_fsm[chat_id] = {
+                    "state": "waiting_quick_add_qty",
+                    "data": {"symbol": sym, "price": p_val}
+                }
+                answer_callback(token, cb_id)
+                send_telegram(
+                    token,
+                    chat_id,
+                    f"➕ <b>Добавление {base_asset(sym)} в портфель</b>\n\n"
+                    f"Фиксированная цена: <code>{fmt_price(p_val)} USDT</code>\n"
+                    f"Введите желаемое количество монет (например: <code>10</code> или <code>0.5</code>):",
+                    reply_markup=cancel_keyboard(),
+                )
+
+            elif cb_data.startswith("factors:"):
+                parts = cb_data.split(":")
+                sym = parts[1]
+                tf = parts[2] if len(parts) > 2 else "15m"
+                answer_callback(token, cb_id, f"Анализ {base_asset(sym)} ({tf})", show_alert=False)
+                send_telegram(
+                    token,
+                    chat_id,
+                    f"📊 <b>Детальный разбор индикаторов {base_asset(sym)}/USDT ({tf})</b>\n\n"
+                    f"• Объём vs SMA20: импульс выше среднего\n"
+                    f"• Donchian 20: фиксация пробоя максимумов\n"
+                    f"• Тренд EMA 9/21: бычья структура\n"
+                    f"• Taker Buy Ratio: преобладание покупок по рынку\n"
+                    f"• RSI: в рабочем коридоре без перегрева\n\n"
+                    f"<i>График доступен по кнопкам под сигналом.</i>"
+                )
+
+            elif cb_data == "menu:main":
+                user_fsm.pop(chat_id, None)
+                answer_callback(token, cb_id)
+                send_telegram(
+                    token,
+                    chat_id,
+                    "🔘 <b>Главное меню клавиатуры активно:</b>",
+                    reply_markup=main_keyboard(),
+                )
+
+            else:
+                answer_callback(token, cb_id)
+            return
+
+        # ── 2. Обработка обычных сообщений ──
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            return
+
+        raw_text = msg.get("text") or msg.get("caption") or ""
+        text = raw_text.strip()
+        chat = msg.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        if not chat_id:
+            return
+
+        sender = msg.get("from", {})
+        user_tag = sender.get("username") or sender.get("first_name") or chat_id
+        if text:
+            print(f"📩 [Message @{user_tag} ({chat_id})]: {text}")
+
+        # Автоматически регистрируем chat_id для получения алертов автоскана
+        if chat_id not in state["allowed_chats"]:
+            state["allowed_chats"].append(chat_id)
+            save_state(state)
+
+        if not is_authorized(chat_id):
+            print(f"⛔ Доступ запрещён для {chat_id}")
+            send_telegram(
+                token,
+                chat_id,
+                "⛔ <b>Доступ ограничен.</b> Ваш Chat ID не авторизован для управления ботом.",
+            )
+            return
+
+        if not text:
+            # Пользователь прислал стикер, фото или файл без текста
+            send_telegram(
+                token,
+                chat_id,
+                "👋 Выберите действие в меню ниже:",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        clean_text = text.strip()
+        cmd = clean_text.split()[0].lower().split("@")[0] if clean_text else ""
+        text_lower = clean_text.lower()
+
+        # Если нажата любая кнопка главного меню — сбрасываем FSM и сразу выполняем действие
+        is_menu_action = (
+            cmd in ("/start", "/scan", "/portfolio", "/port", "/settings", "/help", "/del", "/delete", "/cancel")
+            or "скан" in text_lower
+            or "портфель" in text_lower
+            or "настройк" in text_lower
+            or "помощь" in text_lower
+            or "справка" in text_lower
+            or "удалить" in text_lower
+            or "отмена" in text_lower
+        )
+        if is_menu_action and chat_id in user_fsm:
+            print(f"-> Сброс FSM для {chat_id} по кнопке меню: {clean_text}")
+            user_fsm.pop(chat_id, None)
+
+        # Обработка отмены в любом состоянии
+        if cmd == "/cancel" or "отмена" in text_lower:
+            user_fsm.pop(chat_id, None)
+            print(f"-> Отмена действия для {chat_id}")
+            send_telegram(
+                token,
+                chat_id,
+                "❌ Действие отменено. Главное меню активно.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        # ── Проверка FSM-состояния пользователя ──
+        if chat_id in user_fsm:
+            fsm = user_fsm[chat_id]
+            cur_st = fsm.get("state")
+
+            if cur_st == "waiting_portfolio_input":
+                # Ожидаем ввод: ТИКЕР КОЛИЧЕСТВО [ЦЕНА]
+                clean_text = text.replace(",", " ")
+                tokens = [t.strip() for t in clean_text.split() if t.strip()]
+
+                if len(tokens) < 2:
                     send_telegram(
                         token,
                         chat_id,
-                        settings_text(state),
-                        reply_markup=settings_inline_kb(state),
+                        "⚠️ Неверный формат. Введите тикер и количество (и при желании цену входа).\n"
+                        "Пример: <code>SOL 2.5 140.5</code> или <code>BTC 0.05</code>\n\n"
+                        "Для выхода нажмите <b>«❌ Отмена»</b>.",
+                        reply_markup=cancel_keyboard(),
                     )
+                    return
 
-                elif cmd == "/help" or "помощь" in text_lower or "справка" in text_lower:
-                    print(f"-> Отправка справки для {chat_id}")
-                    send_telegram(token, chat_id, HELP_TEXT, reply_markup=main_keyboard())
+                raw_sym = tokens[0].upper()
+                sym = normalize_symbol(raw_sym)
 
-                else:
-                    print(f"-> Запрос инфо по тикеру: {clean_text}")
-                    cand_sym = normalize_symbol(clean_text)
-                    pr = get_price(cand_sym)
-                    if pr is not None:
-                        base = base_asset(cand_sym)
-                        info_text = (
-                            f"🪙 <b>Актив: {base}/USDT</b>\n"
-                            f"• Текущая цена: <code>{fmt_price(pr)} USDT</code>\n\n"
-                            f"Для управления используйте кнопки меню ниже."
-                        )
-                        send_telegram(token, chat_id, info_text, reply_markup=main_keyboard())
-                    else:
+                try:
+                    qty = float(tokens[1])
+                    if qty <= 0:
+                        raise ValueError
+                except ValueError:
+                    send_telegram(
+                        token,
+                        chat_id,
+                        "⚠️ Ошибка: количество должно быть положительным числом.\nПопробуйте ещё раз:",
+                        reply_markup=cancel_keyboard(),
+                    )
+                    return
+
+                if len(tokens) >= 3:
+                    try:
+                        price = float(tokens[2])
+                        if price <= 0:
+                            raise ValueError
+                    except ValueError:
                         send_telegram(
                             token,
                             chat_id,
-                            "Команда не распознана. Воспользуйтесь кнопками меню или /help.",
-                            reply_markup=main_keyboard(),
+                            "⚠️ Ошибка: цена должна быть положительным числом.\nПопробуйте ещё раз:",
+                            reply_markup=cancel_keyboard(),
                         )
+                        return
+                else:
+                    # Автоматическое получение текущей цены с Binance
+                    mkt_price = get_price(sym)
+                    if mkt_price is None:
+                        send_telegram(
+                            token,
+                            chat_id,
+                            f"⚠️ Монета <code>{sym}</code> не найдена на споте Binance. "
+                            f"Проверьте правильность тикера или укажите цену вручную (например: <code>{raw_sym} {qty} 10.5</code>).",
+                            reply_markup=cancel_keyboard(),
+                        )
+                        return
+                    price = mkt_price
+
+                new_qty, new_avg = portfolio_add(state, sym, qty, price)
+                user_fsm.pop(chat_id, None)
+
+                send_telegram(
+                    token,
+                    chat_id,
+                    f"✅ <b>Актив успешно сохранён в портфель!</b>\n\n"
+                    f"• Монета: <b>{base_asset(sym)}/USDT</b>\n"
+                    f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
+                    f"• Средняя цена входа: <code>{fmt_price(new_avg)} USDT</code>\n"
+                    f"• Сумма позиции: <code>{(new_qty * new_avg):,.2f} USDT</code>",
+                    reply_markup=main_keyboard(),
+                )
+                # Показываем обновленный портфель
+                send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
+                return
+
+            elif cur_st == "waiting_quick_add_qty":
+                try:
+                    qty = float(text.replace(",", ".").strip())
+                    if qty <= 0:
+                        raise ValueError
+                except ValueError:
+                    send_telegram(
+                        token,
+                        chat_id,
+                        "⚠️ Введите корректное положительное число (например, <code>5</code> или <code>0.25</code>):",
+                        reply_markup=cancel_keyboard(),
+                    )
+                    return
+
+                sym = fsm["data"]["symbol"]
+                price = fsm["data"]["price"]
+                new_qty, new_avg = portfolio_add(state, sym, qty, price)
+                user_fsm.pop(chat_id, None)
+
+                send_telegram(
+                    token,
+                    chat_id,
+                    f"✅ <b>Позиция {base_asset(sym)} добавлена!</b>\n\n"
+                    f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
+                    f"• Вход: <code>{fmt_price(new_avg)} USDT</code>",
+                    reply_markup=main_keyboard(),
+                )
+                send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
+                return
+
+        # ── Основные команды и Reply-кнопки ──
+        if cmd == "/start" or text_lower in ("/start", "start"):
+            print(f"-> Отправка приветствия для {chat_id}")
+            welcome_text = (
+                "👋 <b>Добро пожаловать в Pump Pulse Scanner 2.0!</b>\n\n"
+                "Я непрерывно сканирую спотовый рынок Binance на предмет зарождения "
+                "мощных импульсов (пампов) с помощью multi-TF скоринга объёма, "
+                "пробоев Donchian, ATR, RSI и покупательской агрессии.\n\n"
+                "<b>Выберите действие в меню ниже:</b>"
+            )
+            send_telegram(token, chat_id, welcome_text, reply_markup=main_keyboard())
+
+        elif cmd == "/scan" or "скан" in text_lower:
+            print(f"-> Запуск ручного сканирования для {chat_id}")
+            execute_scan_and_report(token, chat_id, state)
+
+        elif cmd in ("/portfolio", "/port") or "портфель" in text_lower:
+            print(f"-> Отправка портфеля для {chat_id}")
+            port_text = format_portfolio(state)
+            send_telegram(token, chat_id, port_text, reply_markup=portfolio_inline_kb())
+
+        elif cmd == "/add" or "добавить" in text_lower:
+            args = clean_text.split()[1:]
+            if len(args) >= 2:
+                raw_sym = args[0].upper()
+                sym = normalize_symbol(raw_sym)
+                try:
+                    qty = float(args[1])
+                    price = float(args[2]) if len(args) >= 3 else (get_price(sym) or 0.0)
+                    if qty <= 0 or price <= 0:
+                        raise ValueError
+                    new_qty, new_avg = portfolio_add(state, sym, qty, price)
+                    print(f"-> Добавлен актив {sym} для {chat_id}")
+                    send_telegram(
+                        token,
+                        chat_id,
+                        f"✅ <b>Актив {base_asset(sym)} успешно добавлен!</b>\n\n"
+                        f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
+                        f"• Вход: <code>{fmt_price(new_avg)} USDT</code>\n"
+                        f"• Сумма позиции: <code>{(new_qty * new_avg):,.2f} USDT</code>",
+                        reply_markup=main_keyboard(),
+                    )
+                    send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
+                except Exception:
+                    send_telegram(token, chat_id, "⚠️ Ошибка формата. Пример: <code>/add SOL 2.5 140.5</code>", reply_markup=main_keyboard())
+            else:
+                print(f"-> Диалог добавления актива для {chat_id}")
+                user_fsm[chat_id] = {"state": "waiting_portfolio_input", "data": {}}
+                prompt_text = (
+                    "➕ <b>Добавление актива в портфель</b>\n\n"
+                    "Отправьте тикер, количество и цену (опционально):\n"
+                    "<code>ТИКЕР КОЛИЧЕСТВО [ЦЕНА]</code>\n\n"
+                    "<b>Примеры:</b>\n"
+                    "• <code>SOL 2.5 140.5</code> — 2.5 SOL по $140.5\n"
+                    "• <code>BTC 0.05</code> — текущая цена возьмётся с Binance!\n\n"
+                    "Или нажмите <b>«❌ Отмена»</b>."
+                )
+                send_telegram(token, chat_id, prompt_text, reply_markup=cancel_keyboard())
+
+        elif cmd in ("/del", "/delete") or "удалить" in text_lower:
+            print(f"-> Диалог удаления для {chat_id}")
+            del_kb = remove_asset_inline_kb(state)
+            if del_kb:
+                send_telegram(
+                    token,
+                    chat_id,
+                    "🗑 <b>Выберите актив для удаления:</b>",
+                    reply_markup=del_kb,
+                )
+            else:
+                send_telegram(
+                    token,
+                    chat_id,
+                    "💼 <b>Портфель пуст!</b> Нечего удалять.",
+                    reply_markup=main_keyboard(),
+                )
+
+        elif cmd == "/settings" or "настройк" in text_lower:
+            print(f"-> Открытие настроек для {chat_id}")
+            send_telegram(
+                token,
+                chat_id,
+                settings_text(state),
+                reply_markup=settings_inline_kb(state),
+            )
+
+        elif cmd == "/help" or "помощь" in text_lower or "справка" in text_lower:
+            print(f"-> Отправка справки для {chat_id}")
+            send_telegram(token, chat_id, HELP_TEXT, reply_markup=main_keyboard())
+
+        else:
+            print(f"-> Запрос инфо по тикеру: {clean_text}")
+            cand_sym = normalize_symbol(clean_text)
+            pr = get_price(cand_sym)
+            if pr is not None:
+                base = base_asset(cand_sym)
+                info_text = (
+                    f"🪙 <b>Актив: {base}/USDT</b>\n"
+                    f"• Текущая цена: <code>{fmt_price(pr)} USDT</code>\n\n"
+                    f"Для управления используйте кнопки меню ниже."
+                )
+                send_telegram(token, chat_id, info_text, reply_markup=main_keyboard())
+            else:
+                send_telegram(
+                    token,
+                    chat_id,
+                    "Команда не распознана. Воспользуйтесь кнопками меню или /help.",
+                    reply_markup=main_keyboard(),
+                )
+
+    try:
+        while True:
+            try:
+                updates = get_updates(token, offset=last_offset, timeout=20)
+            except Exception as e:
+                print(f"⚠️ Ошибка сети при getUpdates: {e}", file=sys.stderr)
+                time.sleep(2)
+                continue
+
+            for upd in updates:
+                last_offset = upd.get("update_id", last_offset) + 1
+                try:
+                    handle_update(upd)
+                except Exception as e:
+                    print(f"❌ Ошибка обработки обновления {upd.get('update_id')}: {e}", file=sys.stderr)
+                    traceback.print_exc()
 
     except KeyboardInterrupt:
         print("\nОстановка бота по сигналу пользователя...")
