@@ -1738,7 +1738,7 @@ def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
     if filter_level == "strong_only":
         active_signals = [s for s in signals if s.grade == "strong"]
     else:
-        active_signals = [s for s in signals if s.grade in ("strong", "watch")]
+        active_signals = [s for s in signals if s.grade in ("strong", "watch", "late")]
 
     duration_sec = meta["duration_ms"] / 1000.0
     print(
@@ -1774,15 +1774,86 @@ def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
             print(f"Успешно отправлено новых сигналов: {sent_count}")
         else:
             print("Новых уникальных сигналов выше порога не обнаружено.")
+
+            # Если запуск был выполнен вручную (workflow_dispatch) или включен NOTIFY_EMPTY, отправляем отчет о спокойном рынке
+            is_manual = (
+                os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                or os.environ.get("NOTIFY_EMPTY", "false").lower() in ("true", "1")
+                or "--notify-always" in sys.argv
+            )
+            if is_manual:
+                top_cand_str = ""
+                if summaries:
+                    top_cand_str = "\n".join(
+                        f"  • {c['base']}: Score {c['best_score']:.0f} ({c['best_tf']}), объём {c['vol_ratio']:.1f}×"
+                        for c in summaries[:3]
+                    )
+                btc_info = meta.get("btc", {})
+                btc_p = btc_info.get("price")
+                btc_c = btc_info.get("change24h")
+                btc_str = f"BTC: {fmt_price(btc_p)} USDT ({fmt_pct(btc_c)})" if btc_p is not None else ""
+
+                status_msg = (
+                    f"🔍 <b>Pump Pulse Scanner — Отчёт сканирования</b>\n\n"
+                    f"• Проверено спотовых пар: <code>{meta['universe']}</code>\n"
+                    f"• Порог сигнала (Score): <code>{min_score:.0f}</code>\n"
+                    f"• Сигналов выше порога: <b>0</b> <i>(рынок спокоен)</i>\n"
+                    f"• Фон: <i>{btc_str}</i>\n\n"
+                    f"<b>Ближайшие кандидаты по активности:</b>\n{top_cand_str or 'Нет данных'}"
+                )
+                for cid in target_chats:
+                    send_telegram(token, cid, status_msg)
+                print(f"Отправлен статус-отчёт о сканировании в Telegram.")
     else:
         for s in active_signals:
             print(f"[{s.grade.upper()}] {s.symbol} Score: {s.best_score:.0f} Price: {s.price} 24h: {s.change_24h:+.2f}%")
+
+def run_test_connection(token: str, chat_id: str) -> None:
+    """Тест подключения бота к Telegram API и отправка тестового сообщения."""
+    print("=== Проверка подключения к Telegram API ===")
+    if not token:
+        print("❌ Ошибка: TELEGRAM_BOT_TOKEN не задан!", file=sys.stderr)
+        return
+    me = api_call(token, "getMe", {})
+    if not me.get("ok"):
+        print(f"❌ Ошибка токена бота: {me.get('description')}", file=sys.stderr)
+        return
+    bot_info = me["result"]
+    print(f"✅ Бот авторизован: @{bot_info.get('username')} ({bot_info.get('first_name')})")
+
+    if not chat_id:
+        print("⚠️ Внимание: TELEGRAM_CHAT_ID не задан!", file=sys.stderr)
+        return
+
+    test_msg = (
+        f"🔔 <b>Тестовое уведомление от Pump Pulse Scanner!</b>\n\n"
+        f"Бот <b>@{bot_info.get('username')}</b> успешно подключён к вашему чату.\n"
+        f"• Chat ID: <code>{chat_id}</code>\n"
+        f"• Статус: 🟢 <b>Связь установлена, бот готов к отправке сигналов!</b>"
+    )
+    res = send_telegram(token, chat_id, test_msg)
+    if res:
+        print(f"✅ Тестовое сообщение успешно доставлено в chat_id {chat_id} (msg_id: {res})!")
+    else:
+        print(
+            f"❌ Не удалось отправить сообщение в chat_id {chat_id}.\n"
+            f"   Возможные причины:\n"
+            f"   1. Вы не нажали кнопку Start (/start) в диалоге с ботом в Telegram.\n"
+            f"   2. Указан неверный chat_id (нужен цифровой ID, а не @username).\n"
+            f"   3. Если это канал/группа — бот должен быть добавлен туда администратором.",
+            file=sys.stderr,
+        )
 
 # ───────────────────────── Main ─────────────────────────
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+    # Проверка тестового режима
+    if "--test" in sys.argv:
+        run_test_connection(token, chat_id)
+        return
 
     # Проверка аргументов командной строки: --oneshot или --bot
     mode = RUN_MODE
