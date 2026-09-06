@@ -24,7 +24,7 @@ import concurrent.futures as cf
 import urllib.request
 import json
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_BASE = "https://data-api.binance.vision"
 
 MIN_VOLUME_RATIO = float(os.environ.get("MIN_VOLUME_RATIO", "1.8"))
 MIN_PRICE_CHANGE_PCT = float(os.environ.get("MIN_PRICE_CHANGE_PCT", "3.0"))
