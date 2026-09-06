@@ -20,14 +20,17 @@ import sys
 import time
 import math
 import json
+import hmac
+import hashlib
 import signal
 import threading
 import traceback
-import concurrent.futures as cf
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple, Any, Set
+import urllib.parse
 import urllib.request
 import urllib.error
+import concurrent.futures as cf
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Tuple, Any, Set, Union
 
 # Настройка UTF-8 вывода для Windows консоли
 if sys.platform == "win32":
@@ -58,6 +61,7 @@ except ImportError:
 # ───────────────────────── Config ─────────────────────────
 
 BINANCE_BASE = "https://data-api.binance.vision"
+BINANCE_TRADE_URL = "https://api.binance.com"
 TIMEFRAMES = ("15m", "30m", "1h")
 TF_MS = {"15m": 15 * 60_000, "30m": 30 * 60_000, "1h": 60 * 60_000}
 
@@ -67,6 +71,12 @@ ALREADY_PUMPED_MAX = float(os.environ.get("ALREADY_PUMPED_MAX", "35"))
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "40"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
 KLINES_LIMIT = 200  # нужно ~32+ бара на 1h
+
+# Параметры спотовой автоторговли
+DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "11.0"))
+DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "3.0"))
+DEFAULT_AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").strip().lower() in ("true", "1")
+DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "74.0"))
 
 IS_CI = (
     os.environ.get("GITHUB_ACTIONS") == "true"
@@ -657,8 +667,15 @@ def default_state() -> dict:
             "autoscan": True,
             "scan_interval_sec": DEFAULT_SCAN_INTERVAL,
             "filter_level": "strong_and_watch",  # "strong_only" или "strong_and_watch"
+            "auto_trade": DEFAULT_AUTO_TRADE,
+            "trade_amount_usdt": DEFAULT_TRADE_AMOUNT,
+            "take_profit_pct": DEFAULT_TAKE_PROFIT,
+            "max_open_trades": 3,
+            "trade_min_score": DEFAULT_TRADE_MIN_SCORE,
         },
-        "sent_alerts": {},  # alert_key -> timestamp
+        "active_trades": {},  # symbol -> trade dict
+        "trade_history": [],  # list of closed trades
+        "sent_alerts": {},    # alert_key -> timestamp
         "allowed_chats": [],
     }
 
@@ -671,6 +688,8 @@ def load_state() -> dict:
             data = json.load(f)
         d["portfolio"].update(data.get("portfolio", {}))
         d["settings"].update(data.get("settings", {}))
+        d["active_trades"].update(data.get("active_trades", {}))
+        d["trade_history"] = data.get("trade_history", [])[-50:]
         sent = data.get("sent_alerts", {})
         if isinstance(sent, list):
             # миграция со старого формата списка
@@ -763,21 +782,481 @@ def portfolio_remove(state: dict, symbol: str) -> bool:
         return True
     return False
 
-def format_portfolio(state: dict) -> str:
-    port = state["portfolio"]
-    if not port:
-        return (
-            "<b>💼 Ваш портфель</b>\n\n"
-            "<i>Портфель пока пуст.</i>\n\n"
-            "💡 Нажмите кнопку <b>«➕ Добавить актив»</b> ниже, чтобы внести монету, "
-            "или используйте команду <code>/add BTC 0.05 65000</code>."
+# ───────────────────────── Binance Spot Trading Engine ─────────────────────────
+
+_binance_time_offset_ms: int = 0
+_binance_time_last_sync: float = 0.0
+
+def sync_binance_time(force: bool = False) -> int:
+    """
+    Синхронизирует локальное время с сервером Binance для предотвращения
+    ошибки -1021 Timestamp for this request was outside recvWindow.
+    """
+    global _binance_time_offset_ms, _binance_time_last_sync
+    now_mono = time.monotonic()
+    if not force and (now_mono - _binance_time_last_sync < 300):
+        return _binance_time_offset_ms
+    try:
+        url = f"{BINANCE_TRADE_URL}/api/v3/time"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            server_time = int(data["serverTime"])
+            local_time = int(time.time() * 1000)
+            _binance_time_offset_ms = server_time - local_time
+            _binance_time_last_sync = now_mono
+    except Exception as e:
+        print(f"[Binance Time Sync Warning]: {e}", file=sys.stderr)
+    return _binance_time_offset_ms
+
+def get_api_credentials(state: Optional[dict] = None) -> Tuple[str, str]:
+    """Возвращает (api_key, api_secret) из переменных окружения или состояния бота."""
+    key = os.environ.get("BINANCE_API_KEY", "").strip()
+    secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+    if not key and state:
+        key = state.get("settings", {}).get("binance_api_key", "").strip()
+    if not secret and state:
+        secret = state.get("settings", {}).get("binance_api_secret", "").strip()
+    return key, secret
+
+def binance_signed_request(
+    method: str,
+    endpoint: str,
+    params: Optional[dict] = None,
+    state: Optional[dict] = None,
+) -> dict:
+    """
+    Выполняет защищенный HMAC-SHA256 запрос к торговому API Binance (/api/v3/*).
+    """
+    api_key, api_secret = get_api_credentials(state)
+    if not api_key or not api_secret:
+        return {"error": "API-ключи Binance не настроены (BINANCE_API_KEY / BINANCE_API_SECRET)"}
+
+    offset = sync_binance_time()
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000) + offset
+    p["recvWindow"] = 5000
+
+    query_str = urllib.parse.urlencode(p)
+    sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+    signed_query = f"{query_str}&signature={sig}"
+
+    headers = {
+        "X-MBX-APIKEY": api_key,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PumpPulseBot/2.0",
+    }
+
+    url = f"{BINANCE_TRADE_URL}{endpoint}"
+    method_up = method.upper()
+
+    if method_up in ("GET", "DELETE"):
+        full_url = f"{url}?{signed_query}"
+        req = urllib.request.Request(full_url, headers=headers, method=method_up)
+    else:  # POST, PUT
+        req = urllib.request.Request(
+            url,
+            data=signed_query.encode("utf-8"),
+            headers=headers,
+            method=method_up,
         )
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        try:
+            err_json = json.loads(err_body)
+            return {"error": err_json.get("msg", err_body), "code": err_json.get("code", e.code)}
+        except Exception:
+            return {"error": f"HTTP {e.code}: {err_body}", "code": e.code}
+    except Exception as e:
+        return {"error": str(e)}
+
+def get_spot_balances(state: Optional[dict] = None) -> Dict[str, float]:
+    """Возвращает словарь свободных спотовых балансов {актив: свободный_объем}."""
+    res = binance_signed_request("GET", "/api/v3/account", state=state)
+    if "error" in res or "balances" not in res:
+        return {}
+    balances: Dict[str, float] = {}
+    for b in res["balances"]:
+        free = float(b.get("free", 0))
+        locked = float(b.get("locked", 0))
+        total = free + locked
+        if total > 0.000001:
+            balances[b["asset"]] = free
+    return balances
+
+def get_free_usdt_balance(state: Optional[dict] = None) -> float:
+    """Возвращает свободный баланс USDT на спотовом кошельке Binance."""
+    balances = get_spot_balances(state=state)
+    return balances.get("USDT", 0.0)
+
+_symbol_filters_cache: Dict[str, dict] = {}
+
+def get_symbol_filters(symbol: str) -> dict:
+    """Получает торговые фильтры для символа (LOT_SIZE stepSize, PRICE_FILTER tickSize, minNotional)."""
+    global _symbol_filters_cache
+    symbol = normalize_symbol(symbol)
+    if symbol in _symbol_filters_cache:
+        return _symbol_filters_cache[symbol]
+
+    url = f"{BINANCE_TRADE_URL}/api/v3/exchangeInfo?symbol={symbol}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            symbols = data.get("symbols", [])
+            if not symbols:
+                return {}
+            s_info = symbols[0]
+            step_size = 1.0
+            min_qty = 0.0
+            tick_size = 0.01
+            min_notional = 5.0
+
+            for f in s_info.get("filters", []):
+                ftype = f.get("filterType")
+                if ftype == "LOT_SIZE":
+                    step_size = float(f.get("stepSize", 1.0))
+                    min_qty = float(f.get("minQty", 0.0))
+                elif ftype == "PRICE_FILTER":
+                    tick_size = float(f.get("tickSize", 0.01))
+                elif ftype in ("NOTIONAL", "MIN_NOTIONAL"):
+                    min_notional = float(f.get("minNotional", 5.0))
+
+            filters = {
+                "step_size": step_size,
+                "min_qty": min_qty,
+                "tick_size": tick_size,
+                "min_notional": min_notional,
+                "status": s_info.get("status", "TRADING"),
+            }
+            _symbol_filters_cache[symbol] = filters
+            return filters
+    except Exception as e:
+        print(f"[get_symbol_filters error for {symbol}]: {e}", file=sys.stderr)
+        return {"step_size": 0.0001, "min_qty": 0.0001, "tick_size": 0.0001, "min_notional": 5.0, "status": "TRADING"}
+
+def round_step(val: float, step: float) -> float:
+    """Округляет вниз с учетом stepSize биржи."""
+    if step <= 0:
+        return val
+    step_str = f"{step:.10f}".rstrip("0")
+    decimals = len(step_str.split(".")[1]) if "." in step_str else 0
+    steps = math.floor(val / step)
+    return round(steps * step, decimals)
+
+def round_tick(val: float, tick: float) -> float:
+    """Округляет цену с учетом tickSize биржи."""
+    if tick <= 0:
+        return val
+    tick_str = f"{tick:.10f}".rstrip("0")
+    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
+    ticks = round(val / tick)
+    return round(ticks * tick, decimals)
+
+def fmt_qty_filter(val: float, step: float) -> str:
+    """Форматирует количество в строковый вид точно под LOT_SIZE фильтр."""
+    rounded = round_step(val, step)
+    step_str = f"{step:.10f}".rstrip("0")
+    decimals = len(step_str.split(".")[1]) if "." in step_str else 0
+    return f"{rounded:.{decimals}f}"
+
+def fmt_price_filter(val: float, tick: float) -> str:
+    """Форматирует цену в строковый вид точно под PRICE_FILTER фильтр."""
+    rounded = round_tick(val, tick)
+    tick_str = f"{tick:.10f}".rstrip("0")
+    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
+    return f"{rounded:.{decimals}f}"
+
+def execute_pump_auto_trade(
+    token: str,
+    chat_id: Union[str, int],
+    state: dict,
+    sig: PumpSignal,
+    manual_amount: Optional[float] = None,
+) -> Optional[dict]:
+    """
+    Выполняет покупку на Binance Spot по маркету на заданную сумму USDT
+    и сразу выставляет лимитный Take-Profit ордер (+3%).
+    """
+    settings = state.get("settings", {})
+    trade_amt = float(manual_amount or settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
+    tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
+    max_trades = int(settings.get("max_open_trades", 3))
+
+    active_trades = state.setdefault("active_trades", {})
+
+    # Проверка на повторный вход в ту же монету
+    if sig.symbol in active_trades:
+        print(f"[AutoTrade] Пропуск {sig.symbol}: уже есть активная сделка")
+        return {"error": f"По монете {sig.symbol} уже есть открытая позиция"}
+
+    # Проверка лимита открытых сделок
+    if len(active_trades) >= max_trades:
+        print(f"[AutoTrade] Достигнут лимит открытых сделок ({len(active_trades)}/{max_trades})")
+        return {"error": f"Достигнут лимит активных сделок ({len(active_trades)}/{max_trades})"}
+
+    # Проверка наличия API-ключей
+    api_key, api_secret = get_api_credentials(state)
+    if not api_key or not api_secret:
+        msg = (
+            "⚠️ <b>Автоторговля: API-ключи Binance не настроены!</b>\n\n"
+            "Для автоматических сделок укажите ключи в <code>.env</code>:\n"
+            "<code>BINANCE_API_KEY=...</code>\n"
+            "<code>BINANCE_API_SECRET=...</code>\n"
+            "или введите команду <code>/api КЛЮЧ СЕКРЕТ</code> в чате бота."
+        )
+        send_telegram(token, chat_id, msg)
+        return {"error": "API keys not configured"}
+
+    # Проверка свободного баланса USDT
+    free_usdt = get_free_usdt_balance(state)
+    if free_usdt < trade_amt:
+        msg = (
+            f"⚠️ <b>Автоторговля: Недостаточно USDT для входа в {sig.base}!</b>\n\n"
+            f"• Требуется: <code>{trade_amt:.2f} USDT</code>\n"
+            f"• Свободно на споте: <code>{free_usdt:.2f} USDT</code>\n\n"
+            f"💡 Пополните баланс USDT на Binance или уменьшите ставку в настройках."
+        )
+        send_telegram(token, chat_id, msg)
+        return {"error": "Insufficient USDT balance"}
+
+    # Получение фильтров торговой пары
+    filters = get_symbol_filters(sig.symbol)
+    if filters.get("status") != "TRADING":
+        return {"error": f"Пара {sig.symbol} временно не торгуется на бирже"}
+
+    # 1. Размещение MARKET BUY ордера
+    buy_params = {
+        "symbol": sig.symbol,
+        "side": "BUY",
+        "type": "MARKET",
+        "quoteOrderQty": f"{trade_amt:.2f}",
+    }
+    buy_res = binance_signed_request("POST", "/api/v3/order", buy_params, state=state)
+    if "error" in buy_res:
+        err_msg = buy_res.get("error", "Unknown error")
+        print(f"[AutoTrade Error Buy]: {err_msg}", file=sys.stderr)
+        send_telegram(
+            token,
+            chat_id,
+            f"❌ <b>Ошибка покупки {sig.base}/USDT:</b>\n<code>{err_msg}</code>",
+        )
+        return buy_res
+
+    buy_order_id = buy_res.get("orderId")
+    cum_quote = float(buy_res.get("cummulativeQuoteQty", trade_amt))
+    exec_qty = float(buy_res.get("executedQty", 0.0))
+
+    if exec_qty <= 0:
+        send_telegram(token, chat_id, f"❌ Ошибка исполнения покупки {sig.base}: 0 объем")
+        return {"error": "Zero executed quantity"}
+
+    avg_buy_price = cum_quote / exec_qty
+
+    # 2. Расчет цены и объема Take-Profit (+3%)
+    tp_raw_price = avg_buy_price * (1.0 + (tp_pct / 100.0))
+    step_size = filters.get("step_size", 1.0)
+    tick_size = filters.get("tick_size", 0.01)
+
+    tp_price_str = fmt_price_filter(tp_raw_price, tick_size)
+    tp_qty_str = fmt_qty_filter(exec_qty, step_size)
+
+    # 3. Размещение LIMIT SELL GTC ордера (Тейк-профит)
+    sell_params = {
+        "symbol": sig.symbol,
+        "side": "SELL",
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "quantity": tp_qty_str,
+        "price": tp_price_str,
+    }
+    sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+
+    # Если биржа вернула ошибку баланса из-за удержанной комиссии BNB/монеты — пробуем списать на 0.15% меньше
+    if "error" in sell_res:
+        err_str = str(sell_res.get("error", ""))
+        print(f"[AutoTrade TP Retry for {sig.symbol}]: {err_str}", file=sys.stderr)
+        reduced_qty = fmt_qty_filter(exec_qty * 0.9985, step_size)
+        if float(reduced_qty) > 0 and reduced_qty != tp_qty_str:
+            sell_params["quantity"] = reduced_qty
+            sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+
+    tp_order_id = sell_res.get("orderId")
+    tp_success = bool(tp_order_id)
+
+    # 4. Сохранение сделки в активные и в портфель
+    trade_record = {
+        "symbol": sig.symbol,
+        "base": sig.base,
+        "buy_order_id": buy_order_id,
+        "tp_order_id": tp_order_id,
+        "buy_price": avg_buy_price,
+        "tp_price": float(tp_price_str),
+        "qty": float(sell_params["quantity"]),
+        "cost_usdt": cum_quote,
+        "tp_pct": tp_pct,
+        "opened_at": int(time.time()),
+        "signal_score": sig.score,
+        "status": "tp_placed" if tp_success else "unhedged_buy",
+    }
+    active_trades[sig.symbol] = trade_record
+    portfolio_add(state, sig.symbol, float(sell_params["quantity"]), avg_buy_price)
+    save_state(state, sync_git=True)
+
+    # 5. Уведомление в Telegram
+    expected_gain = (float(sell_params["quantity"]) * float(tp_price_str)) - cum_quote
+    tp_status_note = (
+        f"• Ордер тейк-профита: <code>#{tp_order_id} (LIMIT SELL GTC)</code>\n"
+        f"• Ожидаемая прибыль: <b>+{expected_gain:.2f} USDT (+{tp_pct:.1f}%)</b>\n"
+        f"<i>При закрытии заявки средства сразу вернутся в USDT.</i>"
+        if tp_success
+        else f"⚠️ <i>Не удалось выставить лимитник TP ({sell_res.get('error')}). Монета на спотовом балансе.</i>"
+    )
+
+    trade_alert = (
+        f"⚡ <b>СДЕЛКА ИСПОЛНЕНА НА BINANCE SPOT!</b>\n\n"
+        f"🟢 <b>Покупка:</b> <b>{sig.base}/USDT</b>\n"
+        f"• Потрачено: <code>{cum_quote:.2f} USDT</code>\n"
+        f"• Куплено: <code>{fmt_qty(float(sell_params['quantity']))} {sig.base}</code>\n"
+        f"• Цена исполнения: <code>{fmt_price(avg_buy_price)} USDT</code>\n"
+        f"• Импульс Score: <b>{sig.score:.1f}</b> ({sig.grade.upper()})\n\n"
+        f"🎯 <b>Тейк-профит (+{tp_pct:.1f}%):</b>\n"
+        f"• Цена продажи: <code>{tp_price_str} USDT</code>\n"
+        f"{tp_status_note}"
+    )
+    send_telegram(token, chat_id, trade_alert)
+    return trade_record
+
+def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> None:
+    """
+    Проверяет исполнение выставленных тейк-профит ордеров на Binance.
+    При исполнении фиксирует прибыль и возвращает средства в USDT.
+    """
+    active_trades = state.get("active_trades", {})
+    if not active_trades:
+        return
+
+    symbols_to_remove = []
+    updated = False
+
+    for symbol, trade in list(active_trades.items()):
+        tp_order_id = trade.get("tp_order_id")
+        if not tp_order_id:
+            continue
+
+        res = binance_signed_request(
+            "GET",
+            "/api/v3/order",
+            {"symbol": symbol, "orderId": tp_order_id},
+            state=state,
+        )
+        if "error" in res:
+            continue
+
+        status = res.get("status")
+        if status == "FILLED":
+            symbols_to_remove.append(symbol)
+            updated = True
+
+            cum_quote = float(res.get("cummulativeQuoteQty", trade.get("qty", 0) * trade.get("tp_price", 0)))
+            cost = float(trade.get("cost_usdt", 0))
+            pnl = cum_quote - cost
+            pnl_pct = (pnl / cost * 100.0) if cost > 0 else trade.get("tp_pct", 3.0)
+
+            history = state.setdefault("trade_history", [])
+            closed_rec = dict(trade)
+            closed_rec["closed_at"] = int(time.time())
+            closed_rec["sell_price"] = (
+                cum_quote / float(res.get("executedQty", 1.0))
+                if float(res.get("executedQty", 0)) > 0
+                else trade.get("tp_price", 0)
+            )
+            closed_rec["pnl"] = pnl
+            closed_rec["pnl_pct"] = pnl_pct
+            closed_rec["status"] = "tp_filled"
+            history.append(closed_rec)
+            if len(history) > 100:
+                history.pop(0)
+
+            # Удаляем из отслеживания портфеля
+            portfolio_remove(state, symbol)
+
+            base = trade.get("base", base_asset(symbol))
+            win_msg = (
+                f"🎉 <b>ТЕЙК-ПРОФИТ СРАБОТАЛ (+{pnl_pct:.2f}%)!</b>\n\n"
+                f"✅ <b>{base}/USDT</b> успешно закрыт на Binance Spot!\n"
+                f"• Вход: <code>{fmt_price(trade.get('buy_price', 0))} USDT</code>\n"
+                f"• Выход: <code>{fmt_price(closed_rec['sell_price'])} USDT</code>\n"
+                f"• Получено: <b>{cum_quote:.2f} USDT</b>\n"
+                f"• Прибыль: 🟢 <b>+{pnl:+.2f} USDT ({fmt_pct(pnl_pct)})</b>\n\n"
+                f"💵 <i>Все средства возвращены в свободный USDT-баланс!</i>"
+            )
+            if chat_id:
+                send_telegram(token, chat_id, win_msg)
+
+        elif status == "CANCELED":
+            symbols_to_remove.append(symbol)
+            updated = True
+            base = trade.get("base", base_asset(symbol))
+            warn_msg = (
+                f"⚠️ <b>Тейк-профит ордер #{tp_order_id} по {base}/USDT был отменён на бирже.</b>\n"
+                f"Сделка снята с автоматического мониторинга бота."
+            )
+            if chat_id:
+                send_telegram(token, chat_id, warn_msg)
+
+    for sym in symbols_to_remove:
+        active_trades.pop(sym, None)
+
+    if updated:
+        save_state(state, sync_git=True)
+
+def format_portfolio(state: dict) -> str:
+    port = state.get("portfolio", {})
+    active_trades = state.get("active_trades", {})
+
+    api_key, api_secret = get_api_credentials(state)
+    has_api = bool(api_key and api_secret)
+    free_usdt_str = ""
+    if has_api:
+        free_usdt = get_free_usdt_balance(state)
+        free_usdt_str = f"💳 <b>Свободно на Binance:</b> <code>{free_usdt:,.2f} USDT</code>\n\n"
 
     lines = ["<b>💼 Ваш криптовалютный портфель</b>\n"]
+    if free_usdt_str:
+        lines.append(free_usdt_str)
+
+    # Отображение активных автосделок
+    if active_trades:
+        lines.append("⚡ <b>Активные сделки с авто-TP:</b>")
+        for sym, tr in active_trades.items():
+            base = tr.get("base", base_asset(sym))
+            bp = tr.get("buy_price", 0.0)
+            tp = tr.get("tp_price", 0.0)
+            tp_pct = tr.get("tp_pct", 3.0)
+            cost = tr.get("cost_usdt", 0.0)
+            lines.append(
+                f"🎯 <b>{base}/USDT</b>: вход <code>{fmt_price(bp)}</code> → TP: <code>{fmt_price(tp)}</code> (+{tp_pct:.1f}%)\n"
+                f"   └ Вложено: {cost:,.2f} $ | Ордер #{tr.get('tp_order_id', '—')}"
+            )
+        lines.append("─────────────────────")
+
+    if not port and not active_trades:
+        return (
+            "<b>💼 Ваш портфель</b>\n\n"
+            + (free_usdt_str or "")
+            + "<i>Портфель пока пуст.</i>\n\n"
+            "💡 Нажмите кнопку <b>«➕ Добавить актив»</b> ниже или включите автоторговлю в настройках ⚙️."
+        )
+
     total_cost = 0.0
     total_value = 0.0
     symbols = sorted(port.keys())
-    prices = get_multiple_prices(symbols)
+    prices = get_multiple_prices(symbols) if symbols else {}
 
     for symbol in symbols:
         pos = port[symbol]
@@ -855,6 +1334,7 @@ def portfolio_inline_kb() -> dict:
                 {"text": "🗑 Удалить", "callback_data": "port:del"},
             ],
             [
+                {"text": "💳 Баланс Binance", "callback_data": "trade:balance"},
                 {"text": "🔙 Вернуть меню кнопок", "callback_data": "menu:main"},
             ]
         ]
@@ -879,26 +1359,52 @@ def remove_asset_inline_kb(state: dict) -> Optional[dict]:
 def settings_text(state: dict) -> str:
     s = state["settings"]
     filt_label = "🔥 Только Strong" if s.get("filter_level") == "strong_only" else "⚡ Strong + Watch"
-    auto_label = "🟢 Включён" if s.get("autoscan", True) else "🔴 Выключен"
+    auto_scan_label = "🟢 Включён" if s.get("autoscan", True) else "🔴 Выключен"
+    auto_trade_label = "🟢 Включена (+3% TP)" if s.get("auto_trade", False) else "🔴 Выключена"
     interval_m = s.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL) // 60
+    trade_amt = s.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT)
+    tp_pct = s.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
+
+    api_key, api_secret = get_api_credentials(state)
+    api_status = "🟢 Подключены" if (api_key and api_secret) else "⚪ Не заданы (только сигналы)"
 
     return (
-        "<b>⚙️ Параметры сканера Pump Pulse</b>\n\n"
+        "<b>⚙️ Параметры бота Pump Pulse</b>\n\n"
+        f"• <b>Автосканирование рынка:</b> {auto_scan_label} (каждые {interval_m} мин)\n"
         f"• <b>Порог Score (MIN_SCORE):</b> <code>{s['min_score']:.0f}</code>\n"
-        f"• <b>Мин. суточный объём:</b> <code>{s['min_quote_volume']:,.0f} USDT</code>\n"
-        f"• <b>Автосканирование рынка:</b> {auto_label}\n"
-        f"• <b>Интервал автопроверки:</b> <code>{interval_m} мин ({s['scan_interval_sec']}с)</code>\n"
         f"• <b>Уведомления:</b> <code>{filt_label}</code>\n\n"
-        "<i>Используйте кнопки ниже для быстрой настройки бота:</i>"
+        "<b>⚡ Спотовая торговля Binance:</b>\n"
+        f"• <b>Автоторговля пампов:</b> {auto_trade_label}\n"
+        f"• <b>Размер покупки:</b> <code>{trade_amt:.1f} USDT</code>\n"
+        f"• <b>Тейк-профит (TP):</b> <code>+{tp_pct:.1f}%</code> (выставляется сразу)\n"
+        f"• <b>Статус API Binance:</b> {api_status}\n\n"
+        "<i>Используйте кнопки ниже для быстрой настройки:</i>"
     )
 
 def settings_inline_kb(state: dict) -> dict:
     s = state["settings"]
     autoscan_label = "🔴 Отключить автоскан" if s.get("autoscan", True) else "🟢 Включить автоскан"
     filter_label = "🔔 Сигналы: Только Strong" if s.get("filter_level") == "strong_only" else "🔔 Сигналы: Strong + Watch"
+    autotrade_label = "🔴 Выключить автоторговлю" if s.get("auto_trade", False) else "⚡ Включить автоторговлю"
 
     return {
         "inline_keyboard": [
+            [
+                {"text": autotrade_label, "callback_data": "trade:toggle"},
+            ],
+            [
+                {"text": "💰 11 USDT", "callback_data": "trade:amt:11"},
+                {"text": "💰 25 USDT", "callback_data": "trade:amt:25"},
+                {"text": "💰 50 USDT", "callback_data": "trade:amt:50"},
+            ],
+            [
+                {"text": "🎯 TP: +2%", "callback_data": "trade:tp:2"},
+                {"text": "🎯 TP: +3%", "callback_data": "trade:tp:3"},
+                {"text": "🎯 TP: +5%", "callback_data": "trade:tp:5"},
+            ],
+            [
+                {"text": "💳 Баланс Binance", "callback_data": "trade:balance"},
+            ],
             [
                 {"text": "Порог Score −5", "callback_data": "score:-5"},
                 {"text": "Порог Score +5", "callback_data": "score:+5"},
@@ -910,14 +1416,12 @@ def settings_inline_kb(state: dict) -> dict:
             ],
             [
                 {"text": autoscan_label, "callback_data": "autoscan:toggle"},
+                {"text": filter_label, "callback_data": "filter:toggle"},
             ],
             [
                 {"text": "⏱ 3 мин", "callback_data": "interval:180"},
                 {"text": "⏱ 5 мин", "callback_data": "interval:300"},
                 {"text": "⏱ 10 мин", "callback_data": "interval:600"},
-            ],
-            [
-                {"text": filter_label, "callback_data": "filter:toggle"},
             ],
             [
                 {"text": "🔄 Обновить статус", "callback_data": "settings:refresh"},
@@ -926,16 +1430,25 @@ def settings_inline_kb(state: dict) -> dict:
         ]
     }
 
-def signal_inline_kb(sig: PumpSignal) -> dict:
+def signal_inline_kb(sig: PumpSignal, state: Optional[dict] = None) -> dict:
     base = sig.base
     binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sig.symbol}"
+
+    trade_amt = 11.0
+    tp_pct = 3.0
+    if state:
+        trade_amt = float(state.get("settings", {}).get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
+        tp_pct = float(state.get("settings", {}).get("take_profit_pct", DEFAULT_TAKE_PROFIT))
 
     return {
         "inline_keyboard": [
             [
                 {"text": "📊 Binance Spot", "url": binance_url},
                 {"text": "📈 TradingView", "url": tv_url},
+            ],
+            [
+                {"text": f"⚡ Купить на {trade_amt:.0f}$ (TP +{tp_pct:.0f}%)", "callback_data": f"trade_buy:{sig.symbol}"},
             ],
             [
                 {"text": f"➕ Добавить {base} в портфель", "callback_data": f"add_coin:{sig.symbol}:{sig.price}"},
@@ -945,29 +1458,30 @@ def signal_inline_kb(sig: PumpSignal) -> dict:
     }
 
 HELP_TEXT = (
-    "<b>🚀 Pump Pulse Scanner 2.0</b>\n\n"
-    "Бот отслеживает аномальную активность и зарождение импульсов на спотовом рынке Binance (USDT-пары).\n\n"
+    "<b>🚀 Pump Pulse Scanner 2.0 & Binance Spot Trader</b>\n\n"
+    "Бот отслеживает аномальную активность на спотовом рынке Binance (USDT-пары) "
+    "и поддерживает автоматическую покупку с мгновенным выставлением Take-Profit (+3%).\n\n"
     "<b>📌 Основные функции:</b>\n"
-    "• <b>🔍 Скан сейчас</b> (/scan) — сканирование всего спота Binance прямо сейчас.\n"
-    "• <b>💼 Портфель</b> (/portfolio) — отслеживание ваших монет и реального PnL.\n"
-    "• <b>➕ Добавить актив</b> (/add) — внести купленную монету.\n"
-    "• <b>🗑 Удалить актив</b> — убрать позицию в 1 клик.\n"
-    "• <b>⚙️ Настройки</b> (/settings) — изменить чувствительность и параметры автоскана.\n\n"
-    "<b>🧠 Как устроен алгоритм скоринга:</b>\n"
-    "Система анализирует 3 таймфрейма (15m, 30m, 1h) по 9 ключевым факторам:\n"
-    "1. <b>Объём:</b> всплеск относительно 20-периодной SMA (до 18 баллов).\n"
-    "2. <b>Breakout:</b> пробой 20-барного Donchian High (до 15 баллов).\n"
-    "3. <b>ATR Expansion:</b> расширение диапазона свечи относительно ATR14 (до 12 баллов).\n"
-    "4. <b>Качество свечи:</b> размер тела, положение закрытия, бычий характер (до 12 баллов).\n"
-    "5. <b>Taker Buy:</b> агрессия рыночных покупателей (до 10 баллов).\n"
-    "6. <b>Тренд EMA:</b> выравнивание Close > EMA 9 > EMA 21 (до 8 баллов).\n"
-    "7. <b>RSI 14:</b> фаза импульса без критической перекупленности (до 8 баллов).\n"
-    "8. <b>Относительно BTC:</b> опережение динамики биткоина (до 7 баллов).\n"
-    "9. <b>Ускорение ROC:</b> нарастание темпа роста (до 5 баллов).\n\n"
+    "• <b>🔍 Скан сейчас</b> (/scan) — сканирование всего спота прямо сейчас.\n"
+    "• <b>💼 Портфель</b> (/portfolio) — баланс Binance, активные сделки и PnL.\n"
+    "• <b>⚡ Торговля</b> (/trade) — статус автоторговли и история профита.\n"
+    "• <b>➕ Добавить актив</b> (/add) — внести купленную монету вручную.\n"
+    "• <b>🗑 Удалить актив</b> (/del) — убрать позицию в 1 клик.\n"
+    "• <b>⚙️ Настройки</b> (/settings) — включение автоторговли, размер ставки ($11, $25, $50) и TP.\n"
+    "• <b>🔑 Привязка API</b> (/api) — настройка Binance API ключей.\n\n"
+    "<b>⚡ Как работает спотовая автоторговля:</b>\n"
+    "1. При обнаружении подтверждённого импульса (Score 74+, STRONG) бот проверяет свободный USDT-баланс.\n"
+    "2. На бирже размещается спотовый MARKET BUY ордер на указанную сумму (~11 USDT).\n"
+    "3. Сразу же выставляется лимитный ордер на продажу (LIMIT SELL GTC) с профитом +3%.\n"
+    "4. Когда цена доходит до цели, ордер исполняется и средства автоматически возвращаются в USDT!\n\n"
+    "<b>🧠 9 факторов алгоритма скоринга:</b>\n"
+    "Объём к SMA20 (18б), Breakout Donchian (15б), ATR Expansion (12б), "
+    "Качество свечи (12б), Taker Buy агрессия (10б), Тренд EMA (8б), RSI 14 (8б), "
+    "Опережение BTC (7б), ROC ускорение (5б).\n\n"
     "<b>Категории сигналов:</b>\n"
-    "• 🔥 <b>STRONG</b> (Score 74+) — мощный чистый импульс.\n"
+    "• 🔥 <b>STRONG</b> (Score 74+) — максимальный импульс (вход в сделку).\n"
     "• ⚡ <b>WATCH</b> (Score 60–73) — зарождающийся импульс под наблюдение.\n"
-    "• ⚠️ <b>LATE</b> — сильный скор, но актив уже сильно растянут.\n"
+    "• ⚠️ <b>LATE</b> — сильный скор, но актив уже перегрет.\n"
 )
 
 # ───────────────────────── Telegram API ─────────────────────────
@@ -1081,8 +1595,10 @@ def set_bot_commands(token: str) -> bool:
     commands = [
         {"command": "scan", "description": "🔍 Сканировать рынок Binance прямо сейчас"},
         {"command": "portfolio", "description": "💼 Открыть портфель и текущий PnL"},
+        {"command": "trade", "description": "⚡ Управление спотовой автоторговлей"},
+        {"command": "settings", "description": "⚙️ Настройки скоринга, ставки и TP"},
+        {"command": "api", "description": "🔑 Подключение Binance API ключей"},
         {"command": "add", "description": "➕ Добавить монету в портфель"},
-        {"command": "settings", "description": "⚙️ Настройки скоринга и автоскана"},
         {"command": "help", "description": "ℹ️ Справка по стратегии и сигналам"},
         {"command": "cancel", "description": "❌ Отменить ввод или действие"},
     ]
@@ -1184,7 +1700,7 @@ def execute_scan_and_report(token: str, chat_id: str | int, state: dict) -> None
 
             for sig in filtered_signals[:5]:
                 card_text = format_alert(sig)
-                kb = signal_inline_kb(sig)
+                kb = signal_inline_kb(sig, state=state)
                 send_telegram(token, chat_id, card_text, reply_markup=kb)
                 time.sleep(0.15)
 
@@ -1244,6 +1760,25 @@ def autoscan_worker(token: str, stop_event: threading.Event) -> None:
         try:
             state = load_state()
             settings = state.get("settings", {})
+
+            # Список чатов для оповещения
+            env_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+            target_chats: Set[str] = set()
+            if env_chat and (env_chat.lstrip("-").isdigit() or env_chat.startswith("@")):
+                target_chats.add(env_chat)
+            for c in state.get("allowed_chats", []):
+                cid_str = str(c).strip()
+                if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
+                    target_chats.add(cid_str)
+
+            # 1. Проверка исполнения активных Take-Profit ордеров на Binance
+            primary_trade_chat = env_chat or (list(target_chats)[0] if target_chats else "")
+            if primary_trade_chat:
+                try:
+                    check_active_trades(token, primary_trade_chat, state)
+                except Exception as e:
+                    print(f"[Autoscan Trade Check Error]: {e}", file=sys.stderr)
+
             if not settings.get("autoscan", True):
                 stop_event.wait(10)
                 continue
@@ -1264,16 +1799,6 @@ def autoscan_worker(token: str, stop_event: threading.Event) -> None:
             sent_alerts: dict = state.setdefault("sent_alerts", {})
             new_alerts_count = 0
 
-            # Список чатов для оповещения
-            env_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-            target_chats: Set[str] = set()
-            if env_chat and (env_chat.lstrip("-").isdigit() or env_chat.startswith("@")):
-                target_chats.add(env_chat)
-            for c in state.get("allowed_chats", []):
-                cid_str = str(c).strip()
-                if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
-                    target_chats.add(cid_str)
-
             for sig in active_signals:
                 if sig.alert_key in sent_alerts:
                     continue
@@ -1281,7 +1806,7 @@ def autoscan_worker(token: str, stop_event: threading.Event) -> None:
                 sent_alerts[sig.alert_key] = now
                 new_alerts_count += 1
                 text = format_alert(sig)
-                kb = signal_inline_kb(sig)
+                kb = signal_inline_kb(sig, state=state)
 
                 for cid in target_chats:
                     try:
@@ -1289,8 +1814,19 @@ def autoscan_worker(token: str, stop_event: threading.Event) -> None:
                     except Exception as e:
                         print(f"Ошибка отправки алерта в {cid}: {e}", file=sys.stderr)
 
+                # 2. Автоторговля памп-импульсов (если включена)
+                auto_trade_enabled = settings.get("auto_trade", False)
+                trade_min_score = settings.get("trade_min_score", DEFAULT_TRADE_MIN_SCORE)
+                if auto_trade_enabled and sig.grade == "strong" and sig.score >= trade_min_score:
+                    if primary_trade_chat:
+                        try:
+                            print(f"[Autoscan] Выполнение автоматической покупки {sig.symbol} (Score: {sig.score:.1f})...")
+                            execute_pump_auto_trade(token, primary_trade_chat, state, sig)
+                        except Exception as e:
+                            print(f"[Autoscan AutoTrade Error for {sig.symbol}]: {e}", file=sys.stderr)
+
             if new_alerts_count > 0:
-                save_state(state)
+                save_state(state, sync_git=True)
                 print(f"[Autoscan] Отправлено {new_alerts_count} новых сигналов в {len(target_chats)} чат(ов)")
 
         except Exception as e:
@@ -1420,6 +1956,81 @@ def run_bot(token: str) -> None:
                 answer_callback(token, cb_id, "Настройки обновлены")
                 if msg_id:
                     edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            # ── Callback-обработчики спотовой автоторговли Binance ──
+            elif cb_data == "trade:toggle":
+                cur_at = settings.get("auto_trade", False)
+                settings["auto_trade"] = not cur_at
+                save_state(state, sync_git=True)
+                st_str = "включена (TP +3%) 🟢" if settings["auto_trade"] else "отключена 🔴"
+                answer_callback(token, cb_id, f"Автоторговля {st_str}")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cb_data.startswith("trade:amt:"):
+                val = float(cb_data.split(":")[-1])
+                settings["trade_amount_usdt"] = val
+                save_state(state, sync_git=True)
+                answer_callback(token, cb_id, f"Сумма ставки: {val:.0f} USDT")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cb_data.startswith("trade:tp:"):
+                val = float(cb_data.split(":")[-1])
+                settings["take_profit_pct"] = val
+                save_state(state, sync_git=True)
+                answer_callback(token, cb_id, f"Take-Profit: +{val:.1f}%")
+                if msg_id:
+                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cb_data == "trade:balance":
+                free_usdt = get_free_usdt_balance(state)
+                bals = get_spot_balances(state)
+                if not bals and free_usdt == 0.0:
+                    api_k, api_s = get_api_credentials(state)
+                    if not api_k or not api_s:
+                        answer_callback(token, cb_id, "Ключи Binance не настроены!", show_alert=True)
+                        send_telegram(
+                            token,
+                            chat_id,
+                            "⚠️ <b>Ключи Binance API не настроены.</b>\n\n"
+                            "Укажите их в <code>.env</code> или отправьте команду:\n"
+                            "<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
+                            "<i>(Убедитесь, что включена опция «Включить спотовую и маржинальную торговлю», а вывод заблокирован).</i>",
+                        )
+                    else:
+                        answer_callback(token, cb_id, "Ошибка получения баланса Binance", show_alert=True)
+                else:
+                    bal_items = [f"• <b>{k}:</b> {fmt_qty(v)}" for k, v in sorted(bals.items()) if v > 0.0001]
+                    bal_str = "\n".join(bal_items[:12]) if bal_items else "<i>Нет активов с ненулевым остатком</i>"
+                    answer_callback(token, cb_id, f"Свободно USDT: {free_usdt:,.2f}")
+                    send_telegram(
+                        token,
+                        chat_id,
+                        f"💳 <b>Спотовый баланс Binance:</b>\n\n"
+                        f"💵 <b>Свободно USDT для торговли:</b> <code>{free_usdt:,.2f} USDT</code>\n\n"
+                        f"<b>Активы на кошельке:</b>\n{bal_str}",
+                    )
+
+            elif cb_data.startswith("trade_buy:"):
+                sym = cb_data.split(":", 1)[1]
+                answer_callback(token, cb_id, f"Покупка {base_asset(sym)} на Binance...")
+                mkt_p = get_price(sym) or 0.0
+                dummy_sig = PumpSignal(
+                    symbol=sym,
+                    base=base_asset(sym),
+                    quote="USDT",
+                    price=mkt_p,
+                    change_24h=0.0,
+                    volume_24h=0.0,
+                    score=80.0,
+                    grade="strong",
+                    best_tf="15m",
+                    by_tf=[],
+                    btc_relative_24h=0.0,
+                    alert_key=f"manual_{sym}_{int(time.time())}",
+                )
+                execute_pump_auto_trade(token, chat_id, state, dummy_sig)
 
             # Управление портфелем через Callback
             elif cb_data == "port:refresh":
@@ -1563,7 +2174,7 @@ def run_bot(token: str) -> None:
 
         # Если нажата любая кнопка главного меню — сбрасываем FSM и сразу выполняем действие
         is_menu_action = (
-            cmd in ("/start", "/scan", "/portfolio", "/port", "/settings", "/help", "/del", "/delete", "/cancel")
+            cmd in ("/start", "/scan", "/portfolio", "/port", "/settings", "/help", "/del", "/delete", "/cancel", "/trade", "/trades", "/api")
             or "скан" in text_lower
             or "портфель" in text_lower
             or "настройк" in text_lower
@@ -1571,6 +2182,8 @@ def run_bot(token: str) -> None:
             or "справка" in text_lower
             or "удалить" in text_lower
             or "отмена" in text_lower
+            or "торговл" in text_lower
+            or "сделк" in text_lower
         )
         if is_menu_action and chat_id in user_fsm:
             print(f"-> Сброс FSM для {chat_id} по кнопке меню: {clean_text}")
@@ -1785,6 +2398,60 @@ def run_bot(token: str) -> None:
                 reply_markup=settings_inline_kb(state),
             )
 
+        elif cmd in ("/trade", "/trades") or "торговл" in text_lower or "сделк" in text_lower:
+            print(f"-> Запрос панели торговли для {chat_id}")
+            settings = state.get("settings", {})
+            at_status = "🟢 ВКЛЮЧЕНА (+3% TP)" if settings.get("auto_trade", False) else "🔴 ВЫКЛЮЧЕНА"
+            amt = settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT)
+            tp = settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
+            free_usdt = get_free_usdt_balance(state)
+            active_cnt = len(state.get("active_trades", {}))
+            history_cnt = len(state.get("trade_history", []))
+
+            trade_info = (
+                f"⚡ <b>Панель управления спотовой торговлей Binance</b>\n\n"
+                f"• Автоторговля пампов: <b>{at_status}</b>\n"
+                f"• Сумма покупки: <code>{amt:.1f} USDT</code>\n"
+                f"• Лимит Take-Profit: <code>+{tp:.1f}%</code>\n"
+                f"• Доступно USDT на бирже: <code>{free_usdt:,.2f} USDT</code>\n"
+                f"• Активных сделок (ордеров TP): <b>{active_cnt}</b>\n"
+                f"• Успешно закрытых сделок: <b>{history_cnt}</b>\n\n"
+                f"<i>Используйте кнопки ниже для переключения режима и ставок:</i>"
+            )
+            send_telegram(token, chat_id, trade_info, reply_markup=settings_inline_kb(state))
+
+        elif cmd == "/api":
+            args = clean_text.split()[1:]
+            if len(args) == 2:
+                k, s = args[0].strip(), args[1].strip()
+                settings = state.setdefault("settings", {})
+                settings["binance_api_key"] = k
+                settings["binance_api_secret"] = s
+                save_state(state, sync_git=True)
+                masked = k[:4] + "..." + k[-4:] if len(k) > 8 else "***"
+                send_telegram(
+                    token,
+                    chat_id,
+                    f"✅ <b>API-ключи Binance сохранены!</b>\n\n"
+                    f"• API Key: <code>{masked}</code>\n"
+                    f"• Спотовая торговля готова к работе.\n\n"
+                    f"💡 Проверьте баланс кнопкой <b>«💳 Баланс Binance»</b> в настройках ⚙️.",
+                    reply_markup=main_keyboard(),
+                )
+            else:
+                api_k, api_s = get_api_credentials(state)
+                st = f"Ключ сохранён ({api_k[:4]}...)" if api_k else "Ключи не заданы"
+                send_telegram(
+                    token,
+                    chat_id,
+                    f"🔑 <b>Настройка Binance API</b>\n\n"
+                    f"Текущий статус: <code>{st}</code>\n\n"
+                    f"Чтобы привязать ключи, отправьте команду:\n"
+                    f"<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
+                    f"<i>Рекомендация по безопасности: на Binance включите только «Чтение» и «Спотовая торговля». Вывод средств оставьте отключённым!</i>",
+                    reply_markup=main_keyboard(),
+                )
+
         elif cmd == "/help" or "помощь" in text_lower or "справка" in text_lower:
             print(f"-> Отправка справки для {chat_id}")
             send_telegram(token, chat_id, HELP_TEXT, reply_markup=main_keyboard())
@@ -1880,7 +2547,7 @@ def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
             sent_alerts[sig.alert_key] = now
             sent_count += 1
             text = format_alert(sig)
-            kb = signal_inline_kb(sig)
+            kb = signal_inline_kb(sig, state=state)
 
             for cid in target_chats:
                 ok = send_telegram(token, cid, text, reply_markup=kb)
@@ -1961,15 +2628,55 @@ def run_test_connection(token: str, chat_id: str) -> None:
             file=sys.stderr,
         )
 
+def run_test_trade() -> None:
+    """Тест подключения к торговому API Binance и проверка баланса спота."""
+    print("=== Проверка подключения к Binance Spot API ===")
+    state = load_state()
+    offset = sync_binance_time(force=True)
+    print(f"• Синхронизация времени: серверный сдвиг Binance = {offset:+d} ms")
+
+    api_key, api_secret = get_api_credentials(state)
+    if not api_key or not api_secret:
+        print("❌ Ошибка: BINANCE_API_KEY и BINANCE_API_SECRET не заданы в .env или в боте!", file=sys.stderr)
+        print("   Для спотовой торговли укажите ключи в .env:")
+        print("      BINANCE_API_KEY=ваш_api_ключ")
+        print("      BINANCE_API_SECRET=ваш_секретный_ключ")
+        return
+
+    masked = api_key[:4] + "..." + api_key[-4:] if len(api_key) > 8 else "***"
+    print(f"• API Key: {masked}")
+
+    print("• Отправка HMAC-SHA256 запроса к /api/v3/account...")
+    acc = binance_signed_request("GET", "/api/v3/account", state=state)
+    if "error" in acc:
+        print(f"❌ Ошибка авторизации Binance: {acc.get('error')}", file=sys.stderr)
+        return
+
+    can_trade = acc.get("canTrade", False)
+    print(f"✅ Успешная авторизация! Спотовая торговля разрешена: {'🟢 ДА' if can_trade else '🔴 НЕТ'}")
+
+    bals = get_spot_balances(state)
+    free_usdt = bals.get("USDT", 0.0)
+    print(f"• Свободный баланс USDT для сделок: {free_usdt:,.2f} USDT")
+
+    other_bals = [f"{k}: {fmt_qty(v)}" for k, v in sorted(bals.items()) if k != "USDT" and v > 0.0001]
+    if other_bals:
+        print(f"• Другие активы на споте: {', '.join(other_bals[:6])}")
+    print("=== Проверка Binance завершена успешно ===")
+
 # ───────────────────────── Main ─────────────────────────
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-    # Проверка тестового режима
+    # Проверка тестовых режимов
     if "--test" in sys.argv:
         run_test_connection(token, chat_id)
+        return
+
+    if "--test-trade" in sys.argv:
+        run_test_trade()
         return
 
     # Проверка аргументов командной строки: --oneshot или --bot
