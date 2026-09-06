@@ -14,7 +14,9 @@
   },
   "active_trades": {},
   "trade_history": [],
-  "sent_alerts": {},
+  "sent_alerts": {
+    "INJUSDT:30m:1788735600000": 1788737123
+  },
   "allowed_chats": [
     "1920596593"
   ]
