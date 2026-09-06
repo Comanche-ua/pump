@@ -67,7 +67,13 @@ MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "40"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
 KLINES_LIMIT = 200  # нужно ~32+ бара на 1h
 
-RUN_MODE = os.environ.get("RUN_MODE", "bot").strip().lower()
+IS_CI = (
+    os.environ.get("GITHUB_ACTIONS") == "true"
+    or os.environ.get("CI") == "true"
+    or os.environ.get("CONTINUOUS_INTEGRATION") == "true"
+)
+DEFAULT_RUN_MODE = "oneshot" if IS_CI else "bot"
+RUN_MODE = os.environ.get("RUN_MODE", DEFAULT_RUN_MODE).strip().lower()
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
 DEFAULT_SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
 
@@ -944,14 +950,35 @@ def api_call(token: str, method: str, payload: dict, timeout: int = 25) -> dict:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        # Игнорируем штатные ошибки редактирования без изменений
-        if "message is not modified" not in err_body:
+        err_body = e.read().decode("utf-8", errors="ignore").lower()
+        # Игнорируем штатные незначительные ошибки (устаревший callback, неизмененное сообщение и т.п.)
+        benign_errors = (
+            "message is not modified",
+            "query is too old",
+            "query id is invalid",
+            "message to edit not found",
+            "bot was blocked by the user",
+        )
+        if not any(be in err_body for be in benign_errors):
             print(f"Telegram API HTTPError ({method}): {e.code} {err_body}", file=sys.stderr)
         return {}
     except Exception as e:
         print(f"Telegram error ({method}): {e}", file=sys.stderr)
         return {}
+
+def drop_pending_updates(token: str) -> int:
+    """
+    Сбрасывает старые апдейты, накопившиеся в очереди Telegram пока бот был оффлайн.
+    Возвращает следующий актуальный offset.
+    """
+    try:
+        body = api_call(token, "getUpdates", {"offset": -1, "timeout": 0}, timeout=10)
+        updates = body.get("result", [])
+        if updates:
+            return updates[-1]["update_id"] + 1
+    except Exception:
+        pass
+    return 0
 
 def send_telegram(
     token: str,
@@ -1224,7 +1251,7 @@ def run_bot(token: str) -> None:
 
     # FSM context: chat_id -> {"state": str, "data": dict}
     user_fsm: Dict[str, dict] = {}
-    last_offset = 0
+    last_offset = drop_pending_updates(token)
 
     print("Бот успешно запущен. Ожидание входящих сообщений (long polling)...")
 
@@ -1630,26 +1657,57 @@ def run_bot(token: str) -> None:
 def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
     print("=== Режим разового сканирования (Oneshot) ===")
     state = load_state()
+    settings = state.get("settings", {})
+    min_score = settings.get("min_score", DEFAULT_MIN_SCORE)
+    min_vol = settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME)
+    filter_level = settings.get("filter_level", "strong_and_watch")
+
     signals, meta, summaries = run_scan(
-        min_score=state["settings"].get("min_score"),
-        min_quote_volume=state["settings"].get("min_quote_volume"),
+        min_score=min_score,
+        min_quote_volume=min_vol,
     )
 
-    strong = [s for s in signals if s.grade == "strong"]
-    watch = [s for s in signals if s.grade == "watch"]
+    if filter_level == "strong_only":
+        active_signals = [s for s in signals if s.grade == "strong"]
+    else:
+        active_signals = [s for s in signals if s.grade in ("strong", "watch")]
+
+    duration_sec = meta["duration_ms"] / 1000.0
     print(
-        f"Сканирование завершено: пар={meta['universe']}, "
-        f"сигналов={len(signals)} (strong={len(strong)}, watch={len(watch)}), "
-        f"время={meta['duration_ms']}мс"
+        f"Сканирование завершено за {duration_sec:.1f}с: пар={meta['universe']}, "
+        f"отобрано={meta['candidates']}, активных сигналов={len(active_signals)}"
     )
 
     if token and chat_id:
-        to_send = [s for s in signals if s.grade in ("strong", "watch")]
-        for sig in to_send:
-            ok = send_telegram(token, chat_id, format_alert(sig), reply_markup=signal_inline_kb(sig))
-            print(f"{sig.symbol} ({sig.grade} {sig.best_score:.0f}) → {'sent' if ok else 'fail'}")
+        now = int(time.time())
+        sent_alerts: dict = state.setdefault("sent_alerts", {})
+        sent_count = 0
+
+        target_chats: Set[str] = {chat_id}
+        for c in state.get("allowed_chats", []):
+            target_chats.add(str(c))
+
+        for sig in active_signals:
+            if sig.alert_key in sent_alerts:
+                print(f"• Пропуск {sig.symbol} ({sig.best_tf}): алерт для этого бара уже был отправлен ранее")
+                continue
+
+            sent_alerts[sig.alert_key] = now
+            sent_count += 1
+            text = format_alert(sig)
+            kb = signal_inline_kb(sig)
+
+            for cid in target_chats:
+                ok = send_telegram(token, cid, text, reply_markup=kb)
+                print(f"• {sig.symbol} ({sig.grade} {sig.best_score:.0f}) → {cid}: {'sent' if ok else 'fail'}")
+
+        if sent_count > 0:
+            save_state(state)
+            print(f"Успешно отправлено новых сигналов: {sent_count}")
+        else:
+            print("Новых уникальных сигналов выше порога не обнаружено.")
     else:
-        for s in signals:
+        for s in active_signals:
             print(f"[{s.grade.upper()}] {s.symbol} Score: {s.best_score:.0f} Price: {s.price} 24h: {s.change_24h:+.2f}%")
 
 # ───────────────────────── Main ─────────────────────────
