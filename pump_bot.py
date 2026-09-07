@@ -62,21 +62,21 @@ except ImportError:
 
 BINANCE_BASE = "https://data-api.binance.vision"
 BINANCE_TRADE_URL = "https://api.binance.com"
-TIMEFRAMES = ("15m", "30m", "1h")
-TF_MS = {"15m": 15 * 60_000, "30m": 30 * 60_000, "1h": 60 * 60_000}
+TIMEFRAMES = ("5m", "15m", "1h")
+TF_MS = {"5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000}
 
-DEFAULT_MIN_QUOTE_VOLUME = float(os.environ.get("MIN_QUOTE_VOLUME", "1500000"))
-DEFAULT_MIN_SCORE = float(os.environ.get("MIN_SCORE", "62"))
-ALREADY_PUMPED_MAX = float(os.environ.get("ALREADY_PUMPED_MAX", "35"))
-MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "40"))
+DEFAULT_MIN_QUOTE_VOLUME = float(os.environ.get("MIN_QUOTE_VOLUME", "1200000"))
+DEFAULT_MIN_SCORE = float(os.environ.get("MIN_SCORE", "58"))
+ALREADY_PUMPED_MAX = float(os.environ.get("ALREADY_PUMPED_MAX", "8.0"))  # Защита от перегретых монет: ищем в зародыше (до +8% за 24ч)
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "50"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
-KLINES_LIMIT = 200  # нужно ~32+ бара на 1h
+KLINES_LIMIT = 250  # 250 баров по 5m (~20 часов подробной истории)
 
 # Параметры спотовой автоторговли
 DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "11.0"))
 DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "3.0"))
 DEFAULT_AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").strip().lower() in ("true", "1")
-DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "74.0"))
+DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "70.0"))
 
 IS_CI = (
     os.environ.get("GITHUB_ACTIONS") == "true"
@@ -251,6 +251,31 @@ def donchian_high(candles: List[Candle], period: int) -> Optional[float]:
         return None
     return max(c.high for c in candles[-period:])
 
+def stddev(values: List[float], period: int = 20) -> Optional[float]:
+    """Среднеквадратичное отклонение цены."""
+    if len(values) < period:
+        return None
+    sub = values[-period:]
+    mean = sum(sub) / period
+    variance = sum((x - mean) ** 2 for x in sub) / period
+    return math.sqrt(variance)
+
+def bollinger_squeeze(closes: List[float], period: int = 20) -> float:
+    """
+    Рассчитывает степень сжатия волатильности (BandWidth / SMA).
+    Чем меньше значение (< 0.035..0.045), тем сильнее сжата 'пружина' перед выстрелом.
+    Возвращает 1.0 (максимальное сжатие) .. 0.0 (сильная растянутость).
+    """
+    if len(closes) < period:
+        return 0.5
+    mean = sma(closes, period)
+    sd = stddev(closes, period)
+    if not mean or not sd or mean <= 0:
+        return 0.5
+    bandwidth = (2.0 * sd * 2.0) / mean  # 4 * sigma / mean
+    # Если bandwidth <= 0.03 (3%), сжатие максимальное (1.0). Если > 0.08, сжатия нет (0.0).
+    return clamp(1.0 - (bandwidth - 0.025) / 0.055, 0.0, 1.0)
+
 def pct_change(from_: float, to: float) -> float:
     if from_ == 0:
         return 0.0
@@ -321,18 +346,25 @@ def pick_candidates(tickers: List[dict], min_quote_volume: float = DEFAULT_MIN_Q
     liquid = [
         t for t in tickers
         if t["quoteVolume"] >= min_quote_volume
-        and t["priceChangePercent"] <= ALREADY_PUMPED_MAX
+        and -4.0 <= t["priceChangePercent"] <= ALREADY_PUMPED_MAX  # Отсекаем дампы (<-4%) и уже взлетевшие (>+8%)
     ]
-    by_change = sorted(liquid, key=lambda t: t["priceChangePercent"], reverse=True)
-    by_heat = sorted(
+    # Приоритет 1: Умеренный рост в зародыше (+0.5% .. +4%)
+    by_germ = sorted(
         liquid,
-        key=lambda t: math.log10(t["quoteVolume"] + 1) * max(t["priceChangePercent"], 0),
+        key=lambda t: t["quoteVolume"] if (0.5 <= t["priceChangePercent"] <= 4.5) else 0.0,
         reverse=True,
     )
+    # Приоритет 2: Высокая ликвидность в узком флэте (-1.0% .. +2.0%)
+    by_flat = sorted(
+        liquid,
+        key=lambda t: t["quoteVolume"] if (-1.5 <= t["priceChangePercent"] <= 2.5) else 0.0,
+        reverse=True,
+    )
+    # Приоритет 3: Общая активность
     by_vol = sorted(liquid, key=lambda t: t["quoteVolume"], reverse=True)
 
     picked: Dict[str, dict] = {}
-    for t in by_change[:16] + by_heat[:16] + by_vol[:12]:
+    for t in by_germ[:24] + by_flat[:20] + by_vol[:16]:
         picked[t["symbol"]] = t
     picked.pop("BTCUSDT", None)
     return list(picked.values())[:MAX_CANDIDATES]
@@ -354,7 +386,7 @@ def parse_kline(raw: list) -> Candle:
     )
 
 def fetch_klines(symbol: str, limit: int = KLINES_LIMIT) -> List[Candle]:
-    url = f"{BINANCE_BASE}/api/v3/klines?symbol={symbol}&interval=15m&limit={limit}"
+    url = f"{BINANCE_BASE}/api/v3/klines?symbol={symbol}&interval=5m&limit={limit}"
     try:
         raw = http_get_json(url, timeout=10)
         return [parse_kline(r) for r in raw]
@@ -366,13 +398,13 @@ def fetch_klines(symbol: str, limit: int = KLINES_LIMIT) -> List[Candle]:
 MIN_BARS = 32
 
 def grade_from(score: float, late: bool) -> str:
-    if score < 50:
+    if score < 48:
         return "none"
-    if late and score >= 66:
+    if late and score >= 62:
         return "late"
-    if score >= 74:
+    if score >= 70:
         return "strong"
-    if score >= 60:
+    if score >= 58:
         return "watch"
     return "none"
 
@@ -390,6 +422,7 @@ def score_window(
     last = candles[-1]
     hist = candles[:-1]
     closes = [c.close for c in candles]
+    hist_closes = [c.close for c in hist]
     vols = [c.volume for c in hist]
 
     vol_sma = sma(vols, 20)
@@ -406,32 +439,41 @@ def score_window(
     close_pos = (last.close - last.low) / range_
     body_ratio = body / range_
     upper_wick_ratio = upper_wick / range_
-    bullish = last.close > last.open
+    bullish = last.close >= last.open
 
+    # 1. Сжатие волатильности (Bollinger Squeeze) перед пампом (пружина)
+    squeeze_val = bollinger_squeeze(hist_closes, 20)  # 0..1 (1 = максимальное сжатие флэта)
+
+    # 2. Taker Buy Ratio (агрессия покупателей по рынку)
+    taker_buy = last.taker_buy_base / last.volume if last.volume > 0 else 0.5
+
+    # 3. ATR и относительное расширение
     atr14 = atr(hist, 14)
     if not atr14 or atr14 <= 0:
         return None
     atr_expansion = range_ / atr14
 
-    prior_high = donchian_high(hist, 20)
+    # 4. Пробой локального коридора консолидации
+    prior_high = donchian_high(hist, 14)
     if prior_high is None:
         return None
     breakout_pct = pct_change(prior_high, last.close)
 
+    # 5. RSI 14
     rsi14 = rsi(closes, 14)
     if rsi14 is None:
         return None
 
+    # 6. Трендовые EMA
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
     ema_aligned = (
         ema9 is not None and ema21 is not None
-        and last.close > ema9 and ema9 > ema21
+        and last.close >= ema9 and ema9 >= ema21
     )
 
-    taker_buy = last.taker_buy_base / last.volume if last.volume > 0 else 0.5
-
-    lookback = 3 if timeframe == "1h" else 4 if timeframe == "30m" else 6
+    # 7. Динамика против BTC
+    lookback = 4 if timeframe == "1h" else 6
     asset_roc = roc(closes, lookback)
     btc_closes = [c.close for c in btc_candles]
     btc_roc = roc(btc_closes, lookback) if len(btc_closes) >= lookback + 1 else 0.0
@@ -439,48 +481,69 @@ def score_window(
 
     prev_roc = roc(closes[:-1], max(1, lookback - 1))
     accel = asset_roc - prev_roc
-
     change_pct = pct_change(last.open, last.close)
 
-    # --- factor values 0..1 ---
-    vol_factor = clamp((vol_ratio - 1.0) / 3.0, 0, 1)
-    breakout_factor = clamp(breakout_pct / 2.5, 0, 1) if breakout_pct > 0 else 0
-    atr_factor = clamp((atr_expansion - 1.0) / 2.0, 0, 1)
+    # ── ФАКТОРЫ СКОРИНГА В ЗАРОДЫШЕ (EARLY PUMP ENGINE) ──
+    # 1. Всплеск объема на покупку (25б): ищем от 2.0x до 5.0x
+    vol_factor = clamp((vol_ratio - 1.2) / 3.0, 0.0, 1.0)
+
+    # 2. Доминирование рыночных покупок Taker Buy (22б): от 55% до 80%+
+    taker_factor = clamp((taker_buy - 0.52) / 0.26, 0.0, 1.0)
+
+    # 3. Сжатие диапазона консолидации перед выстрелом (15б)
+    squeeze_factor = squeeze_val
+
+    # 4. Пробой локального флэта без перегрева (12б)
+    # Идеальный ранний пробой: от +0.3% до +2.5% выше коридора
+    if 0.2 <= breakout_pct <= 2.8:
+        breakout_factor = clamp(breakout_pct / 2.0, 0.2, 1.0)
+    elif breakout_pct > 2.8:
+        breakout_factor = clamp(1.0 - (breakout_pct - 2.8) / 3.0, 0.0, 0.7)
+    else:
+        breakout_factor = 0.0
+
+    # 5. Качество свечи (10б)
     quality = 0.0
     if bullish:
-        quality += 0.35
-    quality += clamp(body_ratio * 1.2, 0, 0.35)
-    quality += clamp(close_pos, 0, 0.30)
-    quality = clamp(quality, 0, 1)
-    taker_factor = clamp((taker_buy - 0.45) / 0.25, 0, 1)
-    ema_factor = 1.0 if ema_aligned else 0.25
-    rsi_factor = 0.0
-    if 52 <= rsi14 <= 72:
-        rsi_factor = 1.0 - abs(rsi14 - 62) / 20
-    elif 45 <= rsi14 < 52:
-        rsi_factor = 0.4
-    elif rsi14 > 72:
-        rsi_factor = clamp(1.0 - (rsi14 - 72) / 15, 0, 0.6)
-    vs_btc_factor = clamp((vs_btc_pct + 0.5) / 2.5, 0, 1)
-    accel_factor = clamp((accel + 0.3) / 1.5, 0, 1)
+        quality += 0.4
+    quality += clamp(body_ratio * 1.0, 0.0, 0.3)
+    quality += clamp(close_pos * 0.3, 0.0, 0.3)
+    quality = clamp(quality, 0.0, 1.0)
 
+    # 6. Окно RSI (8б): идеальное окно зарождения 48..65
+    rsi_factor = 0.0
+    if 48 <= rsi14 <= 66:
+        rsi_factor = 1.0 - abs(rsi14 - 58) / 18.0
+    elif 66 < rsi14 <= 74:
+        rsi_factor = clamp(1.0 - (rsi14 - 66) / 12.0, 0.2, 0.7)
+    elif 40 <= rsi14 < 48:
+        rsi_factor = 0.4
+
+    # 7. Выравнивание EMA (4б)
+    ema_factor = 1.0 if ema_aligned else 0.3
+
+    # 8. Опережение BTC (4б)
+    vs_btc_factor = clamp((vs_btc_pct + 0.3) / 2.0, 0.0, 1.0)
+
+    # Жесткий фильтр перегретости (LATE / PUMP OVER)
+    # Если монета уже выросла за сутки более 7%, или RSI > 74, или свеча уже улетела > 4.5%
     late = (
-        change_24h > 12
-        or rsi14 >= 76
-        or breakout_pct > 4.5
-        or vol_ratio > 5.5
+        change_24h > 7.0
+        or rsi14 >= 74
+        or breakout_pct > 4.0
+        or (vol_ratio > 7.0 and upper_wick_ratio > 0.35)
+        or not bullish  # Исключаем красные свечи (дампы)
     )
 
     factors = [
-        FactorScore("vol", "Объём vs SMA20", 18, vol_factor, f"{vol_ratio:.1f}×"),
-        FactorScore("breakout", "Пробой Donchian20", 15, breakout_factor, f"{breakout_pct:+.2f}%"),
-        FactorScore("atr", "Расширение ATR", 12, atr_factor, f"{atr_expansion:.2f}× ATR14"),
-        FactorScore("candle", "Качество свечи", 12, quality, f"тело {body_ratio*100:.0f}% · close {close_pos*100:.0f}%"),
-        FactorScore("taker", "Агрессия тейкера", 10, taker_factor, f"{taker_buy*100:.0f}% market buy"),
-        FactorScore("ema", "Тренд EMA 9/21", 8, ema_factor, "close > EMA9 > EMA21" if ema_aligned else "нет выравнивания"),
-        FactorScore("rsi", "Окно RSI 14", 8, rsi_factor, f"{rsi14:.1f}"),
-        FactorScore("btc", "Сила vs BTC", 7, vs_btc_factor, f"{vs_btc_pct:+.2f}%"),
-        FactorScore("accel", "Ускорение ROC", 5, accel_factor, f"{accel:+.2f} п.п."),
+        FactorScore("vol", "Всплеск объёма", 25, vol_factor, f"{vol_ratio:.1f}× SMA20"),
+        FactorScore("taker", "Агрессия покупок", 22, taker_factor, f"{taker_buy*100:.0f}% Taker Buy"),
+        FactorScore("squeeze", "Сжатие пружины", 15, squeeze_factor, f"Сжатие {squeeze_val*100:.0f}%"),
+        FactorScore("breakout", "Пробой флэта", 12, breakout_factor, f"{breakout_pct:+.2f}%"),
+        FactorScore("candle", "Структура свечи", 10, quality, f"Бычья, тело {body_ratio*100:.0f}%"),
+        FactorScore("rsi", "Окно RSI 14", 8, rsi_factor, f"{rsi14:.1f} (ранняя зона)"),
+        FactorScore("ema", "Тренд EMA", 4, ema_factor, "Выровнен" if ema_aligned else "Нейтрален"),
+        FactorScore("btc", "Опережение BTC", 4, vs_btc_factor, f"{vs_btc_pct:+.2f}%"),
     ]
 
     score = sum(f.value * f.weight for f in factors)
@@ -489,34 +552,28 @@ def score_window(
         return None
 
     reasons = []
-    if vol_ratio >= 2:
-        reasons.append(f"объём {vol_ratio:.1f}× среднего")
-    if last.close > prior_high:
-        reasons.append("пробой 20-барного максимума")
+    if vol_ratio >= 2.0:
+        reasons.append(f"приток объёма {vol_ratio:.1f}× к среднему")
+    if taker_buy >= 0.62:
+        reasons.append(f"доминируют рыночные покупки ({taker_buy*100:.0f}%)")
+    if squeeze_val >= 0.65:
+        reasons.append("выход из длительного сжатия волатильности")
+    if 0.3 <= breakout_pct <= 2.5:
+        reasons.append(f"аккуратный пробой базы ({breakout_pct:+.1f}%)")
+    if 50 <= rsi14 <= 66:
+        reasons.append(f"RSI {rsi14:.0f} — запас хода вверх без перегрева")
     if ema_aligned:
-        reasons.append("EMA выровнены вверх")
-    if taker_buy >= 0.58:
-        reasons.append("доминируют market buy")
-    if 54 <= rsi14 <= 72:
-        reasons.append("RSI в раннем импульсе, не перекуплен")
-    if vs_btc_pct >= 0.4:
-        reasons.append("обгоняет BTC")
-    if atr_expansion >= 1.8:
-        reasons.append("расширение волатильности")
-    if not bullish:
-        reasons.append("последняя свеча ещё не бычья")
+        reasons.append("структура тренда EMA 9/21 бычья")
 
     risks = []
     if late:
-        risks.append("уже растянут — риск опоздавшего входа")
-    if rsi14 >= 78:
-        risks.append("RSI высокий, возможна разгрузка")
+        risks.append("монета уже дала ход, риск разгрузки")
+    if rsi14 >= 72:
+        risks.append("RSI в зоне перекупленности")
     if upper_wick_ratio > 0.28:
-        risks.append("верхняя тень — продавцы защищаются")
-    if change_24h > 15:
-        risks.append("сильный ход за 24ч, поздняя фаза")
-    if vol_ratio > 6:
-        risks.append("климакс объёма — часто конец волны")
+        risks.append("длинная верхняя тень (сопротивление)")
+    if change_24h > 6.0:
+        risks.append(f"суточный рост {change_24h:+.1f}% (поздняя фаза)")
 
     return TfBreakdown(
         timeframe=timeframe,
@@ -562,8 +619,8 @@ def analyze_symbol(
 
     all_rows: List[TfBreakdown] = []
     for tf in TIMEFRAMES:
-        candles = raw15 if tf == "15m" else aggregate_timeframe(raw15, TF_MS[tf])
-        btc_c = btc_raw15 if tf == "15m" else aggregate_timeframe(btc_raw15, TF_MS[tf])
+        candles = raw15 if tf == "5m" else aggregate_timeframe(raw15, TF_MS[tf])
+        btc_c = btc_raw15 if tf == "5m" else aggregate_timeframe(btc_raw15, TF_MS[tf])
         bd = score_window(tf, candles, btc_c, ticker["priceChangePercent"], forming=True, strict=False)
         if bd:
             all_rows.append(bd)
@@ -1475,14 +1532,18 @@ HELP_TEXT = (
     "2. На бирже размещается спотовый MARKET BUY ордер на указанную сумму (~11 USDT).\n"
     "3. Сразу же выставляется лимитный ордер на продажу (LIMIT SELL GTC) с профитом +3%.\n"
     "4. Когда цена доходит до цели, ордер исполняется и средства автоматически возвращаются в USDT!\n\n"
-    "<b>🧠 9 факторов алгоритма скоринга:</b>\n"
-    "Объём к SMA20 (18б), Breakout Donchian (15б), ATR Expansion (12б), "
-    "Качество свечи (12б), Taker Buy агрессия (10б), Тренд EMA (8б), RSI 14 (8б), "
-    "Опережение BTC (7б), ROC ускорение (5б).\n\n"
-    "<b>Категории сигналов:</b>\n"
-    "• 🔥 <b>STRONG</b> (Score 74+) — максимальный импульс (вход в сделку).\n"
-    "• ⚡ <b>WATCH</b> (Score 60–73) — зарождающийся импульс под наблюдение.\n"
-    "• ⚠️ <b>LATE</b> — сильный скор, но актив уже перегрет.\n"
+    "<b>🧠 8 факторов раннего обнаружения импульса:</b>\n"
+    "1. <b>Всплеск объёма (25б):</b> резкий приток капитала относительно SMA20.\n"
+    "2. <b>Taker Buy агрессия (22б):</b> доминирование покупок по рынку (>60-70%).\n"
+    "3. <b>Сжатие волатильности (15б):</b> пружина Bollinger Squeeze перед выстрелом.\n"
+    "4. <b>Пробой локальной базы (12б):</b> ранний выход из коридора (+0.3%..+2.5%).\n"
+    "5. <b>Структура свечи (10б):</b> бычья формация без длинных верхних теней.\n"
+    "6. <b>Окно RSI 14 (8б):</b> коридор 48-65 (ранний старт без перекупленности).\n"
+    "7. <b>Тренд EMA 9/21 (4б):</b> выравнивание скользящих вверх.\n"
+    "8. <b>Опережение BTC (4б):</b> динамика сильнее биткоина.\n\n"
+    "<b>🛡 Защита от слива и верхушек:</b>\n"
+    "• Монеты с суточным ростом > +7% или красными свечами (дамп) отсекаются.\n"
+    "• Сигналы выдаются <b>до</b> взлёта, а не на пике движения!"
 )
 
 # ───────────────────────── Telegram API ─────────────────────────
@@ -1624,7 +1685,11 @@ def get_updates(token: str, offset: int, timeout: int = 15) -> List[dict]:
 
 def format_alert(sig: PumpSignal) -> str:
     tf = next((t for t in sig.by_tf if t.timeframe == sig.best_tf), sig.by_tf[0])
-    title = {"strong": "🔥 PUMP PULSE", "late": "⚠️ LATE PULSE", "watch": "⚡ WATCH PULSE"}.get(sig.grade, "SIGNAL")
+    title = {
+        "strong": "🚀 ИМПУЛЬС В ЗАРОДЫШЕ (STRONG)",
+        "watch": "⚡ НАКОПЛЕНИЕ ОБЪЁМА (WATCH)",
+        "late": "⚠️ ПОЗДНИЙ ВХОД (LATE)",
+    }.get(sig.grade, "СИГНАЛ")
     reasons = "\n".join(f"  ✓ {r}" for r in tf.reasons[:4])
     risks = ""
     if tf.risks:
@@ -1636,11 +1701,11 @@ def format_alert(sig: PumpSignal) -> str:
         f"<b>{title} · {sig.base}/USDT</b>\n\n"
         f"🎯 <b>Score:</b> <code>{sig.best_score:.0f}/100</code> | <b>TF:</b> <code>{sig.best_tf}</code>\n"
         f"💵 <b>Цена:</b> <code>{fmt_price(sig.price)} USDT</code>\n"
-        f"📊 <b>Суточный рост 24ч:</b> <code>{fmt_pct(sig.change_24h)}</code>\n"
-        f"⚡ <b>Относительно BTC:</b> <code>{fmt_pct(sig.btc_relative_24h)}</code>\n"
+        f"📊 <b>Суточный рост 24ч:</b> <code>{fmt_pct(sig.change_24h)}</code> <i>(в базе)</i>\n"
         f"🌊 <b>Всплеск объёма:</b> <code>{vol_str} SMA20</code>\n"
-        f"📈 <b>RSI (14):</b> <code>{tf.rsi:.1f}</code> | <b>Taker Buy:</b> <code>{tf.taker_buy*100:.0f}%</code>\n\n"
-        f"<b>Драйверы импульса:</b>\n{reasons}"
+        f"🛒 <b>Агрессия покупателей:</b> <code>{tf.taker_buy*100:.0f}% Taker Buy</code>\n"
+        f"📈 <b>RSI (14):</b> <code>{tf.rsi:.1f}</code> | <b>vs BTC:</b> <code>{fmt_pct(sig.btc_relative_24h)}</code>\n\n"
+        f"<b>Признаки зарождения пампа:</b>\n{reasons}"
         f"{risks}"
     )
 
@@ -2531,7 +2596,7 @@ def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
     if filter_level == "strong_only":
         active_signals = [s for s in signals if s.grade == "strong"]
     else:
-        active_signals = [s for s in signals if s.grade in ("strong", "watch", "late")]
+        active_signals = [s for s in signals if s.grade in ("strong", "watch")]
 
     duration_sec = meta["duration_ms"] / 1000.0
     print(
