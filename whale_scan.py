@@ -42,8 +42,14 @@ if sys.platform == "win32":
 
 # ───────────────────────── Config ─────────────────────────
 
-BINANCE_BASE = os.environ.get("BINANCE_DATA_BASE", "https://data-api.binance.vision")
-FAPI_BASE = os.environ.get("BINANCE_FAPI_BASE", "https://fapi.binance.com")
+BINANCE_BASE = (os.environ.get("BINANCE_DATA_BASE") or "").strip() or "https://data-api.binance.vision"
+FAPI_BASE = (os.environ.get("BINANCE_FAPI_BASE") or "").strip() or "https://fapi.binance.com"
+
+# Настройка прокси (если задан BINANCE_PROXY или PROXY_URL) для обхода региональных ограничений (США/GitHub Actions)
+_proxy_cfg = os.environ.get("BINANCE_PROXY") or os.environ.get("PROXY_URL")
+if _proxy_cfg:
+    os.environ["HTTP_PROXY"] = _proxy_cfg
+    os.environ["HTTPS_PROXY"] = _proxy_cfg
 
 WINDOW_SEC = int(os.environ.get("WHALE_WINDOW_SEC", "900"))            # окно анализа сделок, сек
 AGG_TRADES_LIMIT = int(os.environ.get("WHALE_TRADES_LIMIT", "1000"))

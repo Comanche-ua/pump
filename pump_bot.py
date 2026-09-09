@@ -72,8 +72,15 @@ except Exception as _whale_import_err:
 
 # ───────────────────────── Config ─────────────────────────
 
-BINANCE_BASE = "https://data-api.binance.vision"
-BINANCE_TRADE_URL = "https://api.binance.com"
+BINANCE_BASE = (os.environ.get("BINANCE_DATA_BASE") or os.environ.get("BINANCE_BASE") or "").strip() or "https://data-api.binance.vision"
+BINANCE_TRADE_URL = (os.environ.get("BINANCE_TRADE_URL") or "").strip() or "https://api.binance.com"
+
+# Настройка прокси (если задан BINANCE_PROXY или PROXY_URL) для обхода региональных ограничений (США/GitHub Actions)
+_proxy_cfg = os.environ.get("BINANCE_PROXY") or os.environ.get("PROXY_URL")
+if _proxy_cfg:
+    os.environ["HTTP_PROXY"] = _proxy_cfg
+    os.environ["HTTPS_PROXY"] = _proxy_cfg
+
 TIMEFRAMES = ("5m", "15m", "1h")
 TF_MS = {"5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000}
 
@@ -1321,9 +1328,12 @@ def format_portfolio(state: dict) -> str:
             tp_pct = tr.get("tp_pct", 3.0)
             cost = tr.get("cost_usdt", 0.0)
             src = tr.get("signal_source", "scan")
+            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
+            binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
             lines.append(
                 f"🎯 <b>{base}/USDT</b>: вход <code>{fmt_price(bp)}</code> → TP: <code>{fmt_price(tp)}</code> (+{tp_pct:.1f}%)\n"
-                f"   └ Вложено: {cost:,.2f} $ | Ордер #{tr.get('tp_order_id', '—')} | Источник: {src}"
+                f"   ├ Вложено: {cost:,.2f} $ | Ордер #{tr.get('tp_order_id', '—')} | Источник: {src}\n"
+                f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>"
             )
         lines.append("─────────────────────")
 
@@ -1349,12 +1359,15 @@ def format_portfolio(state: dict) -> str:
 
         price = prices.get(symbol)
         base = base_asset(symbol)
+        tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+        binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
 
         if price is None:
             lines.append(
                 f"⚪ <b>{base}</b>: {fmt_qty(qty)} шт\n"
                 f"   ├ Вход: {fmt_price(avg)} USDT (вложено: {cost:,.2f} $)\n"
-                f"   └ <i>Текущая цена временно недоступна</i>\n"
+                f"   ├ <i>Текущая цена временно недоступна</i>\n"
+                f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
             )
             total_value += cost
             continue
@@ -1369,7 +1382,8 @@ def format_portfolio(state: dict) -> str:
             f"{sign} <b>{base}/USDT</b>: {fmt_qty(qty)} шт\n"
             f"   ├ Вход: <code>{fmt_price(avg)}</code> → Рынок: <code>{fmt_price(price)}</code>\n"
             f"   ├ Баланс: {val:,.2f} USDT (вложено {cost:,.2f} $)\n"
-            f"   └ <b>P/L:</b> <b>{pnl:+.2f} USDT</b> (<b>{fmt_pct(pnl_pct)}</b>)\n"
+            f"   ├ <b>P/L:</b> <b>{pnl:+.2f} USDT</b> (<b>{fmt_pct(pnl_pct)}</b>)\n"
+            f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
         )
 
     total_pnl = total_value - total_cost
@@ -1418,11 +1432,36 @@ def portfolio_inline_kb() -> dict:
                 {"text": "🗑 Удалить", "callback_data": "port:del"},
             ],
             [
+                {"text": "📈 Графики (TV / Binance)", "callback_data": "port:charts"},
                 {"text": "💳 Баланс Binance", "callback_data": "trade:balance"},
-                {"text": "🔙 Вернуть меню кнопок", "callback_data": "menu:main"},
+            ],
+            [
+                {"text": "🔙 Главное меню", "callback_data": "menu:main"},
             ]
         ]
     }
+
+def portfolio_charts_inline_kb(state: dict) -> dict:
+    port = state.get("portfolio", {})
+    active_trades = state.get("active_trades", {})
+    all_symbols = sorted(set(list(port.keys()) + list(active_trades.keys())))
+    if not all_symbols:
+        return {
+            "inline_keyboard": [
+                [{"text": "🔙 Назад в портфель", "callback_data": "port:refresh"}]
+            ]
+        }
+    rows = []
+    for s in all_symbols:
+        base = base_asset(s)
+        tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{s}"
+        binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+        rows.append([
+            {"text": f"📈 {base} TradingView", "url": tv_url},
+            {"text": f"📊 {base} Binance", "url": binance_url},
+        ])
+    rows.append([{"text": "🔙 Назад в портфель", "callback_data": "port:refresh"}])
+    return {"inline_keyboard": rows}
 
 def remove_asset_inline_kb(state: dict) -> Optional[dict]:
     port = state.get("portfolio", {})
@@ -2498,6 +2537,18 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     edit_message(token, cb_chat, msg_id, port_text, reply_markup=portfolio_inline_kb())
                 else:
                     send_telegram(token, cb_chat, port_text, reply_markup=portfolio_inline_kb())
+
+            elif cb_data == "port:charts":
+                answer_callback(token, cb_id)
+                kb = portfolio_charts_inline_kb(state)
+                chart_text = (
+                    "<b>📈 Графики активов портфеля:</b>\n\n"
+                    "Выберите монету ниже, чтобы открыть живой график на TradingView или спотовый терминал Binance Spot:"
+                )
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, chart_text, reply_markup=kb)
+                else:
+                    send_telegram(token, cb_chat, chart_text, reply_markup=kb)
 
             elif cb_data == "port:add":
                 answer_callback(token, cb_id)
