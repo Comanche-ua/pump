@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Pump Pulse Scanner (Telegram Bot 2.0).
+Pump Pulse Scanner (Telegram Bot 2.1) + Whale Scan (режим «Скан действий китов»).
 
 Сканирует USDT-спот на Binance, считает multi-TF score
 (объём, breakout, ATR, RSI, EMA, taker buy, vs BTC, ускорение)
 и предоставляет полнофункциональный Telegram-интерфейс:
   - Интерактивное меню и Reply-кнопки
   - Фоновый автоскан рынка в реальном времени с защитой от дублирования
+  - Режим «🐋 Скан действий китов»: крупные принты, чистый поток, стены, OI
   - Управление портфелем (добавление, удаление, расчёт PnL)
   - Настройки порогов и фильтров через Inline-кнопки
   - Прямые ссылки на графики Binance и TradingView
@@ -58,6 +59,17 @@ except ImportError:
         except Exception:
             pass
 
+# ───────────────────────── Whale Scan (совместный режим) ─────────────────────────
+# Модуль лежит рядом в репозитории (whale_scan.py). Если его нет — бот работает
+# как раньше, без режима китов (безопасная деградация).
+try:
+    import whale_scan as ws
+    WHALE_MODULE_OK = True
+except Exception as _whale_import_err:
+    ws = None  # type: ignore[assignment]
+    WHALE_MODULE_OK = False
+    print(f"⚠️ Модуль whale_scan.py недоступен, режим «Скан китов» отключён: {_whale_import_err}", file=sys.stderr)
+
 # ───────────────────────── Config ─────────────────────────
 
 BINANCE_BASE = "https://data-api.binance.vision"
@@ -77,6 +89,11 @@ DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "11.0"))
 DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "3.0"))
 DEFAULT_AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").strip().lower() in ("true", "1")
 DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "70.0"))
+
+# Параметры режима «Скан действий китов»
+DEFAULT_WHALE_MIN_SCORE = float(os.environ.get("WHALE_MIN_SCORE", "60"))
+DEFAULT_WHALE_AUTOSCAN = os.environ.get("WHALE_AUTOSCAN", "true").strip().lower() in ("true", "1")
+DEFAULT_WHALE_TOP_N = int(os.environ.get("WHALE_TOP_N", "30"))
 
 IS_CI = (
     os.environ.get("GITHUB_ACTIONS") == "true"
@@ -98,7 +115,7 @@ LEV_RE = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 # ───────────────────────── HTTP ─────────────────────────
 
 def http_get_json(url: str, timeout: int = 12) -> dict | list:
-    req = urllib.request.Request(url, headers={"User-Agent": "pump-pulse/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "pump-pulse/2.1"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -308,7 +325,6 @@ def aggregate_timeframe(candles: List[Candle], ms: int) -> List[Candle]:
             close_time=last.close_time,
         ))
     return out
-
 # ───────────────────────── Universe / Tickers ─────────────────────────
 
 def is_usdt_spot(symbol: str) -> bool:
@@ -710,7 +726,6 @@ def run_scan(
         },
     }
     return signals, meta, summaries[:5]
-
 # ───────────────────────── Состояние: портфель и настройки ─────────────────────────
 
 STATE_LOCK = threading.Lock()
@@ -729,10 +744,14 @@ def default_state() -> dict:
             "take_profit_pct": DEFAULT_TAKE_PROFIT,
             "max_open_trades": 3,
             "trade_min_score": DEFAULT_TRADE_MIN_SCORE,
+            # ── Режим «Скан действий китов» ──
+            "whale_autoscan": DEFAULT_WHALE_AUTOSCAN,
+            "whale_min_score": DEFAULT_WHALE_MIN_SCORE,
         },
-        "active_trades": {},  # symbol -> trade dict
-        "trade_history": [],  # list of closed trades
-        "sent_alerts": {},    # alert_key -> timestamp
+        "active_trades": {},      # symbol -> trade dict
+        "trade_history": [],      # list of closed trades
+        "sent_alerts": {},        # pump alert_key -> timestamp
+        "sent_whale_alerts": {},  # whale alert_key -> timestamp
         "allowed_chats": [],
     }
 
@@ -754,6 +773,8 @@ def load_state() -> dict:
             d["sent_alerts"] = {k: now for k in sent}
         elif isinstance(sent, dict):
             d["sent_alerts"] = sent
+        sent_w = data.get("sent_whale_alerts", {})
+        d["sent_whale_alerts"] = sent_w if isinstance(sent_w, dict) else {}
         d["allowed_chats"] = list(set(data.get("allowed_chats", [])))
     except Exception as e:
         print(f"Не удалось прочитать {STATE_FILE}: {e}", file=sys.stderr)
@@ -776,6 +797,7 @@ def save_state(state: dict, sync_git: bool = False) -> None:
         # Очищаем устаревшие алерты (старше 24ч)
         cutoff = int(time.time()) - 86400
         state["sent_alerts"] = {k: ts for k, ts in state["sent_alerts"].items() if ts > cutoff}
+        state["sent_whale_alerts"] = {k: ts for k, ts in state["sent_whale_alerts"].items() if ts > cutoff}
 
         tmp = STATE_FILE + ".tmp"
         try:
@@ -900,7 +922,7 @@ def binance_signed_request(
 
     headers = {
         "X-MBX-APIKEY": api_key,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PumpPulseBot/2.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PumpPulseBot/2.1",
     }
 
     url = f"{BINANCE_TRADE_URL}{endpoint}"
@@ -1158,7 +1180,8 @@ def execute_pump_auto_trade(
         "cost_usdt": cum_quote,
         "tp_pct": tp_pct,
         "opened_at": int(time.time()),
-        "signal_score": sig.score,
+        "signal_score": sig.best_score,
+        "signal_source": getattr(sig, "best_tf", "scan"),
         "status": "tp_placed" if tp_success else "unhedged_buy",
     }
     active_trades[sig.symbol] = trade_record
@@ -1181,7 +1204,7 @@ def execute_pump_auto_trade(
         f"• Потрачено: <code>{cum_quote:.2f} USDT</code>\n"
         f"• Куплено: <code>{fmt_qty(float(sell_params['quantity']))} {sig.base}</code>\n"
         f"• Цена исполнения: <code>{fmt_price(avg_buy_price)} USDT</code>\n"
-        f"• Импульс Score: <b>{sig.score:.1f}</b> ({sig.grade.upper()})\n\n"
+        f"• Импульс Score: <b>{sig.best_score:.1f}</b> ({sig.grade.upper()})\n\n"
         f"🎯 <b>Тейк-профит (+{tp_pct:.1f}%):</b>\n"
         f"• Цена продажи: <code>{tp_price_str} USDT</code>\n"
         f"{tp_status_note}"
@@ -1297,9 +1320,10 @@ def format_portfolio(state: dict) -> str:
             tp = tr.get("tp_price", 0.0)
             tp_pct = tr.get("tp_pct", 3.0)
             cost = tr.get("cost_usdt", 0.0)
+            src = tr.get("signal_source", "scan")
             lines.append(
                 f"🎯 <b>{base}/USDT</b>: вход <code>{fmt_price(bp)}</code> → TP: <code>{fmt_price(tp)}</code> (+{tp_pct:.1f}%)\n"
-                f"   └ Вложено: {cost:,.2f} $ | Ордер #{tr.get('tp_order_id', '—')}"
+                f"   └ Вложено: {cost:,.2f} $ | Ордер #{tr.get('tp_order_id', '—')} | Источник: {src}"
             )
         lines.append("─────────────────────")
 
@@ -1364,9 +1388,10 @@ def format_portfolio(state: dict) -> str:
 def main_keyboard() -> dict:
     return {
         "keyboard": [
-            [{"text": "🔍 Скан сейчас"}, {"text": "💼 Портфель"}],
-            [{"text": "➕ Добавить актив"}, {"text": "🗑 Удалить актив"}],
-            [{"text": "⚙️ Настройки"}, {"text": "ℹ️ Помощь"}],
+            [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
+            [{"text": "💼 Портфель"}, {"text": "➕ Добавить актив"}],
+            [{"text": "🗑 Удалить актив"}, {"text": "⚙️ Настройки"}],
+            [{"text": "ℹ️ Помощь"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -1376,8 +1401,9 @@ def cancel_keyboard() -> dict:
     return {
         "keyboard": [
             [{"text": "❌ Отмена"}],
-            [{"text": "🔍 Скан сейчас"}, {"text": "💼 Портфель"}],
-            [{"text": "⚙️ Настройки"}, {"text": "ℹ️ Помощь"}],
+            [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
+            [{"text": "💼 Портфель"}, {"text": "⚙️ Настройки"}],
+            [{"text": "ℹ️ Помощь"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -1419,6 +1445,7 @@ def settings_text(state: dict) -> str:
     filt_label = "🔥 Только Strong" if s.get("filter_level") == "strong_only" else "⚡ Strong + Watch"
     auto_scan_label = "🟢 Включён" if s.get("autoscan", True) else "🔴 Выключен"
     auto_trade_label = "🟢 Включена (+3% TP)" if s.get("auto_trade", False) else "🔴 Выключена"
+    whale_scan_label = "🟢 Включён" if s.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN) else "🔴 Выключен"
     interval_m = s.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL) // 60
     trade_amt = s.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT)
     tp_pct = s.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
@@ -1436,6 +1463,9 @@ def settings_text(state: dict) -> str:
         f"• <b>Размер покупки:</b> <code>{trade_amt:.1f} USDT</code>\n"
         f"• <b>Тейк-профит (TP):</b> <code>+{tp_pct:.1f}%</code> (выставляется сразу)\n"
         f"• <b>Статус API Binance:</b> {api_status}\n\n"
+        "<b>🐋 Скан действий китов:</b>\n"
+        f"• <b>Автоскан китов:</b> {whale_scan_label}\n"
+        f"• <b>Порог Whale Score:</b> <code>{s.get('whale_min_score', DEFAULT_WHALE_MIN_SCORE):.0f}</code>\n\n"
         "<i>Используйте кнопки ниже для быстрой настройки:</i>"
     )
 
@@ -1444,6 +1474,7 @@ def settings_inline_kb(state: dict) -> dict:
     autoscan_label = "🔴 Отключить автоскан" if s.get("autoscan", True) else "🟢 Включить автоскан"
     filter_label = "🔔 Сигналы: Только Strong" if s.get("filter_level") == "strong_only" else "🔔 Сигналы: Strong + Watch"
     autotrade_label = "🔴 Выключить автоторговлю" if s.get("auto_trade", False) else "⚡ Включить автоторговлю"
+    whale_autoscan_label = "🔴 Выключить скан китов" if s.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN) else "🐋 Включить скан китов"
 
     return {
         "inline_keyboard": [
@@ -1475,6 +1506,18 @@ def settings_inline_kb(state: dict) -> dict:
             [
                 {"text": autoscan_label, "callback_data": "autoscan:toggle"},
                 {"text": filter_label, "callback_data": "filter:toggle"},
+            ],
+            [
+                {"text": whale_autoscan_label, "callback_data": "whale:toggle"},
+            ],
+            [
+                {"text": "🐋 Порог −5", "callback_data": "whale:score:-5"},
+                {"text": "🐋 Порог +5", "callback_data": "whale:score:+5"},
+            ],
+            [
+                {"text": "🐋 55", "callback_data": "whale:score:set:55"},
+                {"text": "🐋 65 (базовый)", "callback_data": "whale:score:set:65"},
+                {"text": "🐋 75 (строгий)", "callback_data": "whale:score:set:75"},
             ],
             [
                 {"text": "⏱ 3 мин", "callback_data": "interval:180"},
@@ -1515,20 +1558,51 @@ def signal_inline_kb(sig: PumpSignal, state: Optional[dict] = None) -> dict:
         ]
     }
 
+def whale_inline_kb(sig) -> dict:
+    """Клавиатура для карточки whale-сигнала (sig — объект whale_scan.WhaleSignal)."""
+    base = sig.base
+    binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sig.symbol}"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Binance Spot", "url": binance_url},
+                {"text": "📈 TradingView", "url": tv_url},
+            ],
+            [
+                {"text": "🔎 Детали китов", "callback_data": f"whale:details:{sig.symbol}"},
+            ],
+            [
+                {"text": f"➕ Добавить {base} в портфель", "callback_data": f"add_coin:{sig.symbol}:{sig.price}"},
+                {"text": "🐋 Проверить другую монету", "callback_data": "whale:symbol_prompt"},
+            ],
+        ]
+    }
+
 HELP_TEXT = (
-    "<b>🚀 Pump Pulse Scanner 2.0 & Binance Spot Trader</b>\n\n"
+    "<b>🚀 Pump Pulse Scanner 2.1 & Binance Spot Trader + Whale Scan</b>\n\n"
     "Бот отслеживает аномальную активность на спотовом рынке Binance (USDT-пары) "
     "и поддерживает автоматическую покупку с мгновенным выставлением Take-Profit (+3%).\n\n"
     "<b>📌 Основные функции:</b>\n"
     "• <b>🔍 Скан сейчас</b> (/scan) — сканирование всего спота прямо сейчас.\n"
+    "• <b>🐋 Скан китов</b> (/whale) — детектор крупных сделок (от $100k) на споте.\n"
+    "• <b>🐋 /whale BTC</b> — мгновенный глубокий анализ китов по одной монете.\n"
     "• <b>💼 Портфель</b> (/portfolio) — баланс Binance, активные сделки и PnL.\n"
     "• <b>⚡ Торговля</b> (/trade) — статус автоторговли и история профита.\n"
     "• <b>➕ Добавить актив</b> (/add) — внести купленную монету вручную.\n"
     "• <b>🗑 Удалить актив</b> (/del) — убрать позицию в 1 клик.\n"
-    "• <b>⚙️ Настройки</b> (/settings) — включение автоторговли, размер ставки ($11, $25, $50) и TP.\n"
+    "• <b>⚙️ Настройки</b> (/settings) — включение автоторговли, размер ставки и TP.\n"
     "• <b>🔑 Привязка API</b> (/api) — настройка Binance API ключей.\n\n"
+    "<b>🐋 Как работает «Скан действий китов»:</b>\n"
+    "1. За окно 15 минут анализируются агрегированные сделки (aggTrades) топ-30 пар по ликвидности.\n"
+    "2. «Принт кита» — сделка от $100 000 и одновременно ≥ 25× медианы пары.\n"
+    "3. Считаются 7 факторов (100 баллов): доля китов в потоке (25), чистый поток BUY−SELL (25), "
+    "концентрация топ-20 принтов (15), доминирование покупок (10), ускорение размера сделок (10), "
+    "стены в стакане (10), подтверждение фьючерсами OI/Taker (5).\n"
+    "4. Оценки: 🐋 АККУМУЛЯЦИЯ (киты набирают — бычий сигнал), РАЗГРУЗКА (киты продают — не входить!), АКТИВНОСТЬ.\n"
+    "5. Работает и как режим в этом боте (кнопка 🐋 + автоскан), и как отдельный workflow whale-scan.yml.\n\n"
     "<b>⚡ Как работает спотовая автоторговля:</b>\n"
-    "1. При обнаружении подтверждённого импульса (Score 74+, STRONG) бот проверяет свободный USDT-баланс.\n"
+    "1. При обнаружении подтверждённого импульса (Score 74+, STRONG) или аккумуляции китов бот проверяет свободный USDT-баланс.\n"
     "2. На бирже размещается спотовый MARKET BUY ордер на указанную сумму (~11 USDT).\n"
     "3. Сразу же выставляется лимитный ордер на продажу (LIMIT SELL GTC) с профитом +3%.\n"
     "4. Когда цена доходит до цели, ордер исполняется и средства автоматически возвращаются в USDT!\n\n"
@@ -1548,1243 +1622,1187 @@ HELP_TEXT = (
 
 # ───────────────────────── Telegram API ─────────────────────────
 
-def api_call(token: str, method: str, payload: dict, timeout: int = 25) -> dict:
+def api_call(token: str, method: str, payload: Optional[dict] = None, retries: int = 3, timeout: int = 15) -> dict:
     url = f"https://api.telegram.org/bot{token}/{method}"
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore").lower()
-        # Игнорируем штатные незначительные ошибки (устаревший callback, неизмененное сообщение и т.п.)
-        benign_errors = (
-            "message is not modified",
-            "query is too old",
-            "query id is invalid",
-            "message to edit not found",
-            "bot was blocked by the user",
-        )
-        if not any(be in err_body for be in benign_errors):
-            print(f"Telegram API HTTPError ({method}): {e.code} {err_body}", file=sys.stderr)
-        return {}
-    except Exception as e:
-        print(f"Telegram error ({method}): {e}", file=sys.stderr)
-        return {}
+    data = json.dumps(payload or {}).encode("utf-8")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            if attempt == retries:
+                raise
+            time.sleep(0.5 * attempt)
+    return {}
 
-def drop_pending_updates(token: str) -> int:
-    """
-    Сбрасывает старые апдейты, накопившиеся в очереди Telegram пока бот был оффлайн.
-    Возвращает следующий актуальный offset.
-    """
+def drop_pending_updates(token: str) -> None:
     try:
-        body = api_call(token, "getUpdates", {"offset": -1, "timeout": 0}, timeout=10)
-        updates = body.get("result", [])
-        if updates:
-            return updates[-1]["update_id"] + 1
+        api_call(token, "getUpdates", {"offset": -1, "timeout": 1}, retries=1, timeout=5)
     except Exception:
         pass
-    return 0
 
-def send_telegram(
-    token: str,
-    chat_id: str | int,
-    text: str,
-    reply_markup: Optional[dict] = None,
-    disable_preview: bool = True,
-) -> Optional[int]:
+def send_telegram(token: str, chat_id: Union[str, int], text: str, reply_markup: Optional[dict] = None, retries: int = 3) -> Optional[int]:
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": disable_preview,
+        "disable_web_page_preview": True,
     }
-    if reply_markup is not None:
+    if reply_markup:
         payload["reply_markup"] = reply_markup
-    body = api_call(token, "sendMessage", payload)
-    if body.get("ok"):
-        return body["result"]["message_id"]
 
-    # Если Telegram жалуется на HTML-разметку (например некорректный тег) - шлем чистым текстом
-    err_desc = body.get("description", "")
-    if "parse entities" in err_desc.lower():
-        payload.pop("parse_mode", None)
-        body = api_call(token, "sendMessage", payload)
-        if body.get("ok"):
-            return body["result"]["message_id"]
-
-    if err_desc and "blocked by the user" not in err_desc.lower():
-        print(f"⚠️ Ошибка sendMessage в chat {chat_id}: {err_desc}", file=sys.stderr)
+    for attempt in range(1, retries + 1):
+        try:
+            res = api_call(token, "sendMessage", payload)
+            if res.get("ok"):
+                return res["result"]["message_id"]
+            time.sleep(0.5 * attempt)
+        except Exception as e:
+            if attempt == retries:
+                print(f"Telegram send error: {e}", file=sys.stderr)
+                return None
+            time.sleep(0.5 * attempt)
     return None
 
-def edit_message(
-    token: str,
-    chat_id: str | int,
-    message_id: int,
-    text: str,
-    reply_markup: Optional[dict] = None,
-    disable_preview: bool = True,
-) -> bool:
+def edit_message(token: str, chat_id: Union[str, int], message_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": disable_preview,
+        "disable_web_page_preview": True,
     }
-    if reply_markup is not None:
+    if reply_markup:
         payload["reply_markup"] = reply_markup
-    body = api_call(token, "editMessageText", payload)
-    if body.get("ok"):
-        return True
+    try:
+        api_call(token, "editMessageText", payload, retries=1)
+    except Exception as e:
+        print(f"Telegram edit error: {e}", file=sys.stderr)
 
-    err_desc = body.get("description", "")
-    if "parse entities" in err_desc.lower():
-        payload.pop("parse_mode", None)
-        body = api_call(token, "editMessageText", payload)
-        return bool(body.get("ok"))
-    return False
-
-def answer_callback(token: str, callback_id: str, text: Optional[str] = None, show_alert: bool = False) -> bool:
-    payload: Dict[str, Any] = {"callback_query_id": callback_id}
+def answer_callback(token: str, callback_id: str, text: Optional[str] = None) -> None:
+    payload = {"callback_query_id": callback_id}
     if text:
         payload["text"] = text
-        payload["show_alert"] = show_alert
-    body = api_call(token, "answerCallbackQuery", payload)
-    return bool(body.get("ok"))
+        payload["show_alert"] = False
+    try:
+        api_call(token, "answerCallbackQuery", payload, retries=1)
+    except Exception:
+        pass
 
-def set_bot_commands(token: str) -> bool:
-    commands = [
-        {"command": "scan", "description": "🔍 Сканировать рынок Binance прямо сейчас"},
-        {"command": "portfolio", "description": "💼 Открыть портфель и текущий PnL"},
-        {"command": "trade", "description": "⚡ Управление спотовой автоторговлей"},
-        {"command": "settings", "description": "⚙️ Настройки скоринга, ставки и TP"},
-        {"command": "api", "description": "🔑 Подключение Binance API ключей"},
-        {"command": "add", "description": "➕ Добавить монету в портфель"},
-        {"command": "help", "description": "ℹ️ Справка по стратегии и сигналам"},
-        {"command": "cancel", "description": "❌ Отменить ввод или действие"},
+def set_bot_commands(token: str) -> None:
+    cmds = [
+        {"command": "start", "description": "Главное меню"},
+        {"command": "scan", "description": "Сканер спота сейчас"},
+        {"command": "whale", "description": "🐋 Скан действий китов"},
+        {"command": "portfolio", "description": "Портфель и PnL"},
+        {"command": "add", "description": "Добавить монету в портфель"},
+        {"command": "del", "description": "Удалить монету из портфеля"},
+        {"command": "trade", "description": "Статус автоторговли"},
+        {"command": "settings", "description": "Настройки"},
+        {"command": "api", "description": "Указать API ключи Binance"},
+        {"command": "help", "description": "Инструкция"},
     ]
-    res = api_call(token, "setMyCommands", {"commands": commands})
-    return bool(res.get("ok"))
+    try:
+        api_call(token, "setMyCommands", {"commands": cmds}, retries=1)
+    except Exception:
+        pass
 
-def get_updates(token: str, offset: int, timeout: int = 15) -> List[dict]:
-    payload: Dict[str, Any] = {"timeout": timeout}
-    if offset > 0:
-        payload["offset"] = offset
-    body = api_call(token, "getUpdates", payload, timeout=timeout + 10)
-    if not body.get("ok"):
-        desc = body.get("description", "")
-        if desc:
-            if "conflict" in desc.lower():
-                print(f"⚠️ Telegram webhook активен! Сбрасываю webhook для режима polling...", file=sys.stderr)
-                api_call(token, "deleteWebhook", {"drop_pending_updates": False})
-            else:
-                print(f"⚠️ Ошибка getUpdates: {desc}", file=sys.stderr)
-        return []
-    return body.get("result", [])
+def get_updates(token: str, offset: Optional[int], timeout: int = 40) -> dict:
+    return api_call(token, "getUpdates", {"offset": offset, "timeout": timeout}, retries=1, timeout=timeout + 10)
 
 def format_alert(sig: PumpSignal) -> str:
-    tf = next((t for t in sig.by_tf if t.timeframe == sig.best_tf), sig.by_tf[0])
-    title = {
-        "strong": "🚀 ИМПУЛЬС В ЗАРОДЫШЕ (STRONG)",
-        "watch": "⚡ НАКОПЛЕНИЕ ОБЪЁМА (WATCH)",
-        "late": "⚠️ ПОЗДНИЙ ВХОД (LATE)",
-    }.get(sig.grade, "СИГНАЛ")
-    reasons = "\n".join(f"  ✓ {r}" for r in tf.reasons[:4])
-    risks = ""
-    if tf.risks:
-        risks = "\n<b>Факторы риска:</b>\n" + "\n".join(f"  • {r}" for r in tf.risks[:3])
+    tf_lines = []
+    for r in sig.by_tf:
+        tf_lines.append(f"  {r.timeframe}: score {r.score:.0f} ({r.grade})")
+    tf_str = "\n".join(tf_lines)
 
-    vol_str = f"{tf.volume_ratio:.1f}×" if tf.volume_ratio < 100 else ">99×"
+    best = sig.by_tf[0] if sig.by_tf else None
+    best_reasons = "\n".join(f"  ✓ {r}" for r in (best.reasons[:3] if best else [])) or ""
+    best_risks = "\n".join(f"  • {r}" for r in (best.risks[:2] if best else [])) or ""
 
+    late_note = ""
+    if best and best.late:
+        late_note = "\n⚠️ <b>Фаза:</b> <i>памп уже идёт — вход рискован</i>"
+
+    grade_emoji = {"strong": "🚀", "watch": "👀", "late": "⚠️"}[sig.grade]
     return (
-        f"<b>{title} · {sig.base}/USDT</b>\n\n"
-        f"🎯 <b>Score:</b> <code>{sig.best_score:.0f}/100</code> | <b>TF:</b> <code>{sig.best_tf}</code>\n"
-        f"💵 <b>Цена:</b> <code>{fmt_price(sig.price)} USDT</code>\n"
-        f"📊 <b>Суточный рост 24ч:</b> <code>{fmt_pct(sig.change_24h)}</code> <i>(в базе)</i>\n"
-        f"🌊 <b>Всплеск объёма:</b> <code>{vol_str} SMA20</code>\n"
-        f"🛒 <b>Агрессия покупателей:</b> <code>{tf.taker_buy*100:.0f}% Taker Buy</code>\n"
-        f"📈 <b>RSI (14):</b> <code>{tf.rsi:.1f}</code> | <b>vs BTC:</b> <code>{fmt_pct(sig.btc_relative_24h)}</code>\n\n"
-        f"<b>Признаки зарождения пампа:</b>\n{reasons}"
-        f"{risks}"
+        f"{grade_emoji} <b>{sig.base}/USDT</b> | TF: <b>{sig.best_tf}</b> | Score: <b>{sig.best_score:.0f}</b> ({sig.grade.upper()}){late_note}\n\n"
+        f"💵 Цена: <code>{fmt_price(sig.price)} USDT</code> | 24ч: <code>{fmt_pct(sig.change_24h)}</code> (vs BTC: {fmt_pct(sig.btc_relative_24h)})\n"
+        f"🌊 Объём 24ч: <code>{sig.quote_volume_24h:,.0f} USDT</code>\n\n"
+        f"<b>📊 Скоринг по ТФ:</b>\n{tf_str}\n"
+        f"<b>Почему:</b>\n{best_reasons}\n"
+        f"<b>Риски:</b>\n{best_risks}"
     )
 
-def format_factor_breakdown(sig_candidate: dict) -> str:
-    return (
-        f"<b>ℹ️ Анализ монеты {sig_candidate.get('base', '')}/USDT</b>\n"
-        f"• Лучший таймфрейм: <code>{sig_candidate.get('best_tf')}</code>\n"
-        f"• Оценка скоринга: <code>{sig_candidate.get('best_score', 0):.0f}/100</code>\n"
-        f"• Категория: <code>{sig_candidate.get('grade')}</code>\n"
-        f"• Всплеск объёма: <code>{sig_candidate.get('vol_ratio', 0):.1f}×</code>\n"
-        f"• Изменение за 24ч: <code>{fmt_pct(sig_candidate.get('change_24h', 0))}</code>\n"
-    )
+def format_factor_breakdown(sig: PumpSignal, tf: str) -> str:
+    row = next((r for r in sig.by_tf if r.timeframe == tf), None)
+    if not row:
+        return f"Нет данных по ТФ {tf}"
+    lines = [f"<b>📋 Факторы {sig.base} {tf}</b> (score {row.score:.0f}, {row.grade})\n"]
+    for f in row.factors:
+        bar_len = int(f.value * 10)
+        bar = "█" * bar_len + "░" * (10 - bar_len)
+        lines.append(f"{f.label:<18} {bar} {f.value*100:5.0f}%  ({f.weight}б, {f.note})")
+    if row.reasons:
+        lines.append("\n<b>Причины:</b>")
+        lines += [f"  ✓ {r}" for r in row.reasons]
+    if row.risks:
+        lines.append("\n<b>Риски:</b>")
+        lines += [f"  • {r}" for r in row.risks]
+    return "\n".join(lines)
 
-# ───────────────────────── Сканирование с красивым отчётом ─────────────────────────
+# ───────────────────────── Режим «Скан действий китов» (интеграция) ─────────────────────────
 
-def execute_scan_and_report(token: str, chat_id: str | int, state: dict) -> None:
-    """Выполняет ручной скан и отправляет статус пользователю."""
-    status_msg_id = send_telegram(
-        token,
-        chat_id,
-        "🔍 <i>Сканирую спотовый рынок Binance (USDT пары)... Пожалуйста, подождите.</i>"
-    )
-
+def execute_whale_scan_and_report(token: str, chat_id: Union[str, int], state: dict) -> None:
+    """Запуск полного скана китов по топ-парам с отправкой результатов в чат."""
+    if not WHALE_MODULE_OK:
+        send_telegram(token, chat_id, "⚠️ Модуль <code>whale_scan.py</code> не найден рядом с ботом. Добавьте файл в репозиторий.", reply_markup=main_keyboard())
+        return
+    status_msg_id = send_telegram(token, chat_id, "🐋 <i>Сканирую крупные сделки (китов) на спотовом рынке Binance... Подождите.</i>")
     try:
         s = state["settings"]
-        signals, meta, top_candidates = run_scan(
-            min_score=s.get("min_score"),
-            min_quote_volume=s.get("min_quote_volume"),
+        signals, meta = ws.run_whale_scan(
+            min_score=s.get("whale_min_score", DEFAULT_WHALE_MIN_SCORE),
+            top_n=DEFAULT_WHALE_TOP_N,
         )
-
-        btc_info = meta.get("btc", {})
-        btc_p = btc_info.get("price")
-        btc_c = btc_info.get("change24h")
-        btc_line = f"BTC: {fmt_price(btc_p)} USDT ({fmt_pct(btc_c)})" if btc_p is not None else ""
-
-        filter_level = s.get("filter_level", "strong_and_watch")
-        if filter_level == "strong_only":
-            filtered_signals = [sig for sig in signals if sig.grade == "strong"]
-        else:
-            filtered_signals = [sig for sig in signals if sig.grade in ("strong", "watch")]
-
-        duration_sec = meta["duration_ms"] / 1000.0
-
-        if filtered_signals:
+        duration = meta["duration_ms"] / 1000.0
+        if signals:
             summary_text = (
-                f"✅ <b>Сканирование завершено за {duration_sec:.1f}с</b>\n\n"
+                f"🐋 <b>Скан китов завершён за {duration:.1f}с</b>\n\n"
                 f"• Проверено пар: <code>{meta['universe']}</code>\n"
-                f"• Отобрано кандидатов: <code>{meta['candidates']}</code>\n"
-                f"• Порог Score: <code>{meta['min_score']:.0f}</code>\n"
-                f"• Найдено импульсов: <b>{len(filtered_signals)}</b>\n"
-                f"• Рынок: <i>{btc_line}</i>\n\n"
-                f"Ниже представлены подробные сигналы:"
+                f"• Просканировано топ-пар: <code>{meta['scanned']}</code>\n"
+                f"• Порог Whale Score: <code>{meta['min_score']:.0f}</code>\n"
+                f"• Активность китов найдена: <b>{len(signals)}</b>\n\n"
+                f"Ниже — подробные карточки:"
             )
             if status_msg_id:
                 edit_message(token, chat_id, status_msg_id, summary_text)
             else:
                 send_telegram(token, chat_id, summary_text)
-
-            for sig in filtered_signals[:5]:
-                card_text = format_alert(sig)
-                kb = signal_inline_kb(sig, state=state)
-                send_telegram(token, chat_id, card_text, reply_markup=kb)
+            for sig in signals[:5]:
+                send_telegram(token, chat_id, ws.format_whale_alert(sig), reply_markup=whale_inline_kb(sig))
                 time.sleep(0.15)
-
-            send_telegram(
-                token,
-                chat_id,
-                f"🔘 Найдено импульсов: <b>{len(filtered_signals)}</b>. Главное меню активно:",
-                reply_markup=main_keyboard(),
-            )
+            send_telegram(token, chat_id, "🔘 Скан китов завершён. Главное меню активно:", reply_markup=main_keyboard())
         else:
-            # Если сигналов выше порога нет, показываем ближайших кандидатов (пульс рынка)
-            top_lines = []
-            for i, c in enumerate(top_candidates[:4], 1):
-                top_lines.append(
-                    f"{i}. <b>{c['base']}</b> — Score <code>{c['best_score']:.0f}</code> "
-                    f"({c['best_tf']}), объём {c['vol_ratio']:.1f}×, 24ч {fmt_pct(c['change_24h'])}"
-                )
-            cand_block = "\n".join(top_lines) if top_lines else "<i>Нет данных</i>"
-
+            near_lines = "\n".join(
+                f"{i}. <b>{n['base']}</b> — score <code>{n['score']:.0f}</code>, "
+                f"поток {n['net_flow_pct']:+.0f}%, доля китов {n['whale_share']*100:.0f}% "
+                f"({n['whale_buys']}B/{n['whale_sells']}S)"
+                for i, n in enumerate(meta["near"][:4], 1)
+            ) or "<i>нет данных</i>"
             report_text = (
-                f"🔍 <b>Результаты сканирования ({duration_sec:.1f}с)</b>\n\n"
-                f"• Проверено спотовых пар: <code>{meta['universe']}</code>\n"
-                f"• Активных кандидатов: <code>{meta['candidates']}</code>\n"
-                f"• Текущий порог сигнала: <code>{meta['min_score']:.0f}</code>\n"
-                f"• Сигналов выше порога: <b>0</b> <i>(рынок спокойный)</i>\n"
-                f"• Рыночный фон: <i>{btc_line}</i>\n\n"
-                f"<b>Ближайшие кандидаты по активности:</b>\n{cand_block}\n\n"
-                f"💡 <i>Совет: если хотите видеть более ранние движения, снизьте MIN_SCORE в Настройках до 55.</i>"
+                f"🐋 <b>Скан китов завершён за {duration:.1f}с</b>\n\n"
+                f"• Просканировано топ-пар: <code>{meta['scanned']}</code>\n"
+                f"• Порог Whale Score: <code>{meta['min_score']:.0f}</code>\n"
+                f"• Сигналов: <b>0</b> <i>(киты спят)</i>\n\n"
+                f"<b>Ближайшие к порогу:</b>\n{near_lines}\n\n"
+                f"💡 <i>Снизьте порог кнопками 🐋 в Настройках, чтобы ловить активность раньше.</i>"
             )
             if status_msg_id:
                 edit_message(token, chat_id, status_msg_id, report_text)
             else:
                 send_telegram(token, chat_id, report_text)
-
-            send_telegram(
-                token,
-                chat_id,
-                "🔘 Сканирование завершено. Главное меню активно:",
-                reply_markup=main_keyboard(),
-            )
+            send_telegram(token, chat_id, "🔘 Главное меню активно:", reply_markup=main_keyboard())
     except Exception as e:
-        print(f"❌ Ошибка сканирования: {e}", file=sys.stderr)
+        print(f"❌ Ошибка скана китов: {e}", file=sys.stderr)
         traceback.print_exc()
-        send_telegram(
-            token,
-            chat_id,
-            f"⚠️ <b>Ошибка при сканировании рынка:</b>\n<code>{e}</code>\n\nПожалуйста, повторите попытку через минуту.",
-            reply_markup=main_keyboard(),
+        send_telegram(token, chat_id, f"⚠️ <b>Ошибка скана китов:</b>\n<code>{e}</code>", reply_markup=main_keyboard())
+
+def whale_deep_dive(token: str, chat_id: Union[str, int], symbol: str) -> None:
+    """Глубокий анализ китов по одной монете (команда /whale BTC или кнопка «Детали китов»)."""
+    if not WHALE_MODULE_OK:
+        send_telegram(token, chat_id, "⚠️ Модуль <code>whale_scan.py</code> не найден.", reply_markup=main_keyboard())
+        return
+    symbol = normalize_symbol(symbol)
+    status_msg_id = send_telegram(token, chat_id, f"🐋 <i>Загружаю последние крупные сделки {symbol}...</i>")
+    try:
+        sig = ws.deep_dive(symbol)
+        if not sig:
+            text = (f"⚠️ Не удалось загрузить сделки по <code>{symbol}</code> "
+                    f"(пара не найдена на споте или биржа недоступна).")
+            if status_msg_id:
+                edit_message(token, chat_id, status_msg_id, text)
+            else:
+                send_telegram(token, chat_id, text)
+            return
+        text = ws.format_whale_detail(sig)
+        if status_msg_id:
+            edit_message(token, chat_id, status_msg_id, text, reply_markup=whale_inline_kb(sig))
+        else:
+            send_telegram(token, chat_id, text, reply_markup=whale_inline_kb(sig))
+    except Exception as e:
+        print(f"❌ Ошибка детализации китов: {e}", file=sys.stderr)
+        send_telegram(token, chat_id, f"⚠️ <b>Ошибка анализа:</b>\n<code>{e}</code>", reply_markup=main_keyboard())
+
+def run_whale_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
+    """Разовый whale-скан для CLI: python pump_bot.py --whale"""
+    print("=== Режим разового скана китов (Whale Oneshot) ===")
+    if not WHALE_MODULE_OK:
+        print("❌ Модуль whale_scan.py недоступен", file=sys.stderr)
+        return
+    state = load_state()
+    min_score = state.get("settings", {}).get("whale_min_score", DEFAULT_WHALE_MIN_SCORE)
+    signals, meta = ws.run_whale_scan(min_score=min_score, top_n=DEFAULT_WHALE_TOP_N)
+    print(f"Whale scan: {meta['duration_ms']/1000:.1f}с, scanned={meta['scanned']}, сигналов={len(signals)}")
+    if not token or not chat_id:
+        for s in signals:
+            print(f"[{s.grade.upper()}] {s.symbol} score={s.score:.0f} net_flow={s.net_flow_pct:+.0f}% "
+                  f"share={s.whale_share*100:.0f}% prints={s.whale_buys}B/{s.whale_sells}S")
+        for n in meta["near"][:5]:
+            print(f"  ~ {n['base']}: score={n['score']:.0f} (порог {meta['min_score']:.0f})")
+        return
+    now = int(time.time())
+    sent: dict = state.setdefault("sent_whale_alerts", {})
+    target_chats: Set[str] = set()
+    if chat_id and (str(chat_id).lstrip("-").isdigit() or str(chat_id).startswith("@")):
+        target_chats.add(str(chat_id))
+    for c in state.get("allowed_chats", []):
+        cid_str = str(c).strip()
+        if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
+            target_chats.add(cid_str)
+    sent_count = 0
+    for sig in signals:
+        if sig.alert_key in sent:
+            print(f"• Пропуск {sig.symbol}: алерт за этот час уже отправлен")
+            continue
+        sent[sig.alert_key] = now
+        sent_count += 1
+        for cid in target_chats:
+            ok = send_telegram(token, cid, ws.format_whale_alert(sig), reply_markup=whale_inline_kb(sig))
+            print(f"• {sig.symbol} ({sig.grade} {sig.score:.0f}) → {cid}: {'sent' if ok else 'fail'}")
+    if sent_count > 0:
+        save_state(state)
+        print(f"Отправлено новых whale-сигналов: {sent_count}")
+    else:
+        print("Новых whale-сигналов нет.")
+        is_manual = (
+            os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+            or os.environ.get("NOTIFY_EMPTY", "false").lower() in ("true", "1")
+            or "--notify-always" in sys.argv
         )
+        if is_manual:
+            near_lines = "\n".join(
+                f"  • {n['base']}: score {n['score']:.0f}, поток {n['net_flow_pct']:+.0f}%, доля китов {n['whale_share']*100:.0f}%"
+                for n in meta["near"][:4]
+            ) or "  —"
+            msg = (
+                f"🐋 <b>Whale Scan — отчёт</b>\n\n"
+                f"• Просканировано топ-пар: <code>{meta['scanned']}</code>\n"
+                f"• Порог Whale Score: <code>{min_score:.0f}</code>\n"
+                f"• Сигналов: <b>0</b> <i>(киты спят)</i>\n\n"
+                f"<b>Ближайшие к порогу:</b>\n{near_lines}"
+            )
+            for cid in target_chats:
+                send_telegram(token, cid, msg)
+            print("Отправлен статус-отчёт whale-сканера.")
+
+# ───────────────────────── Одноразовый отчёт (для CI) ─────────────────────────
+
+def execute_scan_and_report(
+    token: str,
+    chat_id: Union[str, int],
+    state: dict,
+    min_score: Optional[float] = None,
+) -> None:
+    s = state["settings"]
+    status_msg_id = send_telegram(token, chat_id, "⏳ <i>Сканирую Binance Spot USDT-пары... Подождите.</i>")
+    try:
+        signals, meta, top = run_scan(
+            min_score=min_score if min_score is not None else s["min_score"],
+            min_quote_volume=s.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME),
+        )
+        duration = meta["duration_ms"] / 1000.0
+        btc = meta["btc"]
+
+        if not signals:
+            top_lines = "\n".join(
+                f"{i}. <b>{c['base']}</b> — score <code>{c['best_score']:.0f}</code> ({c['grade']}, {c['best_tf']}), "
+                f"объём {c['vol_ratio']:.1f}×"
+                for i, c in enumerate(top, 1)
+            ) or "<i>нет данных</i>"
+            report_text = (
+                f"✅ <b>Скан завершён за {duration:.1f}с</b>\n\n"
+                f"• Просканировано пар: <code>{meta['candidates']}</code> из {meta['universe']}\n"
+                f"• Порог Score: <code>{meta['min_score']:.0f}</code>\n"
+                f"• BTC: <code>{fmt_price(btc['price'])} USDT</code> ({fmt_pct(btc['change24h'])})\n"
+                f"• Сигналов: <b>0</b>\n\n"
+                f"<b>Ближайшие кандидаты (ниже порога):</b>\n{top_lines}"
+            )
+            if status_msg_id:
+                edit_message(token, chat_id, status_msg_id, report_text)
+            else:
+                send_telegram(token, chat_id, report_text)
+            return
+
+        sent: dict = state.setdefault("sent_alerts", {})
+        now = int(time.time())
+        sent_count = 0
+        filter_level = s.get("filter_level", "strong_and_watch")
+
+        for sig in signals:
+            if filter_level == "strong_only" and sig.grade != "strong":
+                continue
+            if sig.alert_key in sent:
+                continue
+            sent[sig.alert_key] = now
+            sent_count += 1
+            kb = signal_inline_kb(sig, state)
+            send_telegram(token, chat_id, format_alert(sig), reply_markup=kb)
+            time.sleep(0.2)
+
+        if sent_count == 0:
+            msg = f"🔔 <b>Новых сигналов нет.</b>\n\n• Скан завершён за {duration:.1f}с\n• Сигналов: {len(signals)} (все уже отправлены ранее)"
+            if status_msg_id:
+                edit_message(token, chat_id, status_msg_id, msg)
+            else:
+                send_telegram(token, chat_id, msg)
+        else:
+            save_state(state)
+            header = f"🚀 <b>Найдено {sent_count} новых сигналов!</b> (всего: {len(signals)}, скан за {duration:.1f}с)"
+            if status_msg_id:
+                edit_message(token, chat_id, status_msg_id, header)
+            else:
+                send_telegram(token, chat_id, header)
+    except Exception as e:
+        print(f"❌ Ошибка скана: {e}", file=sys.stderr)
+        traceback.print_exc()
+        send_telegram(token, chat_id, f"⚠️ <b>Ошибка скана:</b>\n<code>{e}</code>")
+
+def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
+    print("=== Режим разового скана (Oneshot) ===")
+    state = load_state()
+    min_score = state.get("settings", {}).get("min_score", DEFAULT_MIN_SCORE)
+    signals, meta, top = run_scan(min_score=min_score)
+    print(f"Scan: {meta['duration_ms']/1000:.1f}с, candidates={meta['candidates']}, сигналов={len(signals)}")
+
+    if not token or not chat_id:
+        for sig in signals:
+            print(format_alert(sig))
+            print("─" * 50)
+        if not signals:
+            for c in top:
+                print(f"~ {c['base']}: score={c['best_score']:.0f} ({c['grade']}, {c['best_tf']})")
+        return
+
+    now = int(time.time())
+    sent: dict = state.setdefault("sent_alerts", {})
+    target_chats: Set[str] = set()
+
+    if chat_id and (chat_id.lstrip("-").isdigit() or chat_id.startswith("@")):
+        target_chats.add(chat_id)
+    for c in state.get("allowed_chats", []):
+        cid_str = str(c).strip()
+        if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
+            target_chats.add(cid_str)
+
+    sent_count = 0
+    for sig in signals:
+        if sig.alert_key in sent:
+            print(f"• Пропуск {sig.symbol}: уже отправлен")
+            continue
+        sent[sig.alert_key] = now
+        sent_count += 1
+        kb = signal_inline_kb(sig, state)
+        for cid in target_chats:
+            ok = send_telegram(token, cid, format_alert(sig), reply_markup=kb)
+            print(f"• {sig.symbol} ({sig.grade} {sig.best_score:.0f}) → {cid}: {'sent' if ok else 'fail'}")
+
+    if sent_count > 0:
+        save_state(state)
+        print(f"Отправлено новых сигналов: {sent_count}")
+    else:
+        print("Новых сигналов нет.")
+        is_manual = (
+            os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+            or os.environ.get("NOTIFY_EMPTY", "false").lower() in ("true", "1")
+            or "--notify-always" in sys.argv
+        )
+        if is_manual:
+            btc = meta["btc"]
+            top_lines = "\n".join(
+                f"  • {c['base']}: score {c['best_score']:.0f} ({c['grade']}, {c['best_tf']})"
+                for c in top[:3]
+            ) or "  —"
+            msg = (
+                f"📡 <b>Pump Scan — отчёт</b>\n\n"
+                f"• Просканировано пар: <code>{meta['candidates']}</code>\n"
+                f"• Порог: <code>{min_score:.0f}</code>\n"
+                f"• BTC: <code>{fmt_price(btc['price'])}</code> ({fmt_pct(btc['change24h'])})\n"
+                f"• Сигналов: <b>0</b>\n\n"
+                f"<b>Топ кандидатов:</b>\n{top_lines}"
+            )
+            for cid in target_chats:
+                send_telegram(token, cid, msg)
+            print("Отправлен статус-отчёт.")
 
 # ───────────────────────── Фоновый автоскан ─────────────────────────
 
-def autoscan_worker(token: str, stop_event: threading.Event) -> None:
-    """Фоновый поток периодического сканирования рынка."""
-    print("Фоновый поток автосканирования запущен.")
+def autoscan_worker(token: str, primary_chat_id: Union[str, int], state: dict, stop_event: threading.Event) -> None:
+    print("🤖 Фоновый автоскан запущен.")
     while not stop_event.is_set():
-        try:
-            state = load_state()
-            settings = state.get("settings", {})
+        settings = state["settings"]
+        if not settings.get("autoscan", True):
+            stop_event.wait(5)
+            continue
 
-            # Список чатов для оповещения
-            env_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        interval = int(settings.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL))
+        try:
+            now = int(time.time())
             target_chats: Set[str] = set()
-            if env_chat and (env_chat.lstrip("-").isdigit() or env_chat.startswith("@")):
-                target_chats.add(env_chat)
+            primary_str = str(primary_chat_id).strip()
+            if primary_str and primary_str != "12345" and (primary_str.lstrip("-").isdigit() or primary_str.startswith("@")):
+                target_chats.add(primary_str)
             for c in state.get("allowed_chats", []):
                 cid_str = str(c).strip()
                 if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
                     target_chats.add(cid_str)
 
-            # 1. Проверка исполнения активных Take-Profit ордеров на Binance
-            primary_trade_chat = env_chat or (list(target_chats)[0] if target_chats else "")
-            if primary_trade_chat:
+            # Проверяем исполнение тейк-профитов по активным сделкам
+            if settings.get("auto_trade", False) and state.get("active_trades"):
                 try:
-                    check_active_trades(token, primary_trade_chat, state)
+                    check_active_trades(token, primary_chat_id, state)
                 except Exception as e:
-                    print(f"[Autoscan Trade Check Error]: {e}", file=sys.stderr)
+                    print(f"[AutoTrade Check Error]: {e}", file=sys.stderr)
 
-            if not settings.get("autoscan", True):
-                stop_event.wait(10)
-                continue
+            # 1. Скан пампов
+            signals, meta, _top = run_scan(
+                min_score=settings.get("min_score", DEFAULT_MIN_SCORE),
+                min_quote_volume=settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME),
+            )
+            print(f"[Autoscan] {time.strftime('%H:%M:%S')}: {meta['duration_ms']/1000:.1f}с, "
+                  f"candidates={meta['candidates']}, сигналов={len(signals)}")
 
-            interval = settings.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL)
-            min_score = settings.get("min_score", DEFAULT_MIN_SCORE)
-            min_vol = settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME)
             filter_level = settings.get("filter_level", "strong_and_watch")
-
-            signals, meta, _ = run_scan(min_score=min_score, min_quote_volume=min_vol)
-
-            if filter_level == "strong_only":
-                active_signals = [s for s in signals if s.grade == "strong"]
-            else:
-                active_signals = [s for s in signals if s.grade in ("strong", "watch")]
-
-            now = int(time.time())
-            sent_alerts: dict = state.setdefault("sent_alerts", {})
+            sent: dict = state.setdefault("sent_alerts", {})
             new_alerts_count = 0
 
-            for sig in active_signals:
-                if sig.alert_key in sent_alerts:
+            for sig in signals:
+                if filter_level == "strong_only" and sig.grade != "strong":
+                    continue
+                if sig.alert_key in sent:
                     continue
 
-                sent_alerts[sig.alert_key] = now
+                sent[sig.alert_key] = now
                 new_alerts_count += 1
-                text = format_alert(sig)
-                kb = signal_inline_kb(sig, state=state)
+                kb = signal_inline_kb(sig, state)
 
                 for cid in target_chats:
                     try:
-                        send_telegram(token, cid, text, reply_markup=kb)
+                        send_telegram(token, cid, format_alert(sig), reply_markup=kb)
                     except Exception as e:
-                        print(f"Ошибка отправки алерта в {cid}: {e}", file=sys.stderr)
+                        print(f"Ошибка отправки в {cid}: {e}", file=sys.stderr)
 
-                # 2. Автоторговля памп-импульсов (если включена)
+                # Автоторговля по сигналу
                 auto_trade_enabled = settings.get("auto_trade", False)
                 trade_min_score = settings.get("trade_min_score", DEFAULT_TRADE_MIN_SCORE)
-                if auto_trade_enabled and sig.grade == "strong" and sig.score >= trade_min_score:
-                    if primary_trade_chat:
+                if auto_trade_enabled and sig.best_score >= trade_min_score:
+                    if primary_str:
                         try:
-                            print(f"[Autoscan] Выполнение автоматической покупки {sig.symbol} (Score: {sig.score:.1f})...")
-                            execute_pump_auto_trade(token, primary_trade_chat, state, sig)
+                            print(f"[AutoTrade] Вход по сигналу {sig.symbol} (score {sig.best_score:.1f})...")
+                            execute_pump_auto_trade(token, primary_str, state, sig)
                         except Exception as e:
-                            print(f"[Autoscan AutoTrade Error for {sig.symbol}]: {e}", file=sys.stderr)
+                            print(f"[AutoTrade Error for {sig.symbol}]: {e}", file=sys.stderr)
 
-            if new_alerts_count > 0:
+            # 2. Режим «Скан действий китов» (совместный: свои алерты + опционально автоторговля)
+            new_whale_count = 0
+            if WHALE_MODULE_OK and settings.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN):
+                try:
+                    whale_signals, _wmeta = ws.run_whale_scan(
+                        min_score=settings.get("whale_min_score", DEFAULT_WHALE_MIN_SCORE),
+                        top_n=DEFAULT_WHALE_TOP_N,
+                    )
+                    sent_whales: dict = state.setdefault("sent_whale_alerts", {})
+                    for wsig in whale_signals:
+                        if wsig.alert_key in sent_whales:
+                            continue
+                        sent_whales[wsig.alert_key] = now
+                        new_whale_count += 1
+                        wtext = ws.format_whale_alert(wsig)
+                        wkb = whale_inline_kb(wsig)
+                        for cid in target_chats:
+                            try:
+                                send_telegram(token, cid, wtext, reply_markup=wkb)
+                            except Exception as e:
+                                print(f"Ошибка отправки whale-алерта в {cid}: {e}", file=sys.stderr)
+
+                        # Совместный режим: автопокупка по подтверждённой аккумуляции китов
+                        if (settings.get("auto_trade", False)
+                                and wsig.grade == "accumulation"
+                                and wsig.score >= settings.get("trade_min_score", DEFAULT_TRADE_MIN_SCORE)):
+                            if primary_str:
+                                try:
+                                    print(f"[WhaleScan] Автопокупка по китам {wsig.symbol} (score {wsig.score:.1f})...")
+                                    whale_sig = PumpSignal(
+                                        symbol=wsig.symbol, base=wsig.base, price=wsig.price,
+                                        change_24h=0.0, quote_volume_24h=0.0,
+                                        high_24h=wsig.price, low_24h=wsig.price,
+                                        btc_relative_24h=0.0, best_tf="whale",
+                                        best_score=wsig.score, grade="strong",
+                                        alert_key=f"whale_trade_{wsig.symbol}_{now}", by_tf=[],
+                                    )
+                                    execute_pump_auto_trade(token, primary_str, state, whale_sig)
+                                except Exception as e:
+                                    print(f"[WhaleScan AutoTrade Error for {wsig.symbol}]: {e}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[WhaleScan Error]: {e}", file=sys.stderr)
+
+            if new_alerts_count > 0 or new_whale_count > 0:
                 save_state(state, sync_git=True)
-                print(f"[Autoscan] Отправлено {new_alerts_count} новых сигналов в {len(target_chats)} чат(ов)")
+                print(f"[Autoscan] Новых сигналов: pump={new_alerts_count}, whale={new_whale_count}, чатов: {len(target_chats)}")
 
         except Exception as e:
             print(f"[Autoscan Error]: {e}", file=sys.stderr)
+            traceback.print_exc()
 
-        # Ожидание следующего цикла с возможностью быстрого прерывания
-        state_curr = load_state()
-        sleep_sec = state_curr.get("settings", {}).get("scan_interval_sec", DEFAULT_SCAN_INTERVAL)
-        stop_event.wait(max(15, sleep_sec))
+        stop_event.wait(interval)
 
-# ───────────────────────── Интерактивный бот ─────────────────────────
+# ───────────────────────── Основной цикл бота ─────────────────────────
 
-def run_bot(token: str) -> None:
-    print("Инициализация Telegram-бота Pump Pulse...")
-    set_bot_commands(token)
-
+def run_bot(token: str, chat_id: Union[str, int]) -> None:
     state = load_state()
-    primary_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    allowed_env = [x.strip() for x in os.environ.get("TELEGRAM_ALLOWED_CHATS", "").split(",") if x.strip()]
-    if primary_chat and primary_chat not in state["allowed_chats"]:
-        state["allowed_chats"].append(primary_chat)
-    for c in allowed_env:
-        if c not in state["allowed_chats"]:
-            state["allowed_chats"].append(c)
-    save_state(state)
+    cid_str = str(chat_id).strip()
+    if cid_str and cid_str not in [str(c) for c in state.get("allowed_chats", [])]:
+        state["allowed_chats"].append(cid_str)
+        save_state(state)
 
-    # Приветственное сообщение в primary_chat (если настроен)
-    if primary_chat:
-        send_telegram(
-            token,
-            primary_chat,
-            "🚀 <b>Pump Pulse Scanner 2.0 запущен и готов к работе!</b>\n\n"
-            "Используйте кнопки меню ниже для управления ботом.",
-            reply_markup=main_keyboard(),
-        )
+    set_bot_commands(token)
+    drop_pending_updates(token)
 
-    # Запуск фонового автоскана
     stop_event = threading.Event()
-    scan_thread = threading.Thread(target=autoscan_worker, args=(token, stop_event), daemon=True)
-    scan_thread.start()
+    scan_thread: Optional[threading.Thread] = None
 
-    # Сбрасываем старый webhook при старте, чтобы getUpdates гарантированно работал
-    api_call(token, "deleteWebhook", {"drop_pending_updates": False})
+    def _signal_handler(signum, frame) -> None:
+        stop_event.set()
 
-    # FSM context: chat_id -> {"state": str, "data": dict}
-    user_fsm: Dict[str, dict] = {}
-    last_offset = 0
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
-    print("Бот успешно запущен. Ожидание входящих сообщений (long polling)...")
+    if RUN_MODE == "bot":
+        scan_thread = threading.Thread(target=autoscan_worker, args=(token, chat_id, state, stop_event), daemon=True)
+        scan_thread.start()
 
-    def is_authorized(chat_id_str: str) -> bool:
-        # Если задан явный белый список TELEGRAM_ALLOWED_CHATS, то проверяем его
-        if allowed_env:
-            return chat_id_str in allowed_env or (primary_chat and chat_id_str == primary_chat)
-        return True
+    welcome = (
+        "<b>👋 Приветствую в Pump Pulse Scanner 2.1 + Whale Scan!</b>\n\n"
+        "Я сканирую спотовый рынок Binance (USDT-пары) в реальном времени "
+        "и мгновенно сообщу о зарождении пампа (Score 58-74+, ДО выстрела).\n"
+        "Также умею детектировать <b>действия китов</b> (крупные сделки от $100k) и "
+        "автоматически торговать на вашем Binance Spot с TP +3%.\n\n"
+        "🐋 <b>Новинка:</b> кнопка «Скан китов» в меню и команда /whale.\n\n"
+        "• Выберите действие кнопками ниже\n"
+        "• Или напишите: <code>scan</code>, <code>whale</code>, <code>whale SOL</code>, <code>portfolio</code> и т.д."
+    )
+    send_telegram(token, chat_id, welcome, reply_markup=main_keyboard())
 
-    def handle_update(upd: dict) -> None:
-        nonlocal state
-        # ── 1. Обработка Callback Query (нажатия на Inline-кнопки) ──
-        if "callback_query" in upd:
-            cb = upd["callback_query"]
-            cb_id = cb["id"]
-            cb_data = cb.get("data", "")
-            sender = cb.get("from", {})
-            msg = cb.get("message", {})
-            chat_id = str(msg.get("chat", {}).get("id", sender.get("id", "")))
-            msg_id = msg.get("message_id")
-            user_tag = sender.get("username") or sender.get("first_name") or chat_id
-            print(f"🔘 [Callback @{user_tag} ({chat_id})]: {cb_data}")
+    last_update_id: Optional[int] = None
+    user_fsm: Dict[Union[str, int], dict] = {}
 
-            if not is_authorized(chat_id):
-                answer_callback(token, cb_id, "Доступ ограничен.", show_alert=True)
+    def is_authorized(user_id: Union[str, int]) -> bool:
+        if not state.get("allowed_chats"):
+            return True
+        return str(user_id) in [str(c) for c in state["allowed_chats"]]
+
+    def handle_update(u: dict) -> None:
+        nonlocal last_update_id
+        last_update_id = u["update_id"]
+
+        if "message" in u:
+            msg = u["message"]
+            chat = msg.get("chat", {})
+            chat_id_local = chat.get("id")
+            user_id = msg.get("from", {}).get("id", chat_id_local)
+            text = (msg.get("text") or "").strip()
+
+            if not text or not chat_id_local:
+                return
+            if not is_authorized(user_id):
+                print(f"⛔ Игнорирую сообщение от несанкционированного user_id={user_id}")
                 return
 
-            state = load_state()
+            if chat_id_local not in [str(c) for c in state.get("allowed_chats", [])] and str(chat_id_local) != str(chat_id):
+                state["allowed_chats"].append(str(chat_id_local))
+                save_state(state)
+                print(f"🔓 Добавлен новый чат: {chat_id_local}")
+
+            text_lower = text.lower()
+            if text_lower in ("/start", "start", "старт", "меню", "/menu"):
+                print(f"-> Показ главного меню для {chat_id_local}")
+                send_telegram(token, chat_id_local, "<b>📋 Главное меню Pump Pulse</b>\n\nВыберите действие:", reply_markup=main_keyboard())
+                return
+
+            if text_lower in ("/cancel", "❌ отмена", "отмена", "cancel", "стоп"):
+                user_fsm.pop(chat_id_local, None)
+                print(f"-> Отмена состояния FSM для {chat_id_local}")
+                send_telegram(token, chat_id_local, "✅ Действие отменено. Возврат в главное меню.", reply_markup=main_keyboard())
+                return
+
+            # ── FSM: пошаговый ввод ──
+            if chat_id_local in user_fsm:
+                st = user_fsm[chat_id_local]
+                cur_st = st.get("state")
+
+                if cur_st == "waiting_symbol":
+                    user_fsm.pop(chat_id_local, None)
+                    symbol = normalize_symbol(text)
+                    if not symbol.isalnum() or len(symbol) > 20:
+                        send_telegram(token, chat_id_local, "❌ Неверный тикер. Попробуйте снова (например, SOL):", reply_markup=cancel_keyboard())
+                        return
+                    price = get_price(symbol)
+                    if price is None:
+                        send_telegram(token, chat_id_local, f"❌ Монета <code>{symbol}</code> не найдена на Binance Spot. Попробуйте другой тикер:", reply_markup=cancel_keyboard())
+                        return
+                    send_telegram(token, chat_id_local, f"✅ Монета: <b>{base_asset(symbol)}/USDT</b>\nТекущая цена: <code>{fmt_price(price)} USDT</code>\n\nВведите <b>количество</b> (например, 10):", reply_markup=cancel_keyboard())
+                    user_fsm[chat_id_local] = {"state": "waiting_qty", "data": {"symbol": symbol, "price": price}}
+                    return
+
+                if cur_st == "waiting_qty":
+                    try:
+                        qty = float(text.replace(",", "."))
+                        if qty <= 0:
+                            raise ValueError()
+                    except ValueError:
+                        send_telegram(token, chat_id_local, "❌ Неверное количество. Введите число, например 5 или 0.5:", reply_markup=cancel_keyboard())
+                        return
+                    data = st["data"]
+                    symbol = data["symbol"]
+                    price = data["price"]
+                    new_qty, new_avg = portfolio_add(state, symbol, qty, price)
+                    user_fsm.pop(chat_id_local, None)
+                    send_telegram(
+                        token, chat_id_local,
+                        f"✅ <b>{base_asset(symbol)}</b> добавлен в портфель!\n\n"
+                        f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
+                        f"• Средняя цена входа: <code>{fmt_price(new_avg)} USDT</code>\n"
+                        f"• Текущий PnL: откройте <b>«💼 Портфель»</b>",
+                        reply_markup=main_keyboard(),
+                    )
+                    return
+
+                if cur_st == "waiting_delete_symbol":
+                    user_fsm.pop(chat_id_local, None)
+                    symbol = normalize_symbol(text)
+                    if portfolio_remove(state, symbol):
+                        send_telegram(token, chat_id_local, f"✅ <b>{base_asset(symbol)}</b> удалена из портфеля!", reply_markup=main_keyboard())
+                    else:
+                        send_telegram(token, chat_id_local, f"❌ <b>{base_asset(symbol)}</b> не найдена в портфеле.", reply_markup=main_keyboard())
+                    return
+
+                if cur_st == "waiting_api_keys":
+                    user_fsm.pop(chat_id_local, None)
+                    parts = text.split()
+                    if len(parts) >= 2:
+                        state["settings"]["binance_api_key"] = parts[0].strip()
+                        state["settings"]["binance_api_secret"] = parts[1].strip()
+                        save_state(state)
+                        send_telegram(token, chat_id_local, "✅ <b>API-ключи Binance сохранены!</b>\n\nТеперь доступны: баланс спота и автоторговля.", reply_markup=main_keyboard())
+                    else:
+                        send_telegram(token, chat_id_local, "❌ Нужно ввести два значения через пробел:\n<code>/api ВАШ_КЛЮЧ ВАШ_СЕКРЕТ</code>", reply_markup=cancel_keyboard())
+                    return
+
+                if cur_st == "waiting_quick_add_qty":
+                    try:
+                        qty = float(text.replace(",", "."))
+                        if qty <= 0:
+                            raise ValueError()
+                    except ValueError:
+                        send_telegram(token, chat_id_local, "❌ Неверное количество. Введите число:", reply_markup=cancel_keyboard())
+                        return
+                    data = st["data"]
+                    symbol = data["symbol"]
+                    price = data["price"]
+                    new_qty, new_avg = portfolio_add(state, symbol, qty, price)
+                    user_fsm.pop(chat_id_local, None)
+                    send_telegram(
+                        token, chat_id_local,
+                        f"✅ <b>{base_asset(symbol)}</b> добавлен в портфель!\n\n"
+                        f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
+                        f"• Средняя цена входа: <code>{fmt_price(new_avg)} USDT</code>",
+                        reply_markup=main_keyboard(),
+                    )
+                    return
+
+                if cur_st == "waiting_whale_symbol":
+                    user_fsm.pop(chat_id_local, None)
+                    whale_deep_dive(token, chat_id_local, text)
+                    return
+
+            # ── Reply-кнопки и команды ──
+            clean_text = text.lstrip("/")
+            cmd = clean_text.split()[0].lower() if clean_text else ""
+
+            is_menu_action = (
+                "скан" in text_lower
+                or "кит" in text_lower
+                or "portfolio" in text_lower
+                or "портфел" in text_lower
+                or "добав" in text_lower
+                or "удал" in text_lower
+                or "настрой" in text_lower
+                or "помощ" in text_lower
+                or "help" in text_lower
+                or "меню" in text_lower
+            )
+
+            if cmd in ("help", "помощ", "помощь", "info", "инфо", "ℹ️ помощь", "❓ помощь") or (is_menu_action and text_lower in ("help", "помощь", "помощ")):
+                print(f"-> Помощь для {chat_id_local}")
+                send_telegram(token, chat_id_local, HELP_TEXT, reply_markup=main_keyboard())
+
+            elif cmd in ("settings", "настройки") or (is_menu_action and "настрой" in text_lower):
+                print(f"-> Настройки для {chat_id_local}")
+                send_telegram(token, chat_id_local, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cmd in ("scan", "скан") or (is_menu_action and "скан" in text_lower and "кит" not in text_lower):
+                print(f"-> Скан для {chat_id_local}")
+                execute_scan_and_report(token, chat_id_local, state)
+
+            elif cmd == "whale" or "кит" in text_lower:
+                print(f"-> Запуск скана китов для {chat_id_local}")
+                args = clean_text.split()[1:]
+                if args:
+                    whale_deep_dive(token, chat_id_local, args[0])
+                else:
+                    execute_whale_scan_and_report(token, chat_id_local, state)
+
+            elif cmd in ("portfolio", "портфель") or (is_menu_action and "портфел" in text_lower):
+                print(f"-> Портфель для {chat_id_local}")
+                msg_id = send_telegram(token, chat_id_local, "⏳ <i>Загружаю портфель...</i>")
+                port_text = format_portfolio(state)
+                if msg_id:
+                    edit_message(token, chat_id_local, msg_id, port_text, reply_markup=portfolio_inline_kb())
+                else:
+                    send_telegram(token, chat_id_local, port_text, reply_markup=portfolio_inline_kb())
+
+            elif cmd in ("trade", "торговля") or (is_menu_action and "торговл" in text_lower):
+                print(f"-> Торговля для {chat_id_local}")
+                settings = state.get("settings", {})
+                api_key, api_secret = get_api_credentials(state)
+                api_status = "🟢 Подключены" if (api_key and api_secret) else "🔴 Не заданы"
+                trade_amt = settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT)
+                tp_pct = settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
+                active = state.get("active_trades", {})
+                history = state.get("trade_history", [])[-5:]
+                trade_kb = settings_inline_kb(state)
+                lines = [
+                    "<b>⚡ Автоторговля Binance Spot</b>\n",
+                    f"• API-ключи: {api_status}",
+                    f"• Размер ставки: <code>{trade_amt:.1f} USDT</code>",
+                    f"• Тейк-профит: <code>+{tp_pct:.1f}%</code>",
+                    f"• Открытых сделок: <code>{len(active)}/3</code>",
+                    f"• Автоскан китов: <code>{'🟢' if settings.get('whale_autoscan', True) else '🔴'}</code>\n",
+                ]
+                if active:
+                    lines.append("<b>🎯 Активные сделки:</b>")
+                    for sym, tr in active.items():
+                        lines.append(
+                            f"  • {tr.get('base', base_asset(sym))}/USDT: вход {fmt_price(tr.get('buy_price', 0))} → TP {fmt_price(tr.get('tp_price', 0))} (+{tr.get('tp_pct', 3.0):.1f}%)"
+                        )
+                    lines.append("")
+                if history:
+                    lines.append("<b>📜 Последние закрытые:</b>")
+                    for h in reversed(history):
+                        lines.append(
+                            f"  • {h.get('base', '?')}: PnL <b>{h.get('pnl', 0):+.2f} USDT</b> ({h.get('pnl_pct', 0):+.2f}%) — {time.strftime('%d.%m %H:%M', time.localtime(h.get('closed_at', 0)))}"
+                        )
+                lines.append("\n💡 Настройки — через кнопки «⚙️ Настройки» ниже.")
+                send_telegram(token, chat_id_local, "\n".join(lines), reply_markup=trade_kb)
+
+            elif cmd in ("add", "добавить") or (is_menu_action and "добав" in text_lower):
+                args = clean_text.split()[1:]
+                if args:
+                    user_fsm[chat_id_local] = {"state": "waiting_symbol", "data": {}}
+                    # если пользователь сразу указал тикер — обрабатываем
+                    msg = {"message": {"chat": {"id": chat_id_local}, "from": {"id": user_id}, "text": args[0]}}
+                    handle_update(msg)
+                    return
+                print(f"-> Добавление актива для {chat_id_local}")
+                user_fsm[chat_id_local] = {"state": "waiting_symbol", "data": {}}
+                send_telegram(
+                    token, chat_id_local,
+                    "➕ <b>Добавление актива в портфель</b>\n\nВведите тикер монеты (например, <code>SOL</code>, <code>BTC</code> или <code>PEPE</code>):",
+                    reply_markup=cancel_keyboard(),
+                )
+
+            elif cmd in ("del", "удалить") or (is_menu_action and "удал" in text_lower):
+                args = clean_text.split()[1:]
+                if args:
+                    symbol = normalize_symbol(args[0])
+                    if portfolio_remove(state, symbol):
+                        send_telegram(token, chat_id_local, f"✅ <b>{base_asset(symbol)}</b> удалена из портфеля!", reply_markup=main_keyboard())
+                    else:
+                        send_telegram(token, chat_id_local, f"❌ <b>{base_asset(symbol)}</b> не найдена в портфеле.", reply_markup=main_keyboard())
+                    return
+                print(f"-> Удаление актива для {chat_id_local}")
+                kb = remove_asset_inline_kb(state)
+                if not kb:
+                    send_telegram(token, chat_id_local, "ℹ️ Портфель пуст. Нечего удалять.", reply_markup=main_keyboard())
+                    return
+                send_telegram(token, chat_id_local, "🗑 <b>Выберите монету для удаления:</b>", reply_markup=kb)
+
+            elif cmd in ("api", "ключ"):
+                args = clean_text.split()[1:]
+                if len(args) >= 2:
+                    state["settings"]["binance_api_key"] = args[0].strip()
+                    state["settings"]["binance_api_secret"] = args[1].strip()
+                    save_state(state)
+                    send_telegram(token, chat_id_local, "✅ <b>API-ключи Binance сохранены!</b>", reply_markup=main_keyboard())
+                else:
+                    print(f"-> Ожидание API ключей для {chat_id_local}")
+                    user_fsm[chat_id_local] = {"state": "waiting_api_keys", "data": {}}
+                    send_telegram(
+                        token, chat_id_local,
+                        "🔑 <b>Привязка API ключей Binance</b>\n\n"
+                        "Отправьте в одном сообщении через пробел:\n"
+                        "<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
+                        "⚠️ <i>Рекомендуется создать ключ с разрешением «Торговля» только на споте, без вывода средств!</i>",
+                        reply_markup=cancel_keyboard(),
+                    )
+
+            elif text_lower in ("ping", "пинг"):
+                send_telegram(token, chat_id_local, "🏓 <b>pong</b> — бот на связи!")
+
+            else:
+                # Эхо-подсказка для нераспознанных команд
+                hint = (
+                    "🤔 Не распознал команду.\n\n"
+                    "Попробуйте:\n"
+                    "• <code>scan</code> — сканер пампов\n"
+                    "• <code>whale</code> — скан китов\n"
+                    "• <code>whale SOL</code> — анализ китов по монете\n"
+                    "• <code>portfolio</code> — портфель\n"
+                    "• или кнопки меню ниже ⬇️"
+                )
+                send_telegram(token, chat_id_local, hint, reply_markup=main_keyboard())
+
+        elif "callback_query" in u:
+            cb = u["callback_query"]
+            cb_id = cb["id"]
+            cb_chat = cb.get("message", {}).get("chat", {}).get("id")
+            cb_user = cb.get("from", {}).get("id", cb_chat)
+            msg_id = cb.get("message", {}).get("message_id")
+            cb_data = cb.get("data", "")
+
+            if not cb_chat:
+                answer_callback(token, cb_id, "Ошибка данных")
+                return
+            if not is_authorized(cb_user):
+                answer_callback(token, cb_id, "⛔ Нет доступа")
+                return
+
+            print(f"🔘 Callback от {cb_user}: {cb_data}")
             settings = state["settings"]
 
-            # Изменение порога Score
-            if cb_data == "score:+5":
-                settings["min_score"] = min(95.0, settings["min_score"] + 5)
-                save_state(state)
-                answer_callback(token, cb_id, f"MIN_SCORE: {settings['min_score']:.0f}")
+            if cb_data == "port:refresh":
+                answer_callback(token, cb_id, "Обновляю цены...")
+                port_text = format_portfolio(state)
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, port_text, reply_markup=portfolio_inline_kb())
+                else:
+                    send_telegram(token, cb_chat, port_text, reply_markup=portfolio_inline_kb())
 
-            elif cb_data == "score:-5":
-                settings["min_score"] = max(45.0, settings["min_score"] - 5)
-                save_state(state)
-                answer_callback(token, cb_id, f"MIN_SCORE: {settings['min_score']:.0f}")
-                if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            elif cb_data == "port:add":
+                answer_callback(token, cb_id)
+                user_fsm[cb_chat] = {"state": "waiting_symbol", "data": {}}
+                send_telegram(token, cb_chat, "➕ Введите тикер монеты (например, <code>SOL</code>):", reply_markup=cancel_keyboard())
 
-            elif cb_data.startswith("score:set:"):
-                val = float(cb_data.split(":")[-1])
-                settings["min_score"] = val
-                save_state(state)
-                answer_callback(token, cb_id, f"MIN_SCORE установлен на {val:.0f}")
-                if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+            elif cb_data == "port:del":
+                answer_callback(token, cb_id)
+                kb = remove_asset_inline_kb(state)
+                if not kb:
+                    send_telegram(token, cb_chat, "ℹ️ Портфель пуст.", reply_markup=main_keyboard())
+                    return
+                send_telegram(token, cb_chat, "🗑 <b>Выберите монету для удаления:</b>", reply_markup=kb)
+
+            elif cb_data.startswith("del:"):
+                symbol = cb_data[4:]
+                answer_callback(token, cb_id)
+                if portfolio_remove(state, symbol):
+                    send_telegram(token, cb_chat, f"✅ <b>{base_asset(symbol)}</b> удалена из портфеля!", reply_markup=main_keyboard())
+                else:
+                    send_telegram(token, cb_chat, f"❌ <b>{base_asset(symbol)}</b> не найдена.", reply_markup=main_keyboard())
+
+            elif cb_data == "menu:main":
+                answer_callback(token, cb_id, "Главное меню")
+                send_telegram(token, cb_chat, "<b>📋 Главное меню Pump Pulse</b>\n\nВыберите действие:", reply_markup=main_keyboard())
 
             elif cb_data == "autoscan:toggle":
                 settings["autoscan"] = not settings.get("autoscan", True)
                 save_state(state)
-                status_str = "включён" if settings["autoscan"] else "выключен"
-                answer_callback(token, cb_id, f"Автоскан {status_str}")
+                status = "включён 🟢" if settings["autoscan"] else "выключен 🔴"
+                answer_callback(token, cb_id, f"Автоскан {status}")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data.startswith("interval:"):
-                sec = int(cb_data.split(":")[-1])
+                sec = int(cb_data.split(":")[1])
                 settings["scan_interval_sec"] = sec
                 save_state(state)
                 answer_callback(token, cb_id, f"Интервал: {sec // 60} мин")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cb_data.startswith("score:set:"):
+                val = float(cb_data.split(":")[2])
+                settings["min_score"] = val
+                save_state(state)
+                answer_callback(token, cb_id, f"Порог Score: {val:.0f}")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cb_data.startswith("score:"):
+                delta = float(cb_data.split(":")[1])
+                settings["min_score"] = max(30.0, min(95.0, settings.get("min_score", DEFAULT_MIN_SCORE) + delta))
+                save_state(state)
+                answer_callback(token, cb_id, f"Порог Score: {settings['min_score']:.0f}")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data == "filter:toggle":
-                cur = settings.get("filter_level", "strong_and_watch")
-                settings["filter_level"] = "strong_only" if cur == "strong_and_watch" else "strong_and_watch"
+                settings["filter_level"] = "strong_only" if settings.get("filter_level") == "strong_and_watch" else "strong_and_watch"
                 save_state(state)
-                mode_str = "Только Strong 🔥" if settings["filter_level"] == "strong_only" else "Strong + Watch ⚡"
-                answer_callback(token, cb_id, f"Фильтр: {mode_str}")
+                lvl = "Только Strong 🔥" if settings["filter_level"] == "strong_only" else "Strong + Watch ⚡"
+                answer_callback(token, cb_id, f"Фильтр: {lvl}")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data == "settings:refresh":
                 answer_callback(token, cb_id, "Настройки обновлены")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-            # ── Callback-обработчики спотовой автоторговли Binance ──
+            # ── Автоторговля ──
             elif cb_data == "trade:toggle":
-                cur_at = settings.get("auto_trade", False)
-                settings["auto_trade"] = not cur_at
-                save_state(state, sync_git=True)
-                st_str = "включена (TP +3%) 🟢" if settings["auto_trade"] else "отключена 🔴"
+                settings["auto_trade"] = not settings.get("auto_trade", False)
+                save_state(state)
+                st_str = "включена ⚡" if settings["auto_trade"] else "выключена"
                 answer_callback(token, cb_id, f"Автоторговля {st_str}")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data.startswith("trade:amt:"):
-                val = float(cb_data.split(":")[-1])
-                settings["trade_amount_usdt"] = val
-                save_state(state, sync_git=True)
-                answer_callback(token, cb_id, f"Сумма ставки: {val:.0f} USDT")
+                amt = float(cb_data.split(":")[2])
+                settings["trade_amount_usdt"] = amt
+                save_state(state)
+                answer_callback(token, cb_id, f"Ставка: {amt:.0f} USDT")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data.startswith("trade:tp:"):
-                val = float(cb_data.split(":")[-1])
-                settings["take_profit_pct"] = val
-                save_state(state, sync_git=True)
-                answer_callback(token, cb_id, f"Take-Profit: +{val:.1f}%")
+                tp = float(cb_data.split(":")[2])
+                settings["take_profit_pct"] = tp
+                save_state(state)
+                answer_callback(token, cb_id, f"TP: +{tp:.0f}%")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data == "trade:balance":
-                bals, err = get_spot_balances(state)
-                free_usdt = bals.get("USDT", 0.0)
-                if err or (not bals and free_usdt == 0.0):
-                    api_k, api_s = get_api_credentials(state)
-                    if not api_k or not api_s:
-                        answer_callback(token, cb_id, "Ключи Binance не настроены!", show_alert=True)
-                        send_telegram(
-                            token,
-                            chat_id,
-                            "⚠️ <b>Ключи Binance API ещё не настроены.</b>\n\n"
-                            "Чтобы бот мог проверять баланс и торговать, отправьте в чат команду:\n"
-                            "<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
-                            "Или добавьте их в GitHub Secrets / файл <code>.env</code>:\n"
-                            "<code>BINANCE_API_KEY=...</code>\n"
-                            "<code>BINANCE_API_SECRET=...</code>",
-                        )
-                    else:
-                        answer_callback(token, cb_id, f"Ошибка: {err or 'нет связи'}", show_alert=True)
-                        send_telegram(
-                            token,
-                            chat_id,
-                            f"❌ <b>Ошибка ответа биржи Binance:</b>\n\n"
-                            f"<code>{err}</code>\n\n"
-                            f"<b>Что проверить:</b>\n"
-                            f"1. Верно ли скопированы API Key и Secret (без пробелов).\n"
-                            f"2. Включена ли галочка <b>«Включить спотовую и маржинальную торговлю»</b> в настройках ключа на Binance.\n"
-                            f"3. Нет ли на ключе ограничения по белому списку IP (IP Access Restriction).",
-                        )
-                else:
-                    bal_items = [f"• <b>{k}:</b> {fmt_qty(v)}" for k, v in sorted(bals.items()) if v > 0.0001]
-                    bal_str = "\n".join(bal_items[:15]) if bal_items else "<i>Нет активов с положительным балансом</i>"
-                    answer_callback(token, cb_id, f"Свободно USDT: {free_usdt:,.2f}")
-                    send_telegram(
-                        token,
-                        chat_id,
-                        f"💳 <b>Спотовый баланс Binance:</b>\n\n"
-                        f"💵 <b>Свободно USDT для торговли:</b> <code>{free_usdt:,.2f} USDT</code>\n\n"
-                        f"<b>Активы на кошельке:</b>\n{bal_str}",
-                    )
+                answer_callback(token, cb_id, "Запрашиваю баланс...")
+                api_key, api_secret = get_api_credentials(state)
+                if not api_key or not api_secret:
+                    send_telegram(token, cb_chat, "⚠️ API-ключи не настроены. Используйте <code>/api КЛЮЧ СЕКРЕТ</code>.")
+                    return
+                balances, err = get_spot_balances(state)
+                if err:
+                    send_telegram(token, cb_chat, f"❌ Ошибка баланса: <code>{err}</code>")
+                    return
+                usdt_free = balances.get("USDT", 0.0)
+                lines = [f"💳 <b>Баланс Binance Spot</b>\n", f"• USDT (свободно): <code>{usdt_free:,.2f}</code>"]
+                for asset, free in sorted(balances.items(), key=lambda x: -x[1])[:15]:
+                    if asset != "USDT" and free > 0.000001:
+                        lines.append(f"• {asset}: <code>{fmt_qty(free)}</code>")
+                send_telegram(token, cb_chat, "\n".join(lines))
 
             elif cb_data.startswith("trade_buy:"):
                 sym = cb_data.split(":", 1)[1]
-                answer_callback(token, cb_id, f"Покупка {base_asset(sym)} на Binance...")
-                mkt_p = get_price(sym) or 0.0
+                answer_callback(token, cb_id, f"Покупаю {base_asset(sym)}...")
+                mkt_p = get_price(sym)
+                if mkt_p is None:
+                    send_telegram(token, cb_chat, f"❌ Не удалось получить цену {sym}.")
+                    return
                 dummy_sig = PumpSignal(
                     symbol=sym,
                     base=base_asset(sym),
-                    quote="USDT",
                     price=mkt_p,
                     change_24h=0.0,
-                    volume_24h=0.0,
-                    score=80.0,
-                    grade="strong",
-                    best_tf="15m",
-                    by_tf=[],
+                    quote_volume_24h=0.0,
+                    high_24h=mkt_p,
+                    low_24h=mkt_p,
                     btc_relative_24h=0.0,
+                    best_tf="manual",
+                    best_score=80.0,
+                    grade="strong",
                     alert_key=f"manual_{sym}_{int(time.time())}",
+                    by_tf=[],
                 )
-                execute_pump_auto_trade(token, chat_id, state, dummy_sig)
+                execute_pump_auto_trade(token, cb_chat, state, dummy_sig)
 
-            # Управление портфелем через Callback
-            elif cb_data == "port:refresh":
-                answer_callback(token, cb_id, "Цены обновлены")
-                port_text = format_portfolio(state)
+            # ── Режим «Скан действий китов» ──
+            elif cb_data == "whale:toggle":
+                settings["whale_autoscan"] = not settings.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN)
+                save_state(state)
+                st_str = "включён 🟢" if settings["whale_autoscan"] else "выключен 🔴"
+                answer_callback(token, cb_id, f"Скан китов {st_str}")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, port_text, reply_markup=portfolio_inline_kb())
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-            elif cb_data == "port:add":
-                answer_callback(token, cb_id)
-                user_fsm[chat_id] = {"state": "waiting_portfolio_input", "data": {}}
-                prompt_text = (
-                    "➕ <b>Добавление актива в портфель</b>\n\n"
-                    "Отправьте сообщение в формате:\n"
-                    "<code>ТИКЕР КОЛИЧЕСТВО [ЦЕНА]</code>\n\n"
-                    "<b>Примеры:</b>\n"
-                    "• <code>SOL 2.5 140.5</code> — 2.5 SOL по $140.5\n"
-                    "• <code>BTC 0.05</code> — 0.05 BTC <i>(цена подставится с биржи автоматически!)</i>\n"
-                    "• <code>PEPE 500000 0.0000115</code>\n\n"
-                    "Для отмены нажмите кнопку <b>«❌ Отмена»</b> ниже."
-                )
-                send_telegram(token, chat_id, prompt_text, reply_markup=cancel_keyboard())
-
-            elif cb_data == "port:del":
-                del_kb = remove_asset_inline_kb(state)
-                if del_kb:
-                    answer_callback(token, cb_id)
-                    if msg_id:
-                        edit_message(
-                            token, chat_id, msg_id,
-                            "🗑 <b>Выберите актив для удаления из портфеля:</b>",
-                            reply_markup=del_kb,
-                        )
+            elif cb_data.startswith("whale:score:"):
+                part = cb_data.rsplit(":", 1)[-1]
+                if part == "-5":
+                    settings["whale_min_score"] = max(30.0, settings.get("whale_min_score", DEFAULT_WHALE_MIN_SCORE) - 5)
+                elif part == "+5":
+                    settings["whale_min_score"] = min(95.0, settings.get("whale_min_score", DEFAULT_WHALE_MIN_SCORE) + 5)
                 else:
-                    answer_callback(token, cb_id, "Портфель пуст!", show_alert=True)
-
-            elif cb_data.startswith("del:"):
-                sym = cb_data.split(":", 1)[1]
-                if portfolio_remove(state, sym):
-                    answer_callback(token, cb_id, f"{base_asset(sym)} удалён из портфеля", show_alert=True)
-                else:
-                    answer_callback(token, cb_id, "Актив не найден.")
-                port_text = format_portfolio(state)
+                    settings["whale_min_score"] = float(part)
+                save_state(state)
+                answer_callback(token, cb_id, f"Whale Score порог: {settings['whale_min_score']:.0f}")
                 if msg_id:
-                    edit_message(token, chat_id, msg_id, port_text, reply_markup=portfolio_inline_kb())
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
-            # Быстрое добавление из карточки сигнала
-            elif cb_data.startswith("add_coin:"):
-                parts = cb_data.split(":")
-                sym = parts[1]
-                p_val = float(parts[2]) if len(parts) > 2 else (get_price(sym) or 0.0)
-                user_fsm[chat_id] = {
-                    "state": "waiting_quick_add_qty",
-                    "data": {"symbol": sym, "price": p_val}
-                }
+            elif cb_data == "whale:scan_now":
+                answer_callback(token, cb_id, "Сканирую действия китов...")
+                execute_whale_scan_and_report(token, cb_chat, state)
+
+            elif cb_data == "whale:symbol_prompt":
                 answer_callback(token, cb_id)
+                user_fsm[cb_chat] = {"state": "waiting_whale_symbol", "data": {}}
                 send_telegram(
-                    token,
-                    chat_id,
-                    f"➕ <b>Добавление {base_asset(sym)} в портфель</b>\n\n"
-                    f"Фиксированная цена: <code>{fmt_price(p_val)} USDT</code>\n"
-                    f"Введите желаемое количество монет (например: <code>10</code> или <code>0.5</code>):",
+                    token, cb_chat,
+                    "🐋 <b>Проверка конкретной монеты</b>\n\n"
+                    "Введите тикер (например <code>BTC</code>, <code>SOL</code> или <code>PEPE</code>):",
                     reply_markup=cancel_keyboard(),
                 )
 
+            elif cb_data.startswith("whale:details:"):
+                sym = cb_data.split(":", 2)[2]
+                answer_callback(token, cb_id, f"Анализ китов: {ws.base_of(sym) if WHALE_MODULE_OK else sym}")
+                whale_deep_dive(token, cb_chat, sym)
+
+            elif cb_data.startswith("add_coin:"):
+                parts = cb_data.split(":")
+                symbol = parts[1]
+                price = float(parts[2]) if len(parts) > 2 else 0.0
+                answer_callback(token, cb_id)
+                if price <= 0:
+                    price = get_price(symbol) or 0.0
+                send_telegram(
+                    token, cb_chat,
+                    f"➕ <b>Добавление {base_asset(symbol)}</b>\n\n"
+                    f"Текущая цена: <code>{fmt_price(price)} USDT</code>\n\n"
+                    f"Введите <b>количество</b> монет, которое у вас есть (например, 10):",
+                    reply_markup=cancel_keyboard(),
+                )
+                user_fsm[cb_chat] = {"state": "waiting_quick_add_qty", "data": {"symbol": symbol, "price": price}}
+
             elif cb_data.startswith("factors:"):
                 parts = cb_data.split(":")
-                sym = parts[1]
-                tf = parts[2] if len(parts) > 2 else "15m"
-                answer_callback(token, cb_id, f"Анализ {base_asset(sym)} ({tf})", show_alert=False)
-                send_telegram(
-                    token,
-                    chat_id,
-                    f"📊 <b>Детальный разбор индикаторов {base_asset(sym)}/USDT ({tf})</b>\n\n"
-                    f"• Объём vs SMA20: импульс выше среднего\n"
-                    f"• Donchian 20: фиксация пробоя максимумов\n"
-                    f"• Тренд EMA 9/21: бычья структура\n"
-                    f"• Taker Buy Ratio: преобладание покупок по рынку\n"
-                    f"• RSI: в рабочем коридоре без перегрева\n\n"
-                    f"<i>График доступен по кнопкам под сигналом.</i>"
-                )
-
-            elif cb_data == "menu:main":
-                user_fsm.pop(chat_id, None)
+                symbol = parts[1]
+                tf = parts[2] if len(parts) > 2 else "5m"
                 answer_callback(token, cb_id)
-                send_telegram(
-                    token,
-                    chat_id,
-                    "🔘 <b>Главное меню клавиатуры активно:</b>",
-                    reply_markup=main_keyboard(),
-                )
-
-            else:
-                answer_callback(token, cb_id)
-            return
-
-        # ── 2. Обработка обычных сообщений ──
-        msg = upd.get("message") or upd.get("edited_message")
-        if not msg:
-            return
-
-        raw_text = msg.get("text") or msg.get("caption") or ""
-        text = raw_text.strip()
-        chat = msg.get("chat", {})
-        chat_id = str(chat.get("id", ""))
-        if not chat_id:
-            return
-
-        sender = msg.get("from", {})
-        user_tag = sender.get("username") or sender.get("first_name") or chat_id
-        if text:
-            print(f"📩 [Message @{user_tag} ({chat_id})]: {text}")
-
-        # Автоматически регистрируем chat_id для получения алертов автоскана
-        if chat_id not in state["allowed_chats"]:
-            state["allowed_chats"].append(chat_id)
-            save_state(state)
-
-        if not is_authorized(chat_id):
-            print(f"⛔ Доступ запрещён для {chat_id}")
-            send_telegram(
-                token,
-                chat_id,
-                "⛔ <b>Доступ ограничен.</b> Ваш Chat ID не авторизован для управления ботом.",
-            )
-            return
-
-        if not text:
-            # Пользователь прислал стикер, фото или файл без текста
-            send_telegram(
-                token,
-                chat_id,
-                "👋 Выберите действие в меню ниже:",
-                reply_markup=main_keyboard(),
-            )
-            return
-
-        clean_text = text.strip()
-        cmd = clean_text.split()[0].lower().split("@")[0] if clean_text else ""
-        text_lower = clean_text.lower()
-
-        # Если нажата любая кнопка главного меню — сбрасываем FSM и сразу выполняем действие
-        is_menu_action = (
-            cmd in ("/start", "/scan", "/portfolio", "/port", "/settings", "/help", "/del", "/delete", "/cancel", "/trade", "/trades", "/api")
-            or "скан" in text_lower
-            or "портфель" in text_lower
-            or "настройк" in text_lower
-            or "помощь" in text_lower
-            or "справка" in text_lower
-            or "удалить" in text_lower
-            or "отмена" in text_lower
-            or "торговл" in text_lower
-            or "сделк" in text_lower
-        )
-        if is_menu_action and chat_id in user_fsm:
-            print(f"-> Сброс FSM для {chat_id} по кнопке меню: {clean_text}")
-            user_fsm.pop(chat_id, None)
-
-        # Обработка отмены в любом состоянии
-        if cmd == "/cancel" or "отмена" in text_lower:
-            user_fsm.pop(chat_id, None)
-            print(f"-> Отмена действия для {chat_id}")
-            send_telegram(
-                token,
-                chat_id,
-                "❌ Действие отменено. Главное меню активно.",
-                reply_markup=main_keyboard(),
-            )
-            return
-
-        # ── Проверка FSM-состояния пользователя ──
-        if chat_id in user_fsm:
-            fsm = user_fsm[chat_id]
-            cur_st = fsm.get("state")
-
-            if cur_st == "waiting_portfolio_input":
-                # Ожидаем ввод: ТИКЕР КОЛИЧЕСТВО [ЦЕНА]
-                clean_text = text.replace(",", " ")
-                tokens = [t.strip() for t in clean_text.split() if t.strip()]
-
-                if len(tokens) < 2:
-                    send_telegram(
-                        token,
-                        chat_id,
-                        "⚠️ Неверный формат. Введите тикер и количество (и при желании цену входа).\n"
-                        "Пример: <code>SOL 2.5 140.5</code> или <code>BTC 0.05</code>\n\n"
-                        "Для выхода нажмите <b>«❌ Отмена»</b>.",
-                        reply_markup=cancel_keyboard(),
-                    )
+                # Восстанавливаем сигнал для разбора факторов
+                tickers = get_24h_tickers()
+                ticker = next((t for t in tickers if t["symbol"] == symbol), None)
+                if not ticker:
+                    send_telegram(token, cb_chat, f"❌ Монета {symbol} не найдена.")
                     return
-
-                raw_sym = tokens[0].upper()
-                sym = normalize_symbol(raw_sym)
-
-                try:
-                    qty = float(tokens[1])
-                    if qty <= 0:
-                        raise ValueError
-                except ValueError:
-                    send_telegram(
-                        token,
-                        chat_id,
-                        "⚠️ Ошибка: количество должно быть положительным числом.\nПопробуйте ещё раз:",
-                        reply_markup=cancel_keyboard(),
-                    )
+                btc_raw = fetch_klines("BTCUSDT")
+                raw = fetch_klines(symbol)
+                btc_ticker = next((t for t in tickers if t["symbol"] == "BTCUSDT"), None)
+                sig, _ = analyze_symbol(ticker, raw, btc_raw, btc_ticker, min_score=0.0)
+                if not sig:
+                    send_telegram(token, cb_chat, "❌ Не удалось рассчитать факторы.")
                     return
+                send_telegram(token, cb_chat, format_factor_breakdown(sig, tf))
 
-                if len(tokens) >= 3:
-                    try:
-                        price = float(tokens[2])
-                        if price <= 0:
-                            raise ValueError
-                    except ValueError:
-                        send_telegram(
-                            token,
-                            chat_id,
-                            "⚠️ Ошибка: цена должна быть положительным числом.\nПопробуйте ещё раз:",
-                            reply_markup=cancel_keyboard(),
-                        )
-                        return
-                else:
-                    # Автоматическое получение текущей цены с Binance
-                    mkt_price = get_price(sym)
-                    if mkt_price is None:
-                        send_telegram(
-                            token,
-                            chat_id,
-                            f"⚠️ Монета <code>{sym}</code> не найдена на споте Binance. "
-                            f"Проверьте правильность тикера или укажите цену вручную (например: <code>{raw_sym} {qty} 10.5</code>).",
-                            reply_markup=cancel_keyboard(),
-                        )
-                        return
-                    price = mkt_price
-
-                new_qty, new_avg = portfolio_add(state, sym, qty, price)
-                user_fsm.pop(chat_id, None)
-
-                send_telegram(
-                    token,
-                    chat_id,
-                    f"✅ <b>Актив успешно сохранён в портфель!</b>\n\n"
-                    f"• Монета: <b>{base_asset(sym)}/USDT</b>\n"
-                    f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
-                    f"• Средняя цена входа: <code>{fmt_price(new_avg)} USDT</code>\n"
-                    f"• Сумма позиции: <code>{(new_qty * new_avg):,.2f} USDT</code>",
-                    reply_markup=main_keyboard(),
-                )
-                # Показываем обновленный портфель
-                send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
-                return
-
-            elif cur_st == "waiting_quick_add_qty":
+    # ── Polling loop ──
+    print("🤖 Бот запущен и слушает сообщения...")
+    while not stop_event.is_set():
+        try:
+            updates = get_updates(token, (last_update_id + 1) if last_update_id is not None else None, timeout=40)
+            for u in updates.get("result", []):
                 try:
-                    qty = float(text.replace(",", ".").strip())
-                    if qty <= 0:
-                        raise ValueError
-                except ValueError:
-                    send_telegram(
-                        token,
-                        chat_id,
-                        "⚠️ Введите корректное положительное число (например, <code>5</code> или <code>0.25</code>):",
-                        reply_markup=cancel_keyboard(),
-                    )
-                    return
-
-                sym = fsm["data"]["symbol"]
-                price = fsm["data"]["price"]
-                new_qty, new_avg = portfolio_add(state, sym, qty, price)
-                user_fsm.pop(chat_id, None)
-
-                send_telegram(
-                    token,
-                    chat_id,
-                    f"✅ <b>Позиция {base_asset(sym)} добавлена!</b>\n\n"
-                    f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
-                    f"• Вход: <code>{fmt_price(new_avg)} USDT</code>",
-                    reply_markup=main_keyboard(),
-                )
-                send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
-                return
-
-        # ── Основные команды и Reply-кнопки ──
-        if cmd == "/start" or text_lower in ("/start", "start"):
-            print(f"-> Отправка приветствия для {chat_id}")
-            welcome_text = (
-                "👋 <b>Добро пожаловать в Pump Pulse Scanner 2.0!</b>\n\n"
-                "Я непрерывно сканирую спотовый рынок Binance на предмет зарождения "
-                "мощных импульсов (пампов) с помощью multi-TF скоринга объёма, "
-                "пробоев Donchian, ATR, RSI и покупательской агрессии.\n\n"
-                "<b>Выберите действие в меню ниже:</b>"
-            )
-            send_telegram(token, chat_id, welcome_text, reply_markup=main_keyboard())
-
-        elif cmd == "/scan" or "скан" in text_lower:
-            print(f"-> Запуск ручного сканирования для {chat_id}")
-            execute_scan_and_report(token, chat_id, state)
-
-        elif cmd in ("/portfolio", "/port") or "портфель" in text_lower:
-            print(f"-> Отправка портфеля для {chat_id}")
-            port_text = format_portfolio(state)
-            send_telegram(token, chat_id, port_text, reply_markup=portfolio_inline_kb())
-
-        elif cmd == "/add" or "добавить" in text_lower:
-            args = clean_text.split()[1:]
-            if len(args) >= 2:
-                raw_sym = args[0].upper()
-                sym = normalize_symbol(raw_sym)
-                try:
-                    qty = float(args[1])
-                    price = float(args[2]) if len(args) >= 3 else (get_price(sym) or 0.0)
-                    if qty <= 0 or price <= 0:
-                        raise ValueError
-                    new_qty, new_avg = portfolio_add(state, sym, qty, price)
-                    print(f"-> Добавлен актив {sym} для {chat_id}")
-                    send_telegram(
-                        token,
-                        chat_id,
-                        f"✅ <b>Актив {base_asset(sym)} успешно добавлен!</b>\n\n"
-                        f"• Количество: <code>{fmt_qty(new_qty)}</code>\n"
-                        f"• Вход: <code>{fmt_price(new_avg)} USDT</code>\n"
-                        f"• Сумма позиции: <code>{(new_qty * new_avg):,.2f} USDT</code>",
-                        reply_markup=main_keyboard(),
-                    )
-                    send_telegram(token, chat_id, format_portfolio(state), reply_markup=portfolio_inline_kb())
-                except Exception:
-                    send_telegram(token, chat_id, "⚠️ Ошибка формата. Пример: <code>/add SOL 2.5 140.5</code>", reply_markup=main_keyboard())
-            else:
-                print(f"-> Диалог добавления актива для {chat_id}")
-                user_fsm[chat_id] = {"state": "waiting_portfolio_input", "data": {}}
-                prompt_text = (
-                    "➕ <b>Добавление актива в портфель</b>\n\n"
-                    "Отправьте тикер, количество и цену (опционально):\n"
-                    "<code>ТИКЕР КОЛИЧЕСТВО [ЦЕНА]</code>\n\n"
-                    "<b>Примеры:</b>\n"
-                    "• <code>SOL 2.5 140.5</code> — 2.5 SOL по $140.5\n"
-                    "• <code>BTC 0.05</code> — текущая цена возьмётся с Binance!\n\n"
-                    "Или нажмите <b>«❌ Отмена»</b>."
-                )
-                send_telegram(token, chat_id, prompt_text, reply_markup=cancel_keyboard())
-
-        elif cmd in ("/del", "/delete") or "удалить" in text_lower:
-            print(f"-> Диалог удаления для {chat_id}")
-            del_kb = remove_asset_inline_kb(state)
-            if del_kb:
-                send_telegram(
-                    token,
-                    chat_id,
-                    "🗑 <b>Выберите актив для удаления:</b>",
-                    reply_markup=del_kb,
-                )
-            else:
-                send_telegram(
-                    token,
-                    chat_id,
-                    "💼 <b>Портфель пуст!</b> Нечего удалять.",
-                    reply_markup=main_keyboard(),
-                )
-
-        elif cmd == "/settings" or "настройк" in text_lower:
-            print(f"-> Открытие настроек для {chat_id}")
-            send_telegram(
-                token,
-                chat_id,
-                settings_text(state),
-                reply_markup=settings_inline_kb(state),
-            )
-
-        elif cmd in ("/trade", "/trades") or "торговл" in text_lower or "сделк" in text_lower:
-            print(f"-> Запрос панели торговли для {chat_id}")
-            settings = state.get("settings", {})
-            at_status = "🟢 ВКЛЮЧЕНА (+3% TP)" if settings.get("auto_trade", False) else "🔴 ВЫКЛЮЧЕНА"
-            amt = settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT)
-            tp = settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
-            free_usdt = get_free_usdt_balance(state)
-            active_cnt = len(state.get("active_trades", {}))
-            history_cnt = len(state.get("trade_history", []))
-
-            trade_info = (
-                f"⚡ <b>Панель управления спотовой торговлей Binance</b>\n\n"
-                f"• Автоторговля пампов: <b>{at_status}</b>\n"
-                f"• Сумма покупки: <code>{amt:.1f} USDT</code>\n"
-                f"• Лимит Take-Profit: <code>+{tp:.1f}%</code>\n"
-                f"• Доступно USDT на бирже: <code>{free_usdt:,.2f} USDT</code>\n"
-                f"• Активных сделок (ордеров TP): <b>{active_cnt}</b>\n"
-                f"• Успешно закрытых сделок: <b>{history_cnt}</b>\n\n"
-                f"<i>Используйте кнопки ниже для переключения режима и ставок:</i>"
-            )
-            send_telegram(token, chat_id, trade_info, reply_markup=settings_inline_kb(state))
-
-        elif cmd == "/api":
-            args = clean_text.split()[1:]
-            if len(args) == 2:
-                k, s = args[0].strip(), args[1].strip()
-                settings = state.setdefault("settings", {})
-                settings["binance_api_key"] = k
-                settings["binance_api_secret"] = s
-                save_state(state, sync_git=True)
-                masked = k[:4] + "..." + k[-4:] if len(k) > 8 else "***"
-                send_telegram(
-                    token,
-                    chat_id,
-                    f"✅ <b>API-ключи Binance сохранены!</b>\n\n"
-                    f"• API Key: <code>{masked}</code>\n"
-                    f"• Спотовая торговля готова к работе.\n\n"
-                    f"💡 Проверьте баланс кнопкой <b>«💳 Баланс Binance»</b> в настройках ⚙️.",
-                    reply_markup=main_keyboard(),
-                )
-            else:
-                api_k, api_s = get_api_credentials(state)
-                st = f"Ключ сохранён ({api_k[:4]}...)" if api_k else "Ключи не заданы"
-                send_telegram(
-                    token,
-                    chat_id,
-                    f"🔑 <b>Настройка Binance API</b>\n\n"
-                    f"Текущий статус: <code>{st}</code>\n\n"
-                    f"Чтобы привязать ключи, отправьте команду:\n"
-                    f"<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
-                    f"<i>Рекомендация по безопасности: на Binance включите только «Чтение» и «Спотовая торговля». Вывод средств оставьте отключённым!</i>",
-                    reply_markup=main_keyboard(),
-                )
-
-        elif cmd == "/help" or "помощь" in text_lower or "справка" in text_lower:
-            print(f"-> Отправка справки для {chat_id}")
-            send_telegram(token, chat_id, HELP_TEXT, reply_markup=main_keyboard())
-
-        else:
-            print(f"-> Запрос инфо по тикеру: {clean_text}")
-            cand_sym = normalize_symbol(clean_text)
-            pr = get_price(cand_sym)
-            if pr is not None:
-                base = base_asset(cand_sym)
-                info_text = (
-                    f"🪙 <b>Актив: {base}/USDT</b>\n"
-                    f"• Текущая цена: <code>{fmt_price(pr)} USDT</code>\n\n"
-                    f"Для управления используйте кнопки меню ниже."
-                )
-                send_telegram(token, chat_id, info_text, reply_markup=main_keyboard())
-            else:
-                send_telegram(
-                    token,
-                    chat_id,
-                    "Команда не распознана. Воспользуйтесь кнопками меню или /help.",
-                    reply_markup=main_keyboard(),
-                )
-
-    try:
-        while True:
-            try:
-                updates = get_updates(token, offset=last_offset, timeout=20)
-            except Exception as e:
-                print(f"⚠️ Ошибка сети при getUpdates: {e}", file=sys.stderr)
-                time.sleep(2)
-                continue
-
-            for upd in updates:
-                last_offset = upd.get("update_id", last_offset) + 1
-                try:
-                    handle_update(upd)
+                    handle_update(u)
                 except Exception as e:
-                    print(f"❌ Ошибка обработки обновления {upd.get('update_id')}: {e}", file=sys.stderr)
+                    print(f"❌ Ошибка обработки апдейта: {e}", file=sys.stderr)
                     traceback.print_exc()
+        except Exception as e:
+            if not stop_event.is_set():
+                print(f"⚠️ Ошибка получения обновлений: {e}. Пауза 5с.", file=sys.stderr)
+                time.sleep(5)
 
-    except KeyboardInterrupt:
-        print("\nОстановка бота по сигналу пользователя...")
-    finally:
-        stop_event.set()
-        save_state(state)
-        print("Состояние сохранено. Бот остановлен.")
+    print("👋 Бот остановлен.")
+    if scan_thread:
+        scan_thread.join(timeout=2)
 
-# ───────────────────────── Режим Oneshot (CLI / Cron) ─────────────────────────
+# ───────────────────────── Тесты и CLI ─────────────────────────
 
-def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
-    print("=== Режим разового сканирования (Oneshot) ===")
-    state = load_state()
-    settings = state.get("settings", {})
-    min_score = settings.get("min_score", DEFAULT_MIN_SCORE)
-    min_vol = settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME)
-    filter_level = settings.get("filter_level", "strong_and_watch")
-
-    signals, meta, summaries = run_scan(
-        min_score=min_score,
-        min_quote_volume=min_vol,
-    )
-
-    if filter_level == "strong_only":
-        active_signals = [s for s in signals if s.grade == "strong"]
-    else:
-        active_signals = [s for s in signals if s.grade in ("strong", "watch")]
-
-    duration_sec = meta["duration_ms"] / 1000.0
-    print(
-        f"Сканирование завершено за {duration_sec:.1f}с: пар={meta['universe']}, "
-        f"отобрано={meta['candidates']}, активных сигналов={len(active_signals)}"
-    )
-
-    if token and chat_id:
-        now = int(time.time())
-        sent_alerts: dict = state.setdefault("sent_alerts", {})
-        sent_count = 0
-
-        target_chats: Set[str] = set()
-        if chat_id and (chat_id.lstrip("-").isdigit() or chat_id.startswith("@")):
-            target_chats.add(chat_id)
-        for c in state.get("allowed_chats", []):
-            cid_str = str(c).strip()
-            if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
-                target_chats.add(cid_str)
-
-        for sig in active_signals:
-            if sig.alert_key in sent_alerts:
-                print(f"• Пропуск {sig.symbol} ({sig.best_tf}): алерт для этого бара уже был отправлен ранее")
-                continue
-
-            sent_alerts[sig.alert_key] = now
-            sent_count += 1
-            text = format_alert(sig)
-            kb = signal_inline_kb(sig, state=state)
-
-            for cid in target_chats:
-                ok = send_telegram(token, cid, text, reply_markup=kb)
-                print(f"• {sig.symbol} ({sig.grade} {sig.best_score:.0f}) → {cid}: {'sent' if ok else 'fail'}")
-
-        if sent_count > 0:
-            save_state(state)
-            print(f"Успешно отправлено новых сигналов: {sent_count}")
-        else:
-            print("Новых уникальных сигналов выше порога не обнаружено.")
-
-            # Если запуск был выполнен вручную (workflow_dispatch) или включен NOTIFY_EMPTY, отправляем отчет о спокойном рынке
-            is_manual = (
-                os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-                or os.environ.get("NOTIFY_EMPTY", "false").lower() in ("true", "1")
-                or "--notify-always" in sys.argv
-            )
-            if is_manual:
-                top_cand_str = ""
-                if summaries:
-                    top_cand_str = "\n".join(
-                        f"  • {c['base']}: Score {c['best_score']:.0f} ({c['best_tf']}), объём {c['vol_ratio']:.1f}×"
-                        for c in summaries[:3]
-                    )
-                btc_info = meta.get("btc", {})
-                btc_p = btc_info.get("price")
-                btc_c = btc_info.get("change24h")
-                btc_str = f"BTC: {fmt_price(btc_p)} USDT ({fmt_pct(btc_c)})" if btc_p is not None else ""
-
-                status_msg = (
-                    f"🔍 <b>Pump Pulse Scanner — Отчёт сканирования</b>\n\n"
-                    f"• Проверено спотовых пар: <code>{meta['universe']}</code>\n"
-                    f"• Порог сигнала (Score): <code>{min_score:.0f}</code>\n"
-                    f"• Сигналов выше порога: <b>0</b> <i>(рынок спокоен)</i>\n"
-                    f"• Фон: <i>{btc_str}</i>\n\n"
-                    f"<b>Ближайшие кандидаты по активности:</b>\n{top_cand_str or 'Нет данных'}"
-                )
-                for cid in target_chats:
-                    send_telegram(token, cid, status_msg)
-                print(f"Отправлен статус-отчёт о сканировании в Telegram.")
-    else:
-        for s in active_signals:
-            print(f"[{s.grade.upper()}] {s.symbol} Score: {s.best_score:.0f} Price: {s.price} 24h: {s.change_24h:+.2f}%")
-
-def run_test_connection(token: str, chat_id: str) -> None:
-    """Тест подключения бота к Telegram API и отправка тестового сообщения."""
-    print("=== Проверка подключения к Telegram API ===")
-    if not token:
-        print("❌ Ошибка: TELEGRAM_BOT_TOKEN не задан!", file=sys.stderr)
-        return
-    me = api_call(token, "getMe", {})
-    if not me.get("ok"):
-        print(f"❌ Ошибка токена бота: {me.get('description')}", file=sys.stderr)
-        return
-    bot_info = me["result"]
-    print(f"✅ Бот авторизован: @{bot_info.get('username')} ({bot_info.get('first_name')})")
-
-    if not chat_id:
-        print("⚠️ Внимание: TELEGRAM_CHAT_ID не задан!", file=sys.stderr)
-        return
-
-    test_msg = (
-        f"🔔 <b>Тестовое уведомление от Pump Pulse Scanner!</b>\n\n"
-        f"Бот <b>@{bot_info.get('username')}</b> успешно подключён к вашему чату.\n"
-        f"• Chat ID: <code>{chat_id}</code>\n"
-        f"• Статус: 🟢 <b>Связь установлена, бот готов к отправке сигналов!</b>"
-    )
-    res = send_telegram(token, chat_id, test_msg)
-    if res:
-        print(f"✅ Тестовое сообщение успешно доставлено в chat_id {chat_id} (msg_id: {res})!")
-    else:
-        print(
-            f"❌ Не удалось отправить сообщение в chat_id {chat_id}.\n"
-            f"   Возможные причины:\n"
-            f"   1. Вы не нажали кнопку Start (/start) в диалоге с ботом в Telegram.\n"
-            f"   2. Указан неверный chat_id (нужен цифровой ID, а не @username).\n"
-            f"   3. Если это канал/группа — бот должен быть добавлен туда администратором.",
-            file=sys.stderr,
-        )
+def run_test_connection() -> None:
+    print("=== Тест соединения с Binance ===")
+    try:
+        tickers = get_24h_tickers()
+        print(f"✅ USDT-спот пар получено: {len(tickers)}")
+        btc = next((t for t in tickers if t["symbol"] == "BTCUSDT"), None)
+        if btc:
+            print(f"✅ BTC: {fmt_price(btc['lastPrice'])} USDT (24ч: {fmt_pct(btc['priceChangePercent'])})")
+        raw = fetch_klines("BTCUSDT", limit=3)
+        print(f"✅ Klines BTCUSDT: {len(raw)} баров")
+        if WHALE_MODULE_OK:
+            sig = ws.deep_dive("BTC")
+            print(f"✅ Whale deep_dive BTC: {'OK' if sig else 'нет данных'}")
+        print("\n🎉 Все системные проверки пройдены успешно!")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}", file=sys.stderr)
+        sys.exit(1)
 
 def run_test_trade() -> None:
-    """Тест подключения к торговому API Binance и проверка баланса спота."""
-    print("=== Проверка подключения к Binance Spot API ===")
+    print("=== Тест API ключей и размещения сделки (11 USDT на BTCUSDT) ===")
     state = load_state()
-    offset = sync_binance_time(force=True)
-    print(f"• Синхронизация времени: серверный сдвиг Binance = {offset:+d} ms")
-
     api_key, api_secret = get_api_credentials(state)
     if not api_key or not api_secret:
-        print("❌ Ошибка: BINANCE_API_KEY и BINANCE_API_SECRET не заданы в .env или в боте!", file=sys.stderr)
-        print("   Для спотовой торговли укажите ключи в .env:")
-        print("      BINANCE_API_KEY=ваш_api_ключ")
-        print("      BINANCE_API_SECRET=ваш_секретный_ключ")
-        return
+        print("❌ API-ключи не настроены. Укажите BINANCE_API_KEY и BINANCE_API_SECRET в .env", file=sys.stderr)
+        sys.exit(1)
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip() or None
+    dummy = PumpSignal(
+        symbol="BTCUSDT", base="BTC", price=get_price("BTCUSDT") or 0.0,
+        change_24h=0.0, quote_volume_24h=0.0, high_24h=0.0, low_24h=0.0,
+        btc_relative_24h=0.0, best_tf="test", best_score=80.0, grade="strong",
+        alert_key="test", by_tf=[],
+    )
+    res = execute_pump_auto_trade(token, chat_id or "", state, dummy, manual_amount=11.0)
+    if res and "error" not in res:
+        print("✅ Тестовая сделка выполнена!")
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print(f"❌ Ошибка: {res.get('error') if res else 'unknown'}", file=sys.stderr)
+        sys.exit(1)
 
-    masked = api_key[:4] + "..." + api_key[-4:] if len(api_key) > 8 else "***"
-    print(f"• API Key: {masked}")
-
-    print("• Отправка HMAC-SHA256 запроса к /api/v3/account...")
-    acc = binance_signed_request("GET", "/api/v3/account", state=state)
-    if "error" in acc:
-        print(f"❌ Ошибка авторизации Binance: {acc.get('error')}", file=sys.stderr)
-        return
-
-    can_trade = acc.get("canTrade", False)
-    print(f"✅ Успешная авторизация! Спотовая торговля разрешена: {'🟢 ДА' if can_trade else '🔴 НЕТ'}")
-
-    bals, _ = get_spot_balances(state)
-    free_usdt = bals.get("USDT", 0.0)
-    print(f"• Свободный баланс USDT для сделок: {free_usdt:,.2f} USDT")
-
-    other_bals = [f"{k}: {fmt_qty(v)}" for k, v in sorted(bals.items()) if k != "USDT" and v > 0.0001]
-    if other_bals:
-        print(f"• Другие активы на споте: {', '.join(other_bals[:6])}")
-    print("=== Проверка Binance завершена успешно ===")
-
-# ───────────────────────── Main ─────────────────────────
-
-def main():
+def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-    # Проверка тестовых режимов
     if "--test" in sys.argv:
-        run_test_connection(token, chat_id)
+        run_test_connection()
         return
-
     if "--test-trade" in sys.argv:
         run_test_trade()
         return
+    if "--whale" in sys.argv:
+        run_whale_oneshot(token, chat_id)
+        return
 
-    # Проверка аргументов командной строки: --oneshot или --bot
-    mode = RUN_MODE
-    if "--oneshot" in sys.argv:
-        mode = "oneshot"
-    elif "--bot" in sys.argv:
-        mode = "bot"
-
-    if mode == "oneshot":
+    if RUN_MODE == "oneshot" or "--oneshot" in sys.argv:
+        if not token or not chat_id:
+            print("⚠️ TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — вывожу в консоль.", file=sys.stderr)
         run_oneshot(token, chat_id)
         return
 
-    # Режим интерактивного бота
-    if not token:
-        print(
-            "\n"
-            "⚠️  Внимание: TELEGRAM_BOT_TOKEN не задан!\n"
-            "   Для работы Telegram-бота необходимо указать токен бота.\n"
-            "   Вы можете создать файл .env на основе .env.example:\n"
-            "      TELEGRAM_BOT_TOKEN=ваш_токен_от_BotFather\n"
-            "      TELEGRAM_CHAT_ID=ваш_chat_id\n\n"
-            "   Либо передать их через переменные окружения.\n"
-            "   Для проверки логики сканера в терминале запустите:\n"
-            "      python pump_bot.py --oneshot\n",
-            file=sys.stderr,
-        )
+    if not token or not chat_id:
+        print("❌ Укажите TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env или переменных окружения.", file=sys.stderr)
         sys.exit(1)
 
-    run_bot(token)
+    try:
+        run_bot(token, chat_id)
+    except KeyboardInterrupt:
+        print("\n👋 Остановлено пользователем.")
 
 if __name__ == "__main__":
     main()
