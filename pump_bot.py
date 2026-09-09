@@ -76,10 +76,17 @@ BINANCE_BASE = (os.environ.get("BINANCE_DATA_BASE") or os.environ.get("BINANCE_B
 BINANCE_TRADE_URL = (os.environ.get("BINANCE_TRADE_URL") or "").strip() or "https://api.binance.com"
 
 # Настройка прокси (если задан BINANCE_PROXY или PROXY_URL) для обхода региональных ограничений (США/GitHub Actions)
-_proxy_cfg = os.environ.get("BINANCE_PROXY") or os.environ.get("PROXY_URL")
+_proxy_cfg = (os.environ.get("BINANCE_PROXY") or os.environ.get("PROXY_URL") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "").strip()
 if _proxy_cfg:
     os.environ["HTTP_PROXY"] = _proxy_cfg
     os.environ["HTTPS_PROXY"] = _proxy_cfg
+    try:
+        _proxy_handler = urllib.request.ProxyHandler({"http": _proxy_cfg, "https": _proxy_cfg})
+        _opener = urllib.request.build_opener(_proxy_handler)
+        urllib.request.install_opener(_opener)
+        print(f"🌐 Прокси успешно подключен: {_proxy_cfg}")
+    except Exception as _p_err:
+        print(f"⚠️ Ошибка настройки прокси: {_p_err}", file=sys.stderr)
 
 TIMEFRAMES = ("5m", "15m", "1h")
 TF_MS = {"5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000}
