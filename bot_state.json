@@ -134,7 +134,8 @@
   },
   "sent_whale_alerts": {
     "WHALE:TRXUSDT:496936": 1788969956,
-    "WHALE:SOLUSDT:496936": 1788970273
+    "WHALE:SOLUSDT:496936": 1788970273,
+    "WHALE:BTCUSDT:496936": 1788970596
   },
   "allowed_chats": [
     "1920596593"
