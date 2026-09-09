@@ -1,11 +1,5 @@
 {
-  "portfolio": {
-    "PENDLEUSDT": {
-      "qty": 43.63,
-      "avg_price": 2.16,
-      "added_at": 1788807030
-    }
-  },
+  "portfolio": {},
   "settings": {
     "min_score": 62.0,
     "min_quote_volume": 1500000.0,
