@@ -34,6 +34,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          BINANCE_PROXY: ${{ secrets.BINANCE_PROXY }}
+          BINANCE_TRADE_URL: ${{ secrets.BINANCE_TRADE_URL }}
           RUN_MODE: bot
         run: python pump_bot.py --bot
 
@@ -42,5 +44,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add bot_state.json
-          git diff --staged --quiet || (git commit -m "Auto-save bot state [skip ci]" && git push)
+          if [ -f bot_state.json ]; then
+            git add bot_state.json
+            git diff --staged --quiet || (git commit -m "Auto-save bot state [skip ci]" && git push)
+          fi
