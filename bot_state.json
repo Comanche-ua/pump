@@ -1,5 +1,11 @@
 {
-  "portfolio": {},
+  "portfolio": {
+    "MIRAUSDT": {
+      "qty": 10.0,
+      "avg_price": 0.05059,
+      "added_at": 1788983897
+    }
+  },
   "settings": {
     "min_score": 62.0,
     "min_quote_volume": 1500000.0,
