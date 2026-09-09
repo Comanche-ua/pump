@@ -2553,6 +2553,8 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 or "добав" in text_lower
                 or "удал" in text_lower
                 or "настрой" in text_lower
+                or "баланс" in text_lower
+                or "balance" in text_lower
                 or "помощ" in text_lower
                 or "help" in text_lower
                 or "меню" in text_lower
@@ -2672,7 +2674,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                         reply_markup=cancel_keyboard(),
                     )
 
-            elif cmd in ("balance", "баланс") or (is_menu_action and "баланс" in text_lower):
+            elif "баланс" in text_lower or "balance" in text_lower or cmd in ("balance", "баланс"):
                 print(f"-> Детальный баланс для {chat_id_local}")
                 msg_id = send_telegram(token, chat_id_local, "⏳ <i>Запрашиваю детальный баланс Binance...</i>")
                 bal_text = format_binance_balance_detailed(state)
