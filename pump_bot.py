@@ -967,25 +967,127 @@ def binance_signed_request(
     except Exception as e:
         return {"error": str(e)}
 
-def get_spot_balances(state: Optional[dict] = None) -> Tuple[Dict[str, float], Optional[str]]:
-    """Возвращает (словарь_балансов, текст_ошибки_если_есть)."""
+def get_spot_account_assets(state: Optional[dict] = None) -> Tuple[Dict[str, dict], Optional[str]]:
+    """
+    Возвращает детализированный баланс спотового аккаунта Binance:
+    {asset: {"free": float, "locked": float, "total": float}}
+    """
     res = binance_signed_request("GET", "/api/v3/account", state=state)
     if "error" in res or "balances" not in res:
         err_msg = res.get("error", "Неизвестная ошибка")
         return {}, str(err_msg)
-    balances: Dict[str, float] = {}
+    assets: Dict[str, dict] = {}
     for b in res["balances"]:
-        free = float(b.get("free", 0))
-        locked = float(b.get("locked", 0))
+        free = float(b.get("free", 0.0))
+        locked = float(b.get("locked", 0.0))
         total = free + locked
-        if total > 0.000001:
-            balances[b["asset"]] = free
-    return balances, None
+        if total > 0.00000001:
+            assets[b["asset"]] = {"free": free, "locked": locked, "total": total}
+    return assets, None
+
+def get_spot_balances(state: Optional[dict] = None) -> Tuple[Dict[str, float], Optional[str]]:
+    """Возвращает (словарь_балансов_free, текст_ошибки_если_есть)."""
+    assets, err = get_spot_account_assets(state=state)
+    if err:
+        return {}, err
+    return {k: v["free"] for k, v in assets.items()}, None
 
 def get_free_usdt_balance(state: Optional[dict] = None) -> float:
     """Возвращает свободный баланс USDT на спотовом кошельке Binance."""
     balances, _ = get_spot_balances(state=state)
     return balances.get("USDT", 0.0)
+
+def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
+    """
+    Формирует подробную расшифровку баланса Binance:
+    - Свободный и заблокированный USDT
+    - Оценка каждого актива в USDT по текущему рынку
+    - Итоговый капитал всего портфеля в USDT
+    """
+    api_key, api_secret = get_api_credentials(state)
+    if not api_key or not api_secret:
+        return (
+            "⚠️ <b>API-ключи Binance не настроены.</b>\n\n"
+            "Чтобы просматривать баланс и совершать сделки, привяжите ключи командой:\n"
+            "<code>/api ВАШ_KEY ВАШ_SECRET</code>\n"
+            "или через меню ⚙️ Настройки."
+        )
+
+    assets, err = get_spot_account_assets(state)
+    if err:
+        return f"❌ <b>Ошибка получения баланса Binance:</b>\n<code>{err}</code>"
+
+    usdt_info = assets.get("USDT", {"free": 0.0, "locked": 0.0, "total": 0.0})
+    usdt_free = usdt_info["free"]
+    usdt_locked = usdt_info["locked"]
+    usdt_total = usdt_info["total"]
+
+    # Собираем список всех ненулевых альткоинов/монет
+    non_usdt_assets = {k: v for k, v in assets.items() if k != "USDT" and v["total"] > 0.00000001}
+
+    # Запрашиваем цены в USDT для всех найденных монет
+    symbols_to_fetch = [f"{a}USDT" for a in non_usdt_assets.keys()]
+    prices = get_multiple_prices(symbols_to_fetch) if symbols_to_fetch else {}
+
+    lines = ["💳 <b>Баланс и активы на Binance Spot</b>\n"]
+
+    # Блок USDT
+    lines.append("💵 <b>Стейблкоин баланс (USDT):</b>")
+    lines.append(f"• <b>Свободно:</b> <code>{usdt_free:,.2f} USDT</code>")
+    if usdt_locked > 0.001:
+        lines.append(f"• <b>В ордерах покупки:</b> <code>{usdt_locked:,.2f} USDT</code>")
+    lines.append(f"• <b>Всего USDT:</b> <code>{usdt_total:,.2f} USDT</code>\n")
+
+    # Блок криптовалютных активов
+    total_crypto_value = 0.0
+    items_lines = []
+
+    for asset, info in sorted(non_usdt_assets.items(), key=lambda x: x[0]):
+        tot_qty = info["total"]
+        free_qty = info["free"]
+        lock_qty = info["locked"]
+        pair = f"{asset}USDT"
+        price = prices.get(pair)
+
+        # Стейблкоины оцениваем 1:1
+        if price is None and asset in STABLE_OR_FIAT:
+            price = 1.0
+
+        if price is not None:
+            val_usdt = tot_qty * price
+            # Скрываем пыль меньше $0.05 если монет микроскопически мало
+            if val_usdt < 0.05 and tot_qty < 0.0001:
+                continue
+            total_crypto_value += val_usdt
+            lock_str = f" <i>(в TP-ордерах: {fmt_qty(lock_qty)})</i>" if lock_qty > 0.000001 else ""
+            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{pair}"
+            binance_url = f"https://www.binance.com/en/trade/{asset}_USDT?type=spot"
+            items_lines.append(
+                f"• <b>{asset}</b>: <code>{fmt_qty(tot_qty)} {asset}</code> × <code>{fmt_price(price)} $</code> = <b>{val_usdt:,.2f} USDT</b>{lock_str}\n"
+                f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>"
+            )
+        else:
+            items_lines.append(f"• <b>{asset}</b>: <code>{fmt_qty(tot_qty)} {asset}</code> <i>(цена недоступна)</i>")
+
+    if items_lines:
+        lines.append("📦 <b>Криптовалютные активы (расшифровка):</b>")
+        lines.extend(items_lines)
+        lines.append("─────────────────────")
+    else:
+        lines.append("📦 <i>Других монет на балансе нет (100% средств в USDT).</i>\n─────────────────────")
+
+    # Итоговый блок капитала
+    grand_total = usdt_total + total_crypto_value
+    pct_usdt = (usdt_total / grand_total * 100.0) if grand_total > 0 else 100.0
+    pct_crypto = (total_crypto_value / grand_total * 100.0) if grand_total > 0 else 0.0
+
+    lines.append("💰 <b>ВСЕГО В ПОРТФЕЛЕ (ОБЩИЙ КАПИТАЛ):</b>")
+    lines.append(f"• Стейблкоины (USDT): <code>{usdt_total:,.2f} USDT</code> ({pct_usdt:.1f}%)")
+    if total_crypto_value > 0:
+        lines.append(f"• В криптовалютных активах: <code>{total_crypto_value:,.2f} USDT</code> ({pct_crypto:.1f}%)")
+    lines.append(f"📊 <b>ИТОГО ВСЕГО:</b> <b>{grand_total:,.2f} USDT</b>")
+
+    return "\n".join(lines)
 
 _symbol_filters_cache: Dict[str, dict] = {}
 
@@ -1313,94 +1415,161 @@ def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> No
 def format_portfolio(state: dict) -> str:
     port = state.get("portfolio", {})
     active_trades = state.get("active_trades", {})
+    history = state.get("trade_history", [])
 
     api_key, api_secret = get_api_credentials(state)
     has_api = bool(api_key and api_secret)
     free_usdt_str = ""
+    free_usdt = 0.0
     if has_api:
         free_usdt = get_free_usdt_balance(state)
         free_usdt_str = f"💳 <b>Свободно на Binance:</b> <code>{free_usdt:,.2f} USDT</code>\n\n"
 
-    lines = ["<b>💼 Ваш криптовалютный портфель</b>\n"]
+    lines = ["<b>💼 Ваш криптовалютный портфель и автосделки</b>\n"]
     if free_usdt_str:
         lines.append(free_usdt_str)
 
-    # Отображение активных автосделок
-    if active_trades:
-        lines.append("⚡ <b>Активные сделки с авто-TP:</b>")
-        for sym, tr in active_trades.items():
-            base = tr.get("base", base_asset(sym))
-            bp = tr.get("buy_price", 0.0)
-            tp = tr.get("tp_price", 0.0)
-            tp_pct = tr.get("tp_pct", 3.0)
-            cost = tr.get("cost_usdt", 0.0)
-            src = tr.get("signal_source", "scan")
-            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
-            binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
-            lines.append(
-                f"🎯 <b>{base}/USDT</b>: вход <code>{fmt_price(bp)}</code> → TP: <code>{fmt_price(tp)}</code> (+{tp_pct:.1f}%)\n"
-                f"   ├ Вложено: {cost:,.2f} $ | Ордер #{tr.get('tp_order_id', '—')} | Источник: {src}\n"
-                f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>"
-            )
-        lines.append("─────────────────────")
-
-    if not port and not active_trades:
+    if not port and not active_trades and not history:
         return (
             "<b>💼 Ваш портфель</b>\n\n"
             + (free_usdt_str or "")
-            + "<i>Портфель пока пуст.</i>\n\n"
-            "💡 Нажмите кнопку <b>«➕ Добавить актив»</b> ниже или включите автоторговлю в настройках ⚙️."
+            + "<i>Портфель пока пуст. Нет открытых сделок.</i>\n\n"
+            "💡 Включите автоторговлю в настройках ⚙️ или нажмите <b>«➕ Добавить актив»</b>."
         )
 
-    total_cost = 0.0
-    total_value = 0.0
-    symbols = sorted(port.keys())
-    prices = get_multiple_prices(symbols) if symbols else {}
+    # Получаем актуальные рыночные цены всех активов
+    all_symbols = sorted(set(list(port.keys()) + list(active_trades.keys())))
+    prices = get_multiple_prices(all_symbols) if all_symbols else {}
 
-    for symbol in symbols:
-        pos = port[symbol]
-        qty = float(pos["qty"])
-        avg = float(pos["avg_price"])
-        cost = qty * avg
-        total_cost += cost
+    # 1. ⚡ АКТИВНЫЕ АВТОСДЕЛКИ (детально по числам)
+    total_trades_cost = 0.0
+    total_trades_val = 0.0
+    total_expected_gain = 0.0
 
-        price = prices.get(symbol)
-        base = base_asset(symbol)
-        tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
-        binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+    if active_trades:
+        lines.append("⚡ <b>ОТКРЫТЫЕ АВТОСДЕЛКИ (с авто-TP):</b>")
+        for sym, tr in active_trades.items():
+            base = tr.get("base", base_asset(sym))
+            bp = float(tr.get("buy_price", 0.0))
+            tp = float(tr.get("tp_price", 0.0))
+            qty = float(tr.get("qty", 0.0))
+            cost = float(tr.get("cost_usdt", qty * bp))
+            tp_pct = float(tr.get("tp_pct", 3.0))
+            tp_order_id = tr.get("tp_order_id", "—")
+            src = tr.get("signal_source", "scan")
+            score = tr.get("signal_score", 0)
 
-        if price is None:
+            cur_price = prices.get(sym)
+            if cur_price is not None:
+                cur_val = qty * cur_price
+                trade_pnl = cur_val - cost
+                trade_pnl_pct = (trade_pnl / cost * 100.0) if cost > 0 else 0.0
+                total_trades_val += cur_val
+            else:
+                cur_val = cost
+                trade_pnl = 0.0
+                trade_pnl_pct = 0.0
+                total_trades_val += cost
+
+            total_trades_cost += cost
+            expected_gain = (qty * tp) - cost
+            total_expected_gain += expected_gain
+            sign = "🟢" if trade_pnl >= 0 else "🔴"
+
+            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
+            binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+
             lines.append(
-                f"⚪ <b>{base}</b>: {fmt_qty(qty)} шт\n"
-                f"   ├ Вход: {fmt_price(avg)} USDT (вложено: {cost:,.2f} $)\n"
-                f"   ├ <i>Текущая цена временно недоступна</i>\n"
+                f"{sign} <b>{base}/USDT</b> (Score: {score:.0f} | TF: {src})\n"
+                f"   ├ 📦 <b>Куплено:</b> <code>{fmt_qty(qty)} {base}</code> (по <code>{fmt_price(bp)} $</code>)\n"
+                f"   ├ 💵 <b>Потрачено:</b> <code>{cost:,.2f} USDT</code>\n"
+                f"   ├ 📊 <b>Рынок:</b> <code>{fmt_price(cur_price) if cur_price else '—'} $</code> (оценка: <code>{cur_val:,.2f} $</code>)\n"
+                f"   ├ 📈 <b>Текущий P/L:</b> <b>{trade_pnl:+.2f} USDT ({fmt_pct(trade_pnl_pct)})</b>\n"
+                f"   ├ 🎯 <b>Тейк-профит:</b> <code>{fmt_price(tp)} $</code> (+{tp_pct:.1f}%)\n"
+                f"   ├ 💰 <b>Заработок при TP:</b> <b>+{expected_gain:.2f} USDT</b> (Ордер #{tp_order_id})\n"
                 f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
             )
-            total_value += cost
-            continue
 
-        val = qty * price
-        total_value += val
-        pnl = val - cost
-        pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
-        sign = "🟢" if pnl >= 0 else "🔴"
+        total_trades_pnl = total_trades_val - total_trades_cost
+        total_trades_pct = (total_trades_pnl / total_trades_cost * 100.0) if total_trades_cost > 0 else 0.0
+        trades_tot_sign = "🟢" if total_trades_pnl >= 0 else "🔴"
 
-        lines.append(
-            f"{sign} <b>{base}/USDT</b>: {fmt_qty(qty)} шт\n"
-            f"   ├ Вход: <code>{fmt_price(avg)}</code> → Рынок: <code>{fmt_price(price)}</code>\n"
-            f"   ├ Баланс: {val:,.2f} USDT (вложено {cost:,.2f} $)\n"
-            f"   ├ <b>P/L:</b> <b>{pnl:+.2f} USDT</b> (<b>{fmt_pct(pnl_pct)}</b>)\n"
-            f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
-        )
+        lines.append("─────────────────────")
+        lines.append("📊 <b>ВСЕГО ПО ОТКРЫТЫМ СДЕЛКАМ:</b>")
+        lines.append(f"• <b>Открыто позиций:</b> <code>{len(active_trades)} шт</code>")
+        lines.append(f"• <b>Всего потрачено:</b> <code>{total_trades_cost:,.2f} USDT</code>")
+        lines.append(f"• <b>Текущая стоимость:</b> <code>{total_trades_val:,.2f} USDT</code>")
+        lines.append(f"• <b>Текущий плавающий P/L:</b> {trades_tot_sign} <b>{total_trades_pnl:+.2f} USDT ({fmt_pct(total_trades_pct)})</b>")
+        lines.append(f"• <b>Ожидаемый профит при закрытии TP:</b> 🟢 <b>+{total_expected_gain:.2f} USDT</b>")
+        lines.append("─────────────────────")
 
-    total_pnl = total_value - total_cost
-    total_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
-    tot_sign = "🟢" if total_pnl >= 0 else "🔴"
+    # 2. 📂 ДРУГИЕ АКТИВЫ ПОРТФЕЛЯ (не привязанные к активным авто-ордерам)
+    manual_symbols = [s for s in sorted(port.keys()) if s not in active_trades]
+    if manual_symbols:
+        lines.append("📂 <b>ДРУГИЕ АКТИВЫ В ПОРТФЕЛЕ:</b>")
+        for symbol in manual_symbols:
+            pos = port[symbol]
+            qty = float(pos["qty"])
+            avg = float(pos["avg_price"])
+            cost = qty * avg
+            price = prices.get(symbol)
+            base = base_asset(symbol)
+            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+            binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
 
-    lines.append("─────────────────────")
-    lines.append(f"💵 <b>Сумма инвестиций:</b> {total_cost:,.2f} USDT")
-    lines.append(f"📊 <b>Текущая оценка:</b> {total_value:,.2f} USDT")
-    lines.append(f"{tot_sign} <b>Общий P/L:</b> <b>{total_pnl:+.2f} USDT ({fmt_pct(total_pct)})</b>")
+            if price is None:
+                lines.append(
+                    f"⚪ <b>{base}/USDT</b>: {fmt_qty(qty)} {base}\n"
+                    f"   ├ Вход: <code>{fmt_price(avg)} $</code> (вложено: {cost:,.2f} $)\n"
+                    f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
+                )
+                continue
+
+            val = qty * price
+            pnl = val - cost
+            pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
+            sign = "🟢" if pnl >= 0 else "🔴"
+
+            lines.append(
+                f"{sign} <b>{base}/USDT</b>: {fmt_qty(qty)} {base}\n"
+                f"   ├ Вход: <code>{fmt_price(avg)} $</code> → Рынок: <code>{fmt_price(price)} $</code>\n"
+                f"   ├ Баланс: <code>{val:,.2f} $</code> (вложено: {cost:,.2f} $)\n"
+                f"   ├ <b>P/L:</b> <b>{pnl:+.2f} USDT ({fmt_pct(pnl_pct)})</b>\n"
+                f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
+            )
+        lines.append("─────────────────────")
+
+    # 3. 🏆 ФИКСИРОВАННЫЙ ЗАРАБОТОК (ИСТОРИЯ ЗАКРЫТЫХ СДЕЛОК)
+    if history:
+        closed_pnl_sum = sum(float(h.get("pnl", 0.0)) for h in history)
+        closed_cost_sum = sum(float(h.get("cost_usdt", 0.0)) for h in history)
+        win_count = sum(1 for h in history if float(h.get("pnl", 0.0)) > 0)
+        win_rate = (win_count / len(history) * 100.0) if history else 0.0
+        hist_sign = "🟢" if closed_pnl_sum >= 0 else "🔴"
+
+        lines.append("🏆 <b>ФИКСИРОВАННЫЙ ЗАРАБОТОК (ИСТОРИЯ):</b>")
+        lines.append(f"• <b>Закрыто сделок по TP:</b> <code>{len(history)} шт</code> (Винрейт: <code>{win_rate:.0f}%</code>)")
+        lines.append(f"• <b>Всего чистый профит:</b> {hist_sign} <b>{closed_pnl_sum:+.2f} USDT</b>")
+        lines.append("─────────────────────")
+
+    # 4. 💼 ОБЩИЙ ИТОГ ВСЕХ ИНВЕСТИЦИЙ
+    total_all_cost = 0.0
+    total_all_val = 0.0
+    for symbol, pos in port.items():
+        q = float(pos["qty"])
+        a = float(pos["avg_price"])
+        c = q * a
+        total_all_cost += c
+        p = prices.get(symbol)
+        total_all_val += (q * p) if p is not None else c
+
+    all_pnl = total_all_val - total_all_cost
+    all_pct = (all_pnl / total_all_cost * 100.0) if total_all_cost > 0 else 0.0
+    all_sign = "🟢" if all_pnl >= 0 else "🔴"
+
+    lines.append(f"💵 <b>Всего инвестировано:</b> <code>{total_all_cost:,.2f} USDT</code>")
+    lines.append(f"📊 <b>Текущая оценка активов:</b> <code>{total_all_val:,.2f} USDT</code>")
+    lines.append(f"{all_sign} <b>Общий P/L портфеля:</b> <b>{all_pnl:+.2f} USDT ({fmt_pct(all_pct)})</b>")
 
     return "\n".join(lines)
 
@@ -1412,7 +1581,7 @@ def main_keyboard() -> dict:
             [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
             [{"text": "💼 Портфель"}, {"text": "➕ Добавить актив"}],
             [{"text": "🗑 Удалить актив"}, {"text": "⚙️ Настройки"}],
-            [{"text": "ℹ️ Помощь"}],
+            [{"text": "💳 Баланс Binance"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -1424,7 +1593,7 @@ def cancel_keyboard() -> dict:
             [{"text": "❌ Отмена"}],
             [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
             [{"text": "💼 Портфель"}, {"text": "⚙️ Настройки"}],
-            [{"text": "ℹ️ Помощь"}],
+            [{"text": "💳 Баланс Binance"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -2503,6 +2672,15 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                         reply_markup=cancel_keyboard(),
                     )
 
+            elif cmd in ("balance", "баланс") or (is_menu_action and "баланс" in text_lower):
+                print(f"-> Детальный баланс для {chat_id_local}")
+                msg_id = send_telegram(token, chat_id_local, "⏳ <i>Запрашиваю детальный баланс Binance...</i>")
+                bal_text = format_binance_balance_detailed(state)
+                if msg_id:
+                    edit_message(token, chat_id_local, msg_id, bal_text, reply_markup=portfolio_inline_kb())
+                else:
+                    send_telegram(token, chat_id_local, bal_text, reply_markup=portfolio_inline_kb())
+
             elif text_lower in ("ping", "пинг"):
                 send_telegram(token, chat_id_local, "🏓 <b>pong</b> — бот на связи!")
 
@@ -2653,21 +2831,12 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data == "trade:balance":
-                answer_callback(token, cb_id, "Запрашиваю баланс...")
-                api_key, api_secret = get_api_credentials(state)
-                if not api_key or not api_secret:
-                    send_telegram(token, cb_chat, "⚠️ API-ключи не настроены. Используйте <code>/api КЛЮЧ СЕКРЕТ</code>.")
-                    return
-                balances, err = get_spot_balances(state)
-                if err:
-                    send_telegram(token, cb_chat, f"❌ Ошибка баланса: <code>{err}</code>")
-                    return
-                usdt_free = balances.get("USDT", 0.0)
-                lines = [f"💳 <b>Баланс Binance Spot</b>\n", f"• USDT (свободно): <code>{usdt_free:,.2f}</code>"]
-                for asset, free in sorted(balances.items(), key=lambda x: -x[1])[:15]:
-                    if asset != "USDT" and free > 0.000001:
-                        lines.append(f"• {asset}: <code>{fmt_qty(free)}</code>")
-                send_telegram(token, cb_chat, "\n".join(lines))
+                answer_callback(token, cb_id, "Запрашиваю детальный баланс...")
+                bal_text = format_binance_balance_detailed(state)
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, bal_text, reply_markup=portfolio_inline_kb())
+                else:
+                    send_telegram(token, cb_chat, bal_text, reply_markup=portfolio_inline_kb())
 
             elif cb_data.startswith("trade_buy:"):
                 sym = cb_data.split(":", 1)[1]
