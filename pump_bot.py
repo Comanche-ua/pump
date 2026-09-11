@@ -1191,7 +1191,6 @@ def execute_pump_auto_trade(
     и сразу выставляет лимитный Take-Profit ордер (+3%).
     """
     settings = state.get("settings", {})
-    trade_amt = float(manual_amount or settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
     tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
     max_trades = int(settings.get("max_open_trades", 3))
 
@@ -1220,17 +1219,43 @@ def execute_pump_auto_trade(
         send_telegram(token, chat_id, msg)
         return {"error": "API keys not configured"}
 
+    # Разрешение суммы ставки по режиму
+    if manual_amount is not None:
+        trade_amt = float(manual_amount)
+    else:
+        trade_mode = settings.get("trade_mode", "fixed")
+        free_usdt_now = get_free_usdt_balance(state)
+        if trade_mode == "all":
+            trade_amt = max(0.0, free_usdt_now - 0.01)  # оставляем 0.01 USDT для комиссий
+        elif trade_mode.startswith("pct:"):
+            try:
+                pct = float(trade_mode.split(":")[1]) / 100.0
+            except (IndexError, ValueError):
+                pct = 0.1
+            trade_amt = round(free_usdt_now * pct, 2)
+        else:
+            trade_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
+
     # Проверка свободного баланса USDT
     free_usdt = get_free_usdt_balance(state)
-    if free_usdt < trade_amt:
+    if free_usdt < max(trade_amt, 1.0):
         msg = (
             f"⚠️ <b>Автоторговля: Недостаточно USDT для входа в {sig.base}!</b>\n\n"
             f"• Требуется: <code>{trade_amt:.2f} USDT</code>\n"
             f"• Свободно на споте: <code>{free_usdt:.2f} USDT</code>\n\n"
-            f"💡 Пополните баланс USDT на Binance или уменьшите ставку в настройках."
+            f"💡 Пополните баланс USDT на Binance или выберите меньший процент ставки в настройках."
         )
         send_telegram(token, chat_id, msg)
         return {"error": "Insufficient USDT balance"}
+
+    if trade_amt < 1.0:
+        msg = (
+            f"⚠️ <b>Слишком маленькая ставка:</b> <code>{trade_amt:.4f} USDT</code>\n"
+            f"Минимальная сумма для торговли — <code>1 USDT</code>.\n"
+            f"Пополните баланс или увеличьте процент ставки."
+        )
+        send_telegram(token, chat_id, msg)
+        return {"error": "Trade amount too small"}
 
     # Получение фильтров торговой пары
     filters = get_symbol_filters(sig.symbol)
@@ -1424,6 +1449,211 @@ def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> No
     if updated:
         save_state(state, sync_git=True)
 
+def execute_emergency_market_sell(
+    token: str,
+    chat_id: Union[str, int],
+    state: dict,
+    symbol: str,
+) -> dict:
+    """
+    Отменяет открытый Take-Profit ордер (если есть) на бирже Binance
+    и экстренно продает весь объем монеты по MARKET ордеру в USDT.
+    """
+    symbol = normalize_symbol(symbol)
+    base = base_asset(symbol)
+
+    active_trades = state.setdefault("active_trades", {})
+    port = state.setdefault("portfolio", {})
+
+    trade = active_trades.get(symbol)
+    port_pos = port.get(symbol)
+
+    if not trade and not port_pos:
+        err = f"Актив {base} не найден в открытых сделках или портфеле."
+        send_telegram(token, chat_id, f"❌ {err}")
+        return {"error": err}
+
+    # 1. Если есть открытый TP ордер на бирже — отменяем его для разблокировки монет
+    tp_order_id = trade.get("tp_order_id") if trade else None
+    if tp_order_id:
+        cancel_res = binance_signed_request(
+            "DELETE",
+            "/api/v3/order",
+            {"symbol": symbol, "orderId": tp_order_id},
+            state=state,
+        )
+        print(f"[Cancel TP order #{tp_order_id} for {symbol}]: {cancel_res}")
+
+    # 2. Получаем реальный спотовый баланс монеты
+    assets, err = get_spot_account_assets(state)
+    if err:
+        send_telegram(token, chat_id, f"❌ <b>Ошибка запроса баланса:</b>\n<code>{err}</code>")
+        return {"error": str(err)}
+
+    asset_info = assets.get(base, {"free": 0.0, "locked": 0.0, "total": 0.0})
+    qty_to_sell = float(asset_info["free"])
+    if qty_to_sell <= 0.00000001:
+        qty_to_sell = float(trade.get("qty", 0.0) if trade else port_pos.get("qty", 0.0))
+
+    filters = get_symbol_filters(symbol)
+    step_size = filters.get("step_size", 0.0001)
+    min_qty = filters.get("min_qty", 0.0)
+    qty_str = fmt_qty_filter(qty_to_sell, step_size)
+
+    if float(qty_str) <= 0 or float(qty_str) < min_qty:
+        err_msg = f"Недостаточно монет {base} на балансе для продажи (доступно: {qty_to_sell})."
+        send_telegram(token, chat_id, f"❌ {err_msg}")
+        return {"error": err_msg}
+
+    # 3. Размещаем MARKET SELL ордер
+    sell_params = {
+        "symbol": symbol,
+        "side": "SELL",
+        "type": "MARKET",
+        "quantity": qty_str,
+    }
+    sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+    if "error" in sell_res:
+        # Если не проходит из-за удержанной комиссии BNB/монеты — пробуем списать на 0.2% меньше
+        reduced = fmt_qty_filter(float(qty_str) * 0.998, step_size)
+        if float(reduced) > 0 and reduced != qty_str:
+            sell_params["quantity"] = reduced
+            sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+
+    if "error" in sell_res:
+        err_msg = sell_res.get("error", "Unknown error")
+        send_telegram(token, chat_id, f"❌ <b>Ошибка продажи {base}/USDT:</b>\n<code>{err_msg}</code>")
+        return {"error": str(err_msg)}
+
+    # 4. Фиксация результата и расчет PnL
+    cum_quote = float(sell_res.get("cummulativeQuoteQty", 0.0))
+    exec_qty = float(sell_res.get("executedQty", float(qty_str)))
+    sell_price = (cum_quote / exec_qty) if exec_qty > 0 else 0.0
+
+    buy_price = float(trade.get("buy_price", port_pos.get("avg_price", 0.0) if port_pos else 0.0))
+    cost = float(trade.get("cost_usdt", exec_qty * buy_price))
+    pnl = (cum_quote - cost) if cost > 0 else 0.0
+    pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
+
+    # Запись в историю
+    history = state.setdefault("trade_history", [])
+    closed_rec = dict(trade or port_pos or {})
+    closed_rec["symbol"] = symbol
+    closed_rec["base"] = base
+    closed_rec["closed_at"] = int(time.time())
+    closed_rec["buy_price"] = buy_price
+    closed_rec["sell_price"] = sell_price
+    closed_rec["cost_usdt"] = cost
+    closed_rec["pnl"] = pnl
+    closed_rec["pnl_pct"] = pnl_pct
+    closed_rec["status"] = "manual_market_sold"
+    history.append(closed_rec)
+    if len(history) > 100:
+        history.pop(0)
+
+    # Удаляем из активных сделок и портфеля
+    active_trades.pop(symbol, None)
+    portfolio_remove(state, symbol)
+    save_state(state, sync_git=True)
+
+    sign = "🟢" if pnl >= 0 else "🔴"
+    result_msg = (
+        f"🚨 <b>ПОЗИЦИЯ ЗАКРЫТА ПО РЫНКУ!</b>\n\n"
+        f"✅ <b>{base}/USDT</b> успешно продан на Binance Spot.\n"
+        f"• Продано: <code>{fmt_qty(exec_qty)} {base}</code>\n"
+        f"• Цена выхода: <code>{fmt_price(sell_price)} USDT</code>\n"
+        f"• Получено: <b>{cum_quote:,.2f} USDT</b>\n"
+        f"• Результат сделки: {sign} <b>{pnl:+.2f} USDT ({fmt_pct(pnl_pct)})</b>\n\n"
+        f"💵 <i>Все средства возвращены в свободный баланс USDT.</i>"
+    )
+    send_telegram(token, chat_id, result_msg, reply_markup=main_keyboard())
+    return {"success": True, "cum_quote": cum_quote, "pnl": pnl, "pnl_pct": pnl_pct}
+
+def format_sell_confirmation_prompt(state: dict, symbol: str) -> Tuple[str, dict]:
+    """Формирует текст предупреждения и кнопки подтверждения досрочной продажи актива."""
+    symbol = normalize_symbol(symbol)
+    base = base_asset(symbol)
+
+    active_trades = state.get("active_trades", {})
+    port = state.get("portfolio", {})
+    trade = active_trades.get(symbol)
+    pos = port.get(symbol)
+
+    cur_price = get_price(symbol) or 0.0
+
+    qty = float(trade.get("qty") if trade else pos.get("qty", 0.0) if pos else 0.0)
+    buy_price = float(trade.get("buy_price") if trade else pos.get("avg_price", 0.0) if pos else 0.0)
+    cost = float(trade.get("cost_usdt", qty * buy_price))
+    tp_price = float(trade.get("tp_price", 0.0)) if trade else 0.0
+
+    cur_val = qty * cur_price if cur_price > 0 else cost
+    pnl = cur_val - cost
+    pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
+    sign = "🟢" if pnl >= 0 else "🔴"
+
+    tp_note = f"\n• Тейк-профит цель: <code>{fmt_price(tp_price)} $</code> (+{trade.get('tp_pct', 3.0):.1f}%)" if trade else ""
+
+    text = (
+        f"⚠️ <b>ПОДТВЕРЖДЕНИЕ ПРОДАЖИ АКТИВА</b>\n\n"
+        f"Вы собираетесь досрочно закрыть позицию <b>{base}/USDT</b> по рынку:\n\n"
+        f"• 📦 <b>К продаже:</b> <code>{fmt_qty(qty)} {base}</code>\n"
+        f"• 💵 <b>Потрачено на вход:</b> <code>{cost:,.2f} USDT</code> (вход <code>{fmt_price(buy_price)} $</code>)\n"
+        f"• 📊 <b>Текущая цена рынка:</b> <code>{fmt_price(cur_price)} $</code>\n"
+        f"• 💵 <b>Оценка к получению:</b> <code>{cur_val:,.2f} USDT</code>\n"
+        f"• 📈 <b>Текущий результат (P/L):</b> {sign} <b>{pnl:+.2f} USDT ({fmt_pct(pnl_pct)})</b>{tp_note}\n\n"
+        f"⚠️ <i>Если на бирже был выставлен Take-Profit ордер, бот автоматически отменит его и продаст монету в USDT прямо сейчас.</i>\n\n"
+        f"<b>Подтверждаете продажу по рыночной цене?</b>"
+    )
+
+    kb = {
+        "inline_keyboard": [
+            [
+                {"text": f"✅ Да, продать {base} по рынку", "callback_data": f"sell_confirm:{symbol}"},
+            ],
+            [
+                {"text": "❌ Отмена (не продавать)", "callback_data": "port:trades_stats"},
+            ]
+        ]
+    }
+    return text, kb
+
+def sell_assets_menu_kb(state: dict) -> dict:
+    """Клавиатура выбора актива для досрочной продажи."""
+    active_trades = state.get("active_trades", {})
+    port = state.get("portfolio", {})
+    all_symbols = sorted(set(list(active_trades.keys()) + list(port.keys())))
+
+    if not all_symbols:
+        return {
+            "inline_keyboard": [
+                [{"text": "🔙 Назад в портфель", "callback_data": "port:refresh"}]
+            ]
+        }
+
+    prices = get_multiple_prices(all_symbols) if all_symbols else {}
+    rows = []
+    for s in all_symbols:
+        base = base_asset(s)
+        tr = active_trades.get(s)
+        pos = port.get(s)
+        qty = float(tr.get("qty") if tr else pos.get("qty", 0.0) if pos else 0.0)
+        buy_p = float(tr.get("buy_price") if tr else pos.get("avg_price", 0.0) if pos else 0.0)
+        cost = qty * buy_p
+        cur_p = prices.get(s)
+        if cur_p is not None and cost > 0:
+            val = qty * cur_p
+            pnl_pct = (val - cost) / cost * 100.0
+            pnl_str = f" ({pnl_pct:+.1f}%)"
+        else:
+            pnl_str = ""
+        rows.append([
+            {"text": f"🔴 Продать {base}{pnl_str}", "callback_data": f"sell_prompt:{s}"},
+            {"text": f"📈 {base} TV", "url": f"https://www.tradingview.com/chart/?symbol=BINANCE:{s}"},
+        ])
+
+    rows.append([{"text": "🔙 Назад в портфель", "callback_data": "port:refresh"}])
+    return {"inline_keyboard": rows}
+
 def format_portfolio(state: dict) -> str:
     port = state.get("portfolio", {})
     active_trades = state.get("active_trades", {})
@@ -1585,15 +1815,141 @@ def format_portfolio(state: dict) -> str:
 
     return "\n".join(lines)
 
+def format_trades_and_profit_stats(state: dict) -> str:
+    active_trades = state.get("active_trades", {})
+    history = state.get("trade_history", [])
+    settings = state.get("settings", {})
+    trade_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
+    tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
+    auto_trade_status = "🟢 Включена" if settings.get("auto_trade", False) else "🔴 Выключена"
+
+    api_key, api_secret = get_api_credentials(state)
+    has_api = bool(api_key and api_secret)
+    free_usdt = get_free_usdt_balance(state) if has_api else 0.0
+
+    lines = [
+        "📊 <b>СТАТИСТИКА АВТОТОРГОВЛИ И РЕАЛИЗОВАННЫЙ ПРОФИТ</b>\n",
+        f"• <b>Автоторговля:</b> {auto_trade_status} (ставка: <code>{trade_amt:.0f} $</code>, TP: <code>+{tp_pct:.1f}%</code>)",
+        f"• <b>Свободный баланс:</b> <code>{free_usdt:,.2f} USDT</code>\n",
+        "─────────────────────"
+    ]
+
+    # 1. ОТКРЫТЫЕ СДЕЛКИ (В ПРОЦЕССЕ)
+    if active_trades:
+        symbols = list(active_trades.keys())
+        prices = get_multiple_prices(symbols) if symbols else {}
+
+        total_cost = 0.0
+        total_val = 0.0
+        total_exp_gain = 0.0
+
+        lines.append("⚡ <b>ОТКРЫТЫЕ СДЕЛКИ (В ПРОЦЕССЕ):</b>")
+        for sym, tr in active_trades.items():
+            base = tr.get("base", base_asset(sym))
+            bp = float(tr.get("buy_price", 0.0))
+            tp = float(tr.get("tp_price", 0.0))
+            qty = float(tr.get("qty", 0.0))
+            cost = float(tr.get("cost_usdt", qty * bp))
+            tp_order_id = tr.get("tp_order_id", "—")
+            opened_at = tr.get("opened_at", 0)
+            time_str = time.strftime("%d.%m %H:%M", time.localtime(opened_at)) if opened_at else ""
+
+            cur_price = prices.get(sym)
+            if cur_price is not None:
+                cur_val = qty * cur_price
+                trade_pnl = cur_val - cost
+                trade_pnl_pct = (trade_pnl / cost * 100.0) if cost > 0 else 0.0
+                total_val += cur_val
+            else:
+                cur_val = cost
+                trade_pnl = 0.0
+                trade_pnl_pct = 0.0
+                total_val += cost
+
+            total_cost += cost
+            exp_gain = (qty * tp) - cost
+            total_exp_gain += exp_gain
+            sign = "🟢" if trade_pnl >= 0 else "🔴"
+
+            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
+            binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+
+            lines.append(
+                f"{sign} <b>{base}/USDT</b> ({time_str})\n"
+                f"   ├ 📦 <b>Куплено:</b> <code>{fmt_qty(qty)} {base}</code> (по <code>{fmt_price(bp)} $</code>)\n"
+                f"   ├ 💵 <b>Потрачено:</b> <code>{cost:,.2f} USDT</code>\n"
+                f"   ├ 📊 <b>Рынок:</b> <code>{fmt_price(cur_price) if cur_price else '—'} $</code> (оценка: <code>{cur_val:,.2f} $</code>)\n"
+                f"   ├ 📈 <b>Текущий P/L:</b> <b>{trade_pnl:+.2f} USDT ({fmt_pct(trade_pnl_pct)})</b>\n"
+                f"   ├ 🎯 <b>Тейк-профит цель:</b> <code>{fmt_price(tp)} $</code> (+{tr.get('tp_pct', tp_pct):.1f}%)\n"
+                f"   ├ 💰 <b>Заработок при TP:</b> <b>+{exp_gain:.2f} USDT</b> (Ордер #{tp_order_id})\n"
+                f"   └ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
+            )
+
+        tot_pnl = total_val - total_cost
+        tot_pct = (tot_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
+        t_sign = "🟢" if tot_pnl >= 0 else "🔴"
+
+        lines.append("📌 <b>ИТОГО В ОТКРЫТЫХ СДЕЛКАХ:</b>")
+        lines.append(f"• <b>Позиций:</b> <code>{len(active_trades)} шт</code>")
+        lines.append(f"• <b>Всего вложено:</b> <code>{total_cost:,.2f} USDT</code>")
+        lines.append(f"• <b>Текущая стоимость:</b> <code>{total_val:,.2f} USDT</code>")
+        lines.append(f"• <b>Плавающий P/L:</b> {t_sign} <b>{tot_pnl:+.2f} USDT ({fmt_pct(tot_pct)})</b>")
+        lines.append(f"• <b>Ожидаемый профит при закрытии всех TP:</b> 🟢 <b>+{total_exp_gain:.2f} USDT</b>")
+        lines.append("─────────────────────")
+    else:
+        lines.append("⚡ <b>ОТКРЫТЫЕ СДЕЛКИ:</b> <i>Сейчас открытых позиций нет.</i>\n─────────────────────")
+
+    # 2. РЕАЛИЗОВАННАЯ ПРИБЫЛЬ (ИСТОРИЯ ЗАКРЫТЫХ)
+    if history:
+        closed_pnl_sum = sum(float(h.get("pnl", 0.0)) for h in history)
+        closed_cost_sum = sum(float(h.get("cost_usdt", 0.0)) for h in history)
+        win_count = sum(1 for h in history if float(h.get("pnl", 0.0)) > 0)
+        win_rate = (win_count / len(history) * 100.0) if history else 0.0
+        h_sign = "🟢" if closed_pnl_sum >= 0 else "🔴"
+
+        lines.append("🏆 <b>РЕАЛИЗОВАННЫЙ ПРОФИТ (ЗАКРЫТЫЕ СДЕЛКИ):</b>")
+        lines.append(f"• <b>Успешно закрыто сделок по TP:</b> <code>{len(history)} шт</code>")
+        lines.append(f"• <b>Винрейт:</b> <code>{win_rate:.0f}%</code>")
+        lines.append(f"• <b>Оборот закрытых сделок:</b> <code>{closed_cost_sum:,.2f} USDT</code>")
+        lines.append(f"• 💰 <b>ЧИСТЫЙ ЗАРАБОТАННЫЙ ДОХОД:</b> {h_sign} <b>{closed_pnl_sum:+.2f} USDT</b>\n")
+
+        lines.append("📜 <b>Последние закрытые сделки:</b>")
+        for h in reversed(history[-5:]):
+            base = h.get("base", "?")
+            pnl = float(h.get("pnl", 0.0))
+            pnl_pct = float(h.get("pnl_pct", 0.0))
+            closed_at = h.get("closed_at", 0)
+            time_str = time.strftime("%d.%m %H:%M", time.localtime(closed_at)) if closed_at else ""
+            bp = float(h.get("buy_price", 0.0))
+            sp = float(h.get("sell_price", 0.0))
+            cost = float(h.get("cost_usdt", 0.0))
+            lines.append(
+                f"  • ✅ <b>{base}/USDT</b> ({time_str}): вложено <code>{cost:.1f}$</code> | "
+                f"вход <code>{fmt_price(bp)}</code> → выход <code>{fmt_price(sp)}</code> | "
+                f"Профит: 🟢 <b>{pnl:+.2f} USDT ({fmt_pct(pnl_pct)})</b>"
+            )
+        lines.append("─────────────────────")
+    else:
+        lines.append("🏆 <b>РЕАЛИЗОВАННАЯ ПРИБЫЛЬ:</b> <i>История закрытых сделок пока пуста.</i>\n─────────────────────")
+
+    # 3. ОБЩИЙ БАЛАНС
+    lines.append(f"💵 <b>Свободный баланс:</b> <code>{free_usdt:,.2f} USDT</code>")
+    if active_trades:
+        total_open = sum(float(tr.get("cost_usdt", 0.0)) for tr in active_trades.values())
+        lines.append(f"⚡ <b>В открытых позициях:</b> <code>{total_open:,.2f} USDT</code>")
+        lines.append(f"📊 <b>Общий капитал:</b> <code>{(free_usdt + total_open):,.2f} USDT</code>")
+
+    return "\n".join(lines)
+
 # ───────────────────────── Клавиатуры ─────────────────────────
 
 def main_keyboard() -> dict:
     return {
         "keyboard": [
             [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
-            [{"text": "💼 Портфель"}, {"text": "➕ Добавить актив"}],
-            [{"text": "🗑 Удалить актив"}, {"text": "⚙️ Настройки"}],
-            [{"text": "💳 Баланс Binance"}],
+            [{"text": "💼 Портфель"}, {"text": "📊 Сделки и Профит"}],
+            [{"text": "💳 Баланс Binance"}, {"text": "⚙️ Настройки"}],
+            [{"text": "➕ Добавить актив"}, {"text": "🗑 Удалить актив"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -1604,8 +1960,8 @@ def cancel_keyboard() -> dict:
         "keyboard": [
             [{"text": "❌ Отмена"}],
             [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
-            [{"text": "💼 Портфель"}, {"text": "⚙️ Настройки"}],
-            [{"text": "💳 Баланс Binance"}],
+            [{"text": "💼 Портфель"}, {"text": "📊 Сделки и Профит"}],
+            [{"text": "💳 Баланс Binance"}, {"text": "⚙️ Настройки"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -1616,8 +1972,14 @@ def portfolio_inline_kb() -> dict:
         "inline_keyboard": [
             [
                 {"text": "🔄 Обновить цены", "callback_data": "port:refresh"},
+                {"text": "📊 Сделки и Профит", "callback_data": "port:trades_stats"},
+            ],
+            [
                 {"text": "➕ Добавить", "callback_data": "port:add"},
                 {"text": "🗑 Удалить", "callback_data": "port:del"},
+            ],
+            [
+                {"text": "🔴 Продать актив (досрочно)", "callback_data": "port:sell_menu"},
             ],
             [
                 {"text": "📈 Графики (TV / Binance)", "callback_data": "port:charts"},
@@ -1671,14 +2033,24 @@ def settings_text(state: dict) -> str:
     s = state["settings"]
     filt_label = "🔥 Только Strong" if s.get("filter_level") == "strong_only" else "⚡ Strong + Watch"
     auto_scan_label = "🟢 Включён" if s.get("autoscan", True) else "🔴 Выключен"
-    auto_trade_label = "🟢 Включена (+3% TP)" if s.get("auto_trade", False) else "🔴 Выключена"
+    tp_pct = s.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
+    auto_trade_label = f"🟢 Включена (+{tp_pct:.1f}% TP)" if s.get("auto_trade", False) else "🔴 Выключена"
     whale_scan_label = "🟢 Включён" if s.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN) else "🔴 Выключен"
     interval_m = s.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL) // 60
     trade_amt = s.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT)
-    tp_pct = s.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
 
     api_key, api_secret = get_api_credentials(state)
     api_status = "🟢 Подключены" if (api_key and api_secret) else "⚪ Не заданы (только сигналы)"
+
+    trade_mode = s.get("trade_mode", "fixed")
+    if trade_mode == "all":
+        trade_size_label = "💯 Весь свободный баланс USDT"
+    elif trade_mode.startswith("pct:"):
+        pct_val = trade_mode.split(":")[1]
+        trade_size_label = f"{pct_val}% от свободного баланса USDT"
+    else:
+        trade_amt = s.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT)
+        trade_size_label = f"{trade_amt:.1f} USDT (фиксированно)"
 
     return (
         "<b>⚙️ Параметры бота Pump Pulse</b>\n\n"
@@ -1687,7 +2059,7 @@ def settings_text(state: dict) -> str:
         f"• <b>Уведомления:</b> <code>{filt_label}</code>\n\n"
         "<b>⚡ Спотовая торговля Binance:</b>\n"
         f"• <b>Автоторговля пампов:</b> {auto_trade_label}\n"
-        f"• <b>Размер покупки:</b> <code>{trade_amt:.1f} USDT</code>\n"
+        f"• <b>Размер ставки:</b> <code>{trade_size_label}</code>\n"
         f"• <b>Тейк-профит (TP):</b> <code>+{tp_pct:.1f}%</code> (выставляется сразу)\n"
         f"• <b>Статус API Binance:</b> {api_status}\n\n"
         "<b>🐋 Скан действий китов:</b>\n"
@@ -1703,20 +2075,37 @@ def settings_inline_kb(state: dict) -> dict:
     autotrade_label = "🔴 Выключить автоторговлю" if s.get("auto_trade", False) else "⚡ Включить автоторговлю"
     whale_autoscan_label = "🔴 Выключить скан китов" if s.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN) else "🐋 Включить скан китов"
 
+    trade_mode = s.get("trade_mode", "fixed")
+
+    def _amt_btn(label: str, mode: str) -> dict:
+        active = "✅ " if trade_mode == mode else ""
+        return {"text": f"{active}{label}", "callback_data": f"trade:amt:{mode}"}
+
     return {
         "inline_keyboard": [
             [
                 {"text": autotrade_label, "callback_data": "trade:toggle"},
             ],
+            # --- Режим ставки ---
             [
-                {"text": "💰 11 USDT", "callback_data": "trade:amt:11"},
-                {"text": "💰 25 USDT", "callback_data": "trade:amt:25"},
-                {"text": "💰 50 USDT", "callback_data": "trade:amt:50"},
+                _amt_btn("💯 Весь баланс", "all"),
             ],
             [
-                {"text": "🎯 TP: +2%", "callback_data": "trade:tp:2"},
-                {"text": "🎯 TP: +3%", "callback_data": "trade:tp:3"},
-                {"text": "🎯 TP: +5%", "callback_data": "trade:tp:5"},
+                _amt_btn("10% баланса", "pct:10"),
+                _amt_btn("20% баланса", "pct:20"),
+                _amt_btn("30% баланса", "pct:30"),
+            ],
+            [
+                _amt_btn("40% баланса", "pct:40"),
+                _amt_btn("50% баланса", "pct:50"),
+            ],
+            [
+                {"text": "🎯 TP: +1%", "callback_data": "trade:tp:1.0"},
+                {"text": "🎯 TP: +1.5%", "callback_data": "trade:tp:1.5"},
+            ],
+            [
+                {"text": "🎯 TP: +2%", "callback_data": "trade:tp:2.0"},
+                {"text": "🎯 TP: +2.5%", "callback_data": "trade:tp:2.5"},
             ],
             [
                 {"text": "💳 Баланс Binance", "callback_data": "trade:balance"},
@@ -1923,9 +2312,10 @@ def set_bot_commands(token: str) -> None:
         {"command": "scan", "description": "Сканер спота сейчас"},
         {"command": "whale", "description": "🐋 Скан действий китов"},
         {"command": "portfolio", "description": "Портфель и PnL"},
+        {"command": "trade", "description": "Статус автоторговли и профит"},
+        {"command": "sell", "description": "🔴 Продать актив досрочно"},
         {"command": "add", "description": "Добавить монету в портфель"},
         {"command": "del", "description": "Удалить монету из портфеля"},
-        {"command": "trade", "description": "Статус автоторговли"},
         {"command": "settings", "description": "Настройки"},
         {"command": "api", "description": "Указать API ключи Binance"},
         {"command": "help", "description": "Инструкция"},
@@ -2582,6 +2972,11 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 or "настрой" in text_lower
                 or "баланс" in text_lower
                 or "balance" in text_lower
+                or "сделк" in text_lower
+                or "профит" in text_lower
+                or "статистик" in text_lower
+                or "trades" in text_lower
+                or "stats" in text_lower
                 or "помощ" in text_lower
                 or "help" in text_lower
                 or "меню" in text_lower
@@ -2682,6 +3077,22 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     return
                 send_telegram(token, chat_id_local, "🗑 <b>Выберите монету для удаления:</b>", reply_markup=kb)
 
+            elif cmd in ("sell", "продать") or (is_menu_action and "прода" in text_lower):
+                print(f"-> Меню досрочной продажи для {chat_id_local}")
+                args = clean_text.split()[1:]
+                if args:
+                    symbol = normalize_symbol(args[0])
+                    prompt_text, kb = format_sell_confirmation_prompt(state, symbol)
+                    send_telegram(token, chat_id_local, prompt_text, reply_markup=kb)
+                else:
+                    kb = sell_assets_menu_kb(state)
+                    prompt_text = (
+                        "🔴 <b>ДОСРОЧНАЯ ПРОДАЖА АКТИВОВ (MARKET SELL)</b>\n\n"
+                        "Выберите монету ниже для продажи по рыночной цене.\n"
+                        "Перед продажей бот покажет <b>окно подтверждения</b> с расчётом PnL и снимет лимитный Take-Profit на бирже."
+                    )
+                    send_telegram(token, chat_id_local, prompt_text, reply_markup=kb)
+
             elif cmd in ("api", "ключ"):
                 args = clean_text.split()[1:]
                 if len(args) >= 2:
@@ -2709,6 +3120,20 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     edit_message(token, chat_id_local, msg_id, bal_text, reply_markup=portfolio_inline_kb())
                 else:
                     send_telegram(token, chat_id_local, bal_text, reply_markup=portfolio_inline_kb())
+
+            elif (
+                "сделк" in text_lower
+                or "профит" in text_lower
+                or "статистик" in text_lower
+                or cmd in ("trades", "stats", "profit", "сделки", "профит", "статистика")
+            ):
+                print(f"-> Статистика автоторговли для {chat_id_local}")
+                msg_id = send_telegram(token, chat_id_local, "⏳ <i>Загружаю статистику сделок и профита...</i>")
+                stats_text = format_trades_and_profit_stats(state)
+                if msg_id:
+                    edit_message(token, chat_id_local, msg_id, stats_text, reply_markup=portfolio_inline_kb())
+                else:
+                    send_telegram(token, chat_id_local, stats_text, reply_markup=portfolio_inline_kb())
 
             elif text_lower in ("ping", "пинг"):
                 send_telegram(token, chat_id_local, "🏓 <b>pong</b> — бот на связи!")
@@ -2752,6 +3177,14 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 else:
                     send_telegram(token, cb_chat, port_text, reply_markup=portfolio_inline_kb())
 
+            elif cb_data == "port:trades_stats":
+                answer_callback(token, cb_id, "Статистика сделок...")
+                stats_text = format_trades_and_profit_stats(state)
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, stats_text, reply_markup=portfolio_inline_kb())
+                else:
+                    send_telegram(token, cb_chat, stats_text, reply_markup=portfolio_inline_kb())
+
             elif cb_data == "port:charts":
                 answer_callback(token, cb_id)
                 kb = portfolio_charts_inline_kb(state)
@@ -2784,6 +3217,35 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     send_telegram(token, cb_chat, f"✅ <b>{base_asset(symbol)}</b> удалена из портфеля!", reply_markup=main_keyboard())
                 else:
                     send_telegram(token, cb_chat, f"❌ <b>{base_asset(symbol)}</b> не найдена.", reply_markup=main_keyboard())
+
+            elif cb_data == "port:sell_menu":
+                answer_callback(token, cb_id, "Меню продажи...")
+                kb = sell_assets_menu_kb(state)
+                prompt_text = (
+                    "🔴 <b>ДОСРОЧНАЯ ПРОДАЖА АКТИВОВ (MARKET SELL)</b>\n\n"
+                    "Выберите монету ниже для продажи по рыночной цене.\n"
+                    "Перед продажей бот покажет <b>окно подтверждения</b> с расчётом PnL и снимет лимитный Take-Profit на бирже."
+                )
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, prompt_text, reply_markup=kb)
+                else:
+                    send_telegram(token, cb_chat, prompt_text, reply_markup=kb)
+
+            elif cb_data.startswith("sell_prompt:"):
+                sym = cb_data.split(":", 1)[1]
+                answer_callback(token, cb_id)
+                prompt_text, kb = format_sell_confirmation_prompt(state, sym)
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, prompt_text, reply_markup=kb)
+                else:
+                    send_telegram(token, cb_chat, prompt_text, reply_markup=kb)
+
+            elif cb_data.startswith("sell_confirm:"):
+                sym = cb_data.split(":", 1)[1]
+                answer_callback(token, cb_id, f"Продаю {base_asset(sym)} по рынку...")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, f"⏳ <i>Закрываю позицию {base_asset(sym)}/USDT на Binance...</i>")
+                execute_emergency_market_sell(token, cb_chat, state, sym)
 
             elif cb_data == "menu:main":
                 answer_callback(token, cb_id, "Главное меню")
@@ -2851,18 +3313,30 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data.startswith("trade:amt:"):
-                amt = float(cb_data.split(":")[2])
-                settings["trade_amount_usdt"] = amt
+                mode_val = cb_data[len("trade:amt:"):]  # "all", "pct:10", etc.
+                settings["trade_mode"] = mode_val
                 save_state(state)
-                answer_callback(token, cb_id, f"Ставка: {amt:.0f} USDT")
+                if mode_val == "all":
+                    answer_callback(token, cb_id, "Режим: весь свободный баланс USDT")
+                elif mode_val.startswith("pct:"):
+                    pct = mode_val.split(":")[1]
+                    answer_callback(token, cb_id, f"Режим: {pct}% от баланса USDT")
+                else:
+                    # legacy fixed number
+                    try:
+                        amt = float(mode_val)
+                        settings["trade_amount_usdt"] = amt
+                        answer_callback(token, cb_id, f"Ставка: {amt:.0f} USDT")
+                    except ValueError:
+                        answer_callback(token, cb_id, "Режим обновлён")
                 if msg_id:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data.startswith("trade:tp:"):
-                tp = float(cb_data.split(":")[2])
+                tp = float(cb_data.split(":", 2)[2])
                 settings["take_profit_pct"] = tp
                 save_state(state)
-                answer_callback(token, cb_id, f"TP: +{tp:.0f}%")
+                answer_callback(token, cb_id, f"TP: +{tp:.1f}%")
                 if msg_id:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
