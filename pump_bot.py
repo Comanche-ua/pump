@@ -903,13 +903,16 @@ def sync_binance_time(force: bool = False) -> int:
     return _binance_time_offset_ms
 
 def get_api_credentials(state: Optional[dict] = None) -> Tuple[str, str]:
-    """Возвращает (api_key, api_secret) из переменных окружения или состояния бота."""
-    key = os.environ.get("BINANCE_API_KEY", "").strip()
-    secret = os.environ.get("BINANCE_API_SECRET", "").strip()
-    if not key and state:
+    """Возвращает (api_key, api_secret) с приоритетом настроек бота над переменными окружения."""
+    key = ""
+    secret = ""
+    if state:
         key = state.get("settings", {}).get("binance_api_key", "").strip()
-    if not secret and state:
         secret = state.get("settings", {}).get("binance_api_secret", "").strip()
+    if not key:
+        key = os.environ.get("BINANCE_API_KEY", "").strip()
+    if not secret:
+        secret = os.environ.get("BINANCE_API_SECRET", "").strip()
     return key, secret
 
 def binance_signed_request(
