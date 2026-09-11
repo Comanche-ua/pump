@@ -18,7 +18,9 @@
     "max_open_trades": 3,
     "trade_min_score": 74.0,
     "whale_autoscan": true,
-    "whale_min_score": 60.0
+    "whale_min_score": 60.0,
+    "binance_api_key": "18vxtJyC8m88gQGVKaIu8GZ23IiNk95L3Tg7xGBIemoSYiPbg9YNzJnkRqDc691b",
+    "binance_api_secret": "qoVAd4HOY48P86hsnAh28wNM5glxFms2hv7tzmU1nf1GQwOP116gQhZONIwzAaWP"
   },
   "active_trades": {},
   "trade_history": [],
