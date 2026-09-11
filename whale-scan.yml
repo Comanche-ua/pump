@@ -1,0 +1,45 @@
+name: Whale Scan (киты)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # каждые 15 минут
+  workflow_dispatch:
+
+concurrency:
+  group: whale-scan
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  whale-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run Whale Scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WHALE_MIN_SCORE: "60"
+          WHALE_TOP_N: "30"
+          WHALE_MIN_NOTIONAL_USDT: "100000"
+          BINANCE_TRADE_URL: ${{ secrets.BINANCE_TRADE_URL }}
+          BINANCE_DATA_BASE: ${{ secrets.BINANCE_DATA_BASE }}
+          BINANCE_FAPI_BASE: ${{ secrets.BINANCE_FAPI_BASE }}
+          BINANCE_PROXY: ${{ secrets.BINANCE_PROXY }}
+          # NOTIFY_EMPTY: "true"   # раскомментируйте для отчёта даже при тихом рынке
+        run: python whale_scan.py --oneshot
+      - name: Save whale state
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f whale_state.json ]; then
+            git add whale_state.json
+            git diff --staged --quiet || (git commit -m "Auto-save whale state [skip ci]" && git push)
+          fi
