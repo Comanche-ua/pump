@@ -902,17 +902,26 @@ def sync_binance_time(force: bool = False) -> int:
         print(f"[Binance Time Sync Warning]: {e}", file=sys.stderr)
     return _binance_time_offset_ms
 
+def sanitize_api_key(val: str) -> str:
+    """Очищает API-ключ от лишних кавычек, пробелов и префиксов."""
+    if not val:
+        return ""
+    cleaned = val.strip().strip("'\"`")
+    if "=" in cleaned:
+        cleaned = cleaned.split("=", 1)[1].strip().strip("'\"`")
+    return cleaned
+
 def get_api_credentials(state: Optional[dict] = None) -> Tuple[str, str]:
     """Возвращает (api_key, api_secret) с приоритетом настроек бота над переменными окружения."""
     key = ""
     secret = ""
     if state:
-        key = state.get("settings", {}).get("binance_api_key", "").strip()
-        secret = state.get("settings", {}).get("binance_api_secret", "").strip()
+        key = sanitize_api_key(state.get("settings", {}).get("binance_api_key", ""))
+        secret = sanitize_api_key(state.get("settings", {}).get("binance_api_secret", ""))
     if not key:
-        key = os.environ.get("BINANCE_API_KEY", "").strip()
+        key = sanitize_api_key(os.environ.get("BINANCE_API_KEY", ""))
     if not secret:
-        secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+        secret = sanitize_api_key(os.environ.get("BINANCE_API_SECRET", ""))
     return key, secret
 
 def binance_signed_request(
@@ -2144,13 +2153,28 @@ def execute_scan_and_report(
                 f"• Просканировано пар: <code>{meta['candidates']}</code> из {meta['universe']}\n"
                 f"• Порог Score: <code>{meta['min_score']:.0f}</code>\n"
                 f"• BTC: <code>{fmt_price(btc['price'])} USDT</code> ({fmt_pct(btc['change24h'])})\n"
-                f"• Сигналов: <b>0</b>\n\n"
-                f"<b>Ближайшие кандидаты (ниже порога):</b>\n{top_lines}"
+                f"• Сигналов: <b>0</b> <i>(порог {meta['min_score']:.0f} не превышен)</i>\n\n"
+                f"<b>Ближайшие кандидаты:</b>\n{top_lines}\n\n"
+                f"💡 <i>Вы можете купить любого кандидата кнопками ниже или понизить порог Score в ⚙️ Настройки.</i>"
             )
+            kb_rows = []
+            for c in top[:3]:
+                b = c['base']
+                sym = c['symbol']
+                sc = c['best_score']
+                kb_rows.append([
+                    {"text": f"⚡ Купить {b} (Score {sc:.0f})", "callback_data": f"trade_buy:{sym}"},
+                    {"text": f"📈 {b} TV", "url": f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"},
+                ])
+            kb_rows.append([
+                {"text": "⚙️ Настройки порога Score", "callback_data": "menu:settings"},
+            ])
+            kb = {"inline_keyboard": kb_rows}
+
             if status_msg_id:
-                edit_message(token, chat_id, status_msg_id, report_text)
+                edit_message(token, chat_id, status_msg_id, report_text, reply_markup=kb)
             else:
-                send_telegram(token, chat_id, report_text)
+                send_telegram(token, chat_id, report_text, reply_markup=kb)
             return
 
         sent: dict = state.setdefault("sent_alerts", {})
@@ -2509,8 +2533,8 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     user_fsm.pop(chat_id_local, None)
                     parts = text.split()
                     if len(parts) >= 2:
-                        state["settings"]["binance_api_key"] = parts[0].strip()
-                        state["settings"]["binance_api_secret"] = parts[1].strip()
+                        state["settings"]["binance_api_key"] = sanitize_api_key(parts[0])
+                        state["settings"]["binance_api_secret"] = sanitize_api_key(parts[1])
                         save_state(state)
                         send_telegram(token, chat_id_local, "✅ <b>API-ключи Binance сохранены!</b>\n\nТеперь доступны: баланс спота и автоторговля.", reply_markup=main_keyboard())
                     else:
@@ -2661,8 +2685,8 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
             elif cmd in ("api", "ключ"):
                 args = clean_text.split()[1:]
                 if len(args) >= 2:
-                    state["settings"]["binance_api_key"] = args[0].strip()
-                    state["settings"]["binance_api_secret"] = args[1].strip()
+                    state["settings"]["binance_api_key"] = sanitize_api_key(args[0])
+                    state["settings"]["binance_api_secret"] = sanitize_api_key(args[1])
                     save_state(state)
                     send_telegram(token, chat_id_local, "✅ <b>API-ключи Binance сохранены!</b>", reply_markup=main_keyboard())
                 else:
@@ -2764,6 +2788,13 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
             elif cb_data == "menu:main":
                 answer_callback(token, cb_id, "Главное меню")
                 send_telegram(token, cb_chat, "<b>📋 Главное меню Pump Pulse</b>\n\nВыберите действие:", reply_markup=main_keyboard())
+
+            elif cb_data == "menu:settings":
+                answer_callback(token, cb_id, "Настройки")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                else:
+                    send_telegram(token, cb_chat, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data == "autoscan:toggle":
                 settings["autoscan"] = not settings.get("autoscan", True)
