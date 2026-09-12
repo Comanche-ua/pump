@@ -126,6 +126,18 @@ DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "70.0"))
 # отсутствие сети. Значение по умолчанию можно выключить через USE_OCO=false —
 # тогда возвращается прежняя схема: лимитный TP на бирже, а стоп следит
 # Python-процесс (и не срабатывает, когда процесс мёртв).
+# ── Режим стратегии ──
+# "pump" — прежний скоринг из 8 факторов (объём, taker, сжатие, пробой...).
+# "indicators" — классика по индикаторам: RSI выше порога, стохастик выше
+# порога и %K > %D (восходящий импульс). Режим выбирается перед торговлей.
+DEFAULT_STRATEGY = (os.environ.get("STRATEGY") or "pump").strip().lower()
+STRATEGY_LABELS = {
+    "pump": "📈 Памп-скор (8 факторов)",
+    "indicators": "📊 RSI + Стохастик",
+}
+DEFAULT_RSI_MIN = float(os.environ.get("RSI_MIN", "55"))
+DEFAULT_STOCH_MIN = float(os.environ.get("STOCH_MIN", "55"))
+
 DEFAULT_USE_OCO = os.environ.get("USE_OCO", "true").strip().lower() in ("true", "1")
 # Прежний дефолт TP — нужен только для миграции уже сохранённого состояния
 PREVIOUS_TAKE_PROFIT_DEFAULT = 2.0
@@ -342,6 +354,55 @@ def roc(closes: List[float], bars: int) -> float:
     if len(closes) < bars + 1:
         return 0.0
     return pct_change(closes[-(bars + 1)], closes[-1])
+
+def rsi_series(closes: List[float], period: int = 14) -> List[Optional[float]]:
+    """
+    RSI по ВСЕЙ серии (rsi() даёт только последнее значение).
+    Нужен и стратегии индикаторов, и графику — поэтому живёт здесь,
+    а chart.py переиспользует, чтобы не было двух реализаций.
+    """
+    out: List[Optional[float]] = [None] * len(closes)
+    if len(closes) < period + 1:
+        return out
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    def value(g: float, l: float) -> float:
+        if l == 0:
+            return 100.0
+        rs = g / l
+        return 100 - 100 / (1 + rs)
+
+    out[period] = value(avg_gain, avg_loss)
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        out[i + 1] = value(avg_gain, avg_loss)
+    return out
+
+def stochastic_series(candles: List[Candle], k_period: int = 14,
+                      d_period: int = 3) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    """(%K, %D) — стохастик по High/Low/Close. %D — сглаженный %K."""
+    n = len(candles)
+    k: List[Optional[float]] = [None] * n
+    d: List[Optional[float]] = [None] * n
+    for i in range(k_period - 1, n):
+        window = candles[i - k_period + 1:i + 1]
+        hi = max(c.high for c in window)
+        lo = min(c.low for c in window)
+        k[i] = 50.0 if hi <= lo else (candles[i].close - lo) / (hi - lo) * 100.0
+    for i in range(n):
+        if k[i] is None:
+            continue
+        window = [v for v in k[max(0, i - d_period + 1):i + 1] if v is not None]
+        if len(window) == d_period:
+            d[i] = sum(window) / d_period
+    return k, d
 
 def aggregate_timeframe(candles: List[Candle], ms: int) -> List[Candle]:
     groups: Dict[int, List[Candle]] = {}
@@ -666,6 +727,94 @@ def score_window(
         risks=risks,
     )
 
+def score_indicators(
+    timeframe: str,
+    candles: List[Candle],
+    btc_candles: List[Candle],
+    change_24h: float,
+    forming: bool,
+    strict: bool = True,
+) -> Optional[TfBreakdown]:
+    """
+    Режим «RSI + стохастик»: покупка, когда RSI выше порога, стохастик выше
+    порога И %K выше %D (импульс вверх). Пороги — в настройках (rsi_min,
+    stoch_min), по умолчанию 55/55.
+
+    Соблюдает контракт score_window — возвращает TfBreakdown либо None,
+    поэтому analyze_symbol не знает, какой режим выбран.
+    """
+    if len(candles) < MIN_BARS:
+        return None
+
+    closes = [c.close for c in candles]
+    rsi14 = rsi(closes, 14)
+    if rsi14 is None:
+        return None
+    k_series, d_series = stochastic_series(candles)
+    k_last, d_last = k_series[-1], d_series[-1]
+    if k_last is None or d_last is None:
+        return None
+
+    last = candles[-1]
+    range_ = last.high - last.low
+    if range_ <= 0:
+        return None
+
+    up = k_last > d_last
+    # Жёсткое условие входа: оба индикатора выше своих порогов и импульс вверх
+    if strict and not (rsi14 > DEFAULT_RSI_MIN and k_last > DEFAULT_STOCH_MIN and up):
+        return None
+
+    rsi_part = clamp((rsi14 - DEFAULT_RSI_MIN) / max(1.0, 70.0 - DEFAULT_RSI_MIN), 0.0, 1.0)
+    stoch_part = clamp((k_last - DEFAULT_STOCH_MIN) / max(1.0, 85.0 - DEFAULT_STOCH_MIN), 0.0, 1.0)
+    up_part = 1.0 if up else 0.0
+
+    factors = [
+        FactorScore("rsi_zone", f"RSI выше {DEFAULT_RSI_MIN:.0f}", 40, rsi_part, f"RSI {rsi14:.1f}"),
+        FactorScore("stoch_zone", f"Стохастик выше {DEFAULT_STOCH_MIN:.0f}", 40, stoch_part, f"%K {k_last:.1f}"),
+        FactorScore("stoch_up", "Импульс вверх (%K > %D)", 20, up_part,
+                    f"%K {k_last:.1f} vs %D {d_last:.1f}"),
+    ]
+    score = sum(f.value * f.weight for f in factors)
+    late = rsi14 >= 75 or k_last >= 95
+    grade = grade_from(score, late)
+
+    reasons = []
+    if rsi14 > DEFAULT_RSI_MIN:
+        reasons.append(f"RSI {rsi14:.1f} выше порога {DEFAULT_RSI_MIN:.0f}")
+    if k_last > DEFAULT_STOCH_MIN:
+        reasons.append(f"стохастик %K {k_last:.1f} выше порога {DEFAULT_STOCH_MIN:.0f}")
+    if up:
+        reasons.append("%K выше %D — импульс вверх")
+
+    risks = []
+    if rsi14 >= 70:
+        risks.append("RSI в зоне перекупленности")
+    if k_last >= 80:
+        risks.append("стохастик в верхней зоне")
+    if last.close < last.open:
+        risks.append("текущая свеча красная")
+
+    return TfBreakdown(
+        timeframe=timeframe,
+        score=score,
+        grade=grade,
+        volume_ratio=0.0,
+        atr_expansion=0.0,
+        breakout_pct=0.0,
+        rsi=rsi14,
+        taker_buy=0.0,
+        vs_btc_pct=0.0,
+        change_pct=pct_change(last.open, last.close),
+        ema_aligned=False,
+        late=late,
+        forming=forming,
+        bar_open_time=last.open_time,
+        factors=factors,
+        reasons=reasons,
+        risks=risks,
+    )
+
 def pick_best(rows: List[TfBreakdown]) -> TfBreakdown:
     order = {"strong": 0, "watch": 1, "late": 2, "none": 3}
     return sorted(rows, key=lambda r: (order.get(r.grade, 9), -r.score))[0]
@@ -678,9 +827,14 @@ def analyze_symbol(
     btc_raw15: List[Candle],
     btc_ticker: Optional[dict] = None,
     min_score: float = DEFAULT_MIN_SCORE,
+    strategy: str = DEFAULT_STRATEGY,
 ) -> Tuple[Optional[PumpSignal], Optional[dict]]:
     """
     Возвращает (PumpSignal если прошёл порог, candidate_summary с лучшим TF для отчёта).
+
+    strategy выбирает движок: "pump" — прежний скоринг из 8 факторов,
+    "indicators" — RSI + стохастик. Оба движка имеют одинаковый контракт,
+    поэтому остальной конвейер (порог, грейды, автоторговля) не меняется.
     """
     if len(raw15) < MIN_BARS:
         return None, None
@@ -688,11 +842,12 @@ def analyze_symbol(
     btc_change = btc_ticker["priceChangePercent"] if btc_ticker else 0.0
     btc_rel_24h = ticker["priceChangePercent"] - btc_change
 
+    scorer = score_indicators if strategy == "indicators" else score_window
     all_rows: List[TfBreakdown] = []
     for tf in TIMEFRAMES:
         candles = raw15 if tf == "5m" else aggregate_timeframe(raw15, TF_MS[tf])
         btc_c = btc_raw15 if tf == "5m" else aggregate_timeframe(btc_raw15, TF_MS[tf])
-        bd = score_window(tf, candles, btc_c, ticker["priceChangePercent"], forming=True, strict=False)
+        bd = scorer(tf, candles, btc_c, ticker["priceChangePercent"], forming=True, strict=False)
         if bd:
             all_rows.append(bd)
 
@@ -738,6 +893,7 @@ def analyze_symbol(
 def run_scan(
     min_score: Optional[float] = None,
     min_quote_volume: Optional[float] = None,
+    strategy: str = DEFAULT_STRATEGY,
 ) -> Tuple[List[PumpSignal], dict, List[dict]]:
     started = time.time()
     score_threshold = min_score if min_score is not None else DEFAULT_MIN_SCORE
@@ -757,7 +913,8 @@ def run_scan(
         raw = fetch_klines(t["symbol"])
         if not raw:
             return None, None
-        return analyze_symbol(t, raw, btc_raw, btc_ticker, min_score=score_threshold)
+        return analyze_symbol(t, raw, btc_raw, btc_ticker,
+                              min_score=score_threshold, strategy=strategy)
 
     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         for sig, smm in pool.map(worker, candidates):
@@ -814,6 +971,8 @@ def default_state() -> dict:
             "trailing_activation_pct": DEFAULT_TRAILING_ACTIVATION,
             "trailing_distance_pct": DEFAULT_TRAILING_DISTANCE,
             "use_oco": DEFAULT_USE_OCO,
+            "strategy": DEFAULT_STRATEGY,          # "pump" | "indicators"
+            "strategy_confirmed": False,           # выбран ли режим осознанно
             "max_open_trades": 3,
             "trade_min_score": DEFAULT_TRADE_MIN_SCORE,
         },
@@ -3549,6 +3708,9 @@ def remove_asset_inline_kb(state: dict) -> Optional[dict]:
 def settings_text(state: dict) -> str:
     s = state["settings"]
     filt_label = "🔥 Только Strong" if s.get("filter_level") == "strong_only" else "⚡ Strong + Watch"
+    strat_label = STRATEGY_LABELS.get(s.get("strategy", DEFAULT_STRATEGY), DEFAULT_STRATEGY)
+    if s.get("strategy", DEFAULT_STRATEGY) == "indicators":
+        strat_label += f" (RSI > {DEFAULT_RSI_MIN:.0f}, %K > {DEFAULT_STOCH_MIN:.0f}, %K > %D)"
     auto_scan_label = "🟢 Включён" if s.get("autoscan", True) else "🔴 Выключен"
     tp_pct = s.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
     sl_pct = s.get("stop_loss_pct", DEFAULT_STOP_LOSS)
@@ -3582,7 +3744,10 @@ def settings_text(state: dict) -> str:
         "<b>⚙️ Параметры бота Pump Pulse</b>\n\n"
         f"• <b>Автосканирование рынка:</b> {auto_scan_label} (каждые {interval_m} мин)\n"
         f"• <b>Порог Score (MIN_SCORE):</b> <code>{s['min_score']:.0f}</code>\n"
-        f"• <b>Уведомления:</b> <code>{filt_label}</code>\n\n"
+        f"• <b>Уведомления:</b> <code>{filt_label}</code>\n"
+        f"• <b>Режим стратегии:</b> <code>{strat_label}</code>\n"
+        f"  <i>Меняется кнопками ниже и применяется к следующему скану. "
+        f"«Памп-скор» ищет всплеск объёма и пробой, «RSI + Стохастик» — импульс по индикаторам.</i>\n\n"
         "<b>⚡ Спотовая торговля Binance:</b>\n"
         f"• <b>Автоторговля пампов:</b> {auto_trade_label}\n"
         f"• <b>Размер ставки:</b> <code>{trade_size_label}</code>\n"
@@ -3614,6 +3779,11 @@ def settings_inline_kb(state: dict) -> dict:
     def _sl_btn(val: float) -> dict:
         active = "✅ " if abs(cur_sl - val) < 0.05 else ""
         return {"text": f"{active}🛑 SL: -{val:.1f}%", "callback_data": f"trade:sl:{val:.1f}"}
+
+    def _strategy_btn(mode: str, label: str) -> dict:
+        """Кнопка режима стратегии: активный помечается галочкой."""
+        active = "✅ " if s.get("strategy", DEFAULT_STRATEGY) == mode else ""
+        return {"text": f"{active}{label}", "callback_data": f"strategy:set:{mode}"}
 
     def _tp_btn(val: float) -> dict:
         active = "✅ " if abs(cur_tp - val) < 0.05 else ""
@@ -3661,6 +3831,11 @@ def settings_inline_kb(state: dict) -> dict:
             ],
             [
                 {"text": dyn_tp_btn_label, "callback_data": "trade:dyn_tp:toggle"},
+            ],
+            # --- Режим стратегии: выбирается ПЕРЕД торговлей ---
+            [
+                _strategy_btn("pump", "📈 Памп-скор"),
+                _strategy_btn("indicators", "📊 RSI+Стох"),
             ],
             # --- Stop Loss ---
             [
@@ -4165,6 +4340,7 @@ def execute_scan_and_report(
         signals, meta, top = run_scan(
             min_score=min_score if min_score is not None else s["min_score"],
             min_quote_volume=s.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME),
+            strategy=s.get("strategy", DEFAULT_STRATEGY),
         )
         duration = meta["duration_ms"] / 1000.0
         btc = meta["btc"]
@@ -4339,6 +4515,7 @@ def autoscan_worker(token: str, primary_chat_id: Union[str, int], state: dict, s
             signals, meta, _top = run_scan(
                 min_score=settings.get("min_score", DEFAULT_MIN_SCORE),
                 min_quote_volume=settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME),
+                strategy=settings.get("strategy", DEFAULT_STRATEGY),
             )
             print(f"[Autoscan] {time.strftime('%H:%M:%S')}: {meta['duration_ms']/1000:.1f}с, "
                   f"candidates={meta['candidates']}, сигналов={len(signals)}")
@@ -5125,6 +5302,21 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 if msg_id:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
+            elif cb_data.startswith("strategy:set:"):
+                # Выбор режима стратегии. Он влияет и на скан, и на автоторговлю,
+                # поэтому пользователь выбирает его осознанно; флаг фиксирует это.
+                mode = cb_data.split(":", 2)[2]
+                if mode not in STRATEGY_LABELS:
+                    answer_callback(token, cb_id, "Неизвестный режим", show_alert=True)
+                    return
+                settings["strategy"] = mode
+                settings["strategy_confirmed"] = True
+                save_state(state)
+                answer_callback(token, cb_id, f"Режим: {STRATEGY_LABELS[mode]}")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, settings_text(state),
+                                 reply_markup=settings_inline_kb(state))
+
             elif cb_data == "filter:toggle":
                 settings["filter_level"] = "strong_only" if settings.get("filter_level") == "strong_and_watch" else "strong_and_watch"
                 save_state(state)
@@ -5146,6 +5338,21 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 answer_callback(token, cb_id, f"Автоторговля {st_str}")
                 if msg_id:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+                # Выбор режима ПЕРЕД торговлей: если режим ещё не выбран осознанно,
+                # спрашиваем об этом сразу при включении, а не после первой сделки.
+                if settings["auto_trade"] and not settings.get("strategy_confirmed"):
+                    cur = STRATEGY_LABELS.get(settings.get("strategy", DEFAULT_STRATEGY), "—")
+                    send_telegram(
+                        token, cb_chat,
+                        f"⚙️ <b>Выберите режим стратегии перед торговлей</b>\n\n"
+                        f"Сейчас установлен: <code>{cur}</code>\n\n"
+                        f"• <b>📈 Памп-скор</b> — 8 факторов: всплеск объёма, агрессия покупок, "
+                        f"сжатие волатильности, пробой флэта.\n"
+                        f"• <b>📊 RSI + Стохастик</b> — классика по индикаторам: "
+                        f"RSI &gt; {DEFAULT_RSI_MIN:.0f}, %K &gt; {DEFAULT_STOCH_MIN:.0f} и %K &gt; %D.\n\n"
+                        f"<i>От выбора зависит, какие сигналы будут открывать сделки.</i>",
+                        reply_markup=settings_inline_kb(state),
+                    )
 
             elif cb_data.startswith("trade:amt:"):
                 mode_val = cb_data[len("trade:amt:"):]  # "all", "pct:10", etc.
