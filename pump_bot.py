@@ -86,7 +86,7 @@ DEFAULT_MIN_SCORE = float(os.environ.get("MIN_SCORE", "58"))
 ALREADY_PUMPED_MAX = float(os.environ.get("ALREADY_PUMPED_MAX", "8.0"))  # Защита от перегретых монет: ищем в зародыше (до +8% за 24ч)
 MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "50"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
-KLINES_LIMIT = 250  # 250 баров по 5m (~20 часов подробной истории)
+KLINES_LIMIT = int(os.environ.get("KLINES_LIMIT", "500"))  # 500 баров 5m → 41 бар 1h (нужно ≥ MIN_BARS)
 
 # Параметры спотовой автоторговли.
 # TP/SL подобраны бэктестом (backtest/backtest.py) и подтверждены на трёх
@@ -1369,7 +1369,7 @@ def execute_pump_auto_trade(
 ) -> Optional[dict]:
     """
     Выполняет покупку на Binance Spot по маркету на заданную сумму USDT
-    и сразу выставляет лимитный Take-Profit ордер (+3%).
+    и сразу ставит на бирже OCO-список: тейк-профит и стоп-лосс.
     """
     settings = state.get("settings", {})
     tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
@@ -2578,7 +2578,7 @@ def format_sell_confirmation_prompt(state: dict, symbol: str) -> Tuple[str, dict
     pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
     sign = "🟢" if pnl >= 0 else "🔴"
 
-    tp_note = f"\n• Тейк-профит цель: <code>{fmt_price(tp_price)} $</code> (+{trade.get('tp_pct', 3.0):.1f}%)" if trade else ""
+    tp_note = f"\n• Тейк-профит цель: <code>{fmt_price(tp_price)} $</code> (+{trade.get('tp_pct', DEFAULT_TAKE_PROFIT):.1f}%)" if trade else ""
 
     text = (
         f"⚠️ <b>ПОДТВЕРЖДЕНИЕ ПРОДАЖИ АКТИВА</b>\n\n"
@@ -2856,9 +2856,9 @@ def set_custom_target_sell(token: str, chat_id: Union[str, int], state: dict, sy
         "buy_price": buy_p,
         "highest_price": max(cur_price, buy_p),
         "tp_price": float(target_price_str),
-        "sl_price": trade.get("sl_price", buy_p * 0.98) if trade else buy_p * 0.98,
-        "trailing_sl": trade.get("trailing_sl", buy_p * 0.98) if trade else buy_p * 0.98,
-        "sl_pct": trade.get("sl_pct", 2.0) if trade else 2.0,
+        "sl_price": trade.get("sl_price", buy_p * (1 - DEFAULT_STOP_LOSS / 100)) if trade else buy_p * (1 - DEFAULT_STOP_LOSS / 100),
+        "trailing_sl": trade.get("trailing_sl", buy_p * (1 - DEFAULT_STOP_LOSS / 100)) if trade else buy_p * (1 - DEFAULT_STOP_LOSS / 100),
+        "sl_pct": trade.get("sl_pct", DEFAULT_STOP_LOSS) if trade else DEFAULT_STOP_LOSS,
         "trailing_activation_pct": 1.0,
         "trailing_distance_pct": 0.8,
         "qty": float(sell_params["quantity"]),
@@ -3079,10 +3079,10 @@ def _sync_trades_and_active_positions(state: dict) -> None:
                     prev_buys = [b for b in buys if b.get("time", 0) < s_trade.get("time", 0)]
                     if prev_buys:
                         b_trade = prev_buys[-1]
-                        b_price = float(b_trade.get("price", s_price * 0.98))
+                        b_price = float(b_trade.get("price", s_price * (1 - DEFAULT_STOP_LOSS / 100)))
                         b_time = int(b_trade.get("time", 0)) // 1000
                     else:
-                        b_price = s_price * 0.98
+                        b_price = s_price * (1 - DEFAULT_STOP_LOSS / 100)
                         b_time = s_time - 3600
 
                     cost = s_qty * b_price
@@ -3159,7 +3159,7 @@ def format_portfolio(state: dict) -> str:
             tp = float(tr.get("tp_price", 0.0))
             qty = float(tr.get("qty", 0.0))
             cost = float(tr.get("cost_usdt", qty * bp))
-            tp_pct = float(tr.get("tp_pct", 3.0))
+            tp_pct = float(tr.get("tp_pct", DEFAULT_TAKE_PROFIT))
             tp_order_id = tr.get("tp_order_id", "—")
             src = tr.get("signal_source", "scan")
             score = tr.get("signal_score", 0)
@@ -3521,6 +3521,9 @@ def portfolio_charts_inline_kb(state: dict) -> dict:
         tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{s}"
         binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
         rows.append([
+            {"text": f"📉 {base} 15m (индикаторы)", "callback_data": f"chart:{s}"},
+        ])
+        rows.append([
             {"text": f"📈 {base} TradingView", "url": tv_url},
             {"text": f"📊 {base} Binance", "url": binance_url},
         ])
@@ -3701,8 +3704,8 @@ def signal_inline_kb(sig: PumpSignal, state: Optional[dict] = None) -> dict:
     binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sig.symbol}"
 
-    trade_amt = 11.0
-    tp_pct = 3.0
+    trade_amt = DEFAULT_TRADE_AMOUNT
+    tp_pct = DEFAULT_TAKE_PROFIT
     if state:
         trade_amt = float(state.get("settings", {}).get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
         tp_pct = float(state.get("settings", {}).get("take_profit_pct", DEFAULT_TAKE_PROFIT))
@@ -3712,6 +3715,9 @@ def signal_inline_kb(sig: PumpSignal, state: Optional[dict] = None) -> dict:
             [
                 {"text": "📊 Binance Spot", "url": binance_url},
                 {"text": "📈 TradingView", "url": tv_url},
+            ],
+            [
+                {"text": "📉 График 15m (RSI/Stoch/BB)", "callback_data": f"chart:{sig.symbol}"},
             ],
             [
                 {"text": f"⚡ Купить {base} (TP +{tp_pct:.0f}%)", "callback_data": f"trade_buy:{sig.symbol}"},
@@ -3762,9 +3768,12 @@ def trade_buy_amount_kb(symbol: str, state: dict) -> dict:
 HELP_TEXT = (
     "<b>🚀 Pump Pulse Scanner 2.1 & Binance Spot Trader</b>\n\n"
     "Бот отслеживает аномальную активность на спотовом рынке Binance (USDT-пары) "
-    "и поддерживает автоматическую покупку с мгновенным выставлением Take-Profit (+3%).\n\n"
+    f"и поддерживает автоматическую покупку с защитой позиции на бирже: "
+    f"тейк-профит +{DEFAULT_TAKE_PROFIT:.1f}% и стоп-лосс -{DEFAULT_STOP_LOSS:.1f}% (значения по умолчанию).\n\n"
     "<b>📌 Основные функции:</b>\n"
     "• <b>🔍 Скан сейчас</b> (/scan) — сканирование всего спота прямо сейчас.\n"
+    "• <b>🐋 Скан китов</b> (/whale) — крупные сделки и потоки капитала.\n"
+    "• <b>📉 График 15m</b> (/chart SOL) — свечи с Боллинджером, RSI и стохастиком.\n"
     "• <b>💼 Портфель</b> (/portfolio) — баланс Binance, активные сделки и PnL.\n"
     "• <b>⚡ Торговля</b> (/trade) — статус автоторговли и история профита.\n"
     "• <b>🎯 Автопродажи</b> (/targetsell) — настройка целевой цены продажи (TP).\n"
@@ -3773,10 +3782,10 @@ HELP_TEXT = (
     "• <b>⚙️ Настройки</b> (/settings) — включение автоторговли, размер ставки и TP.\n"
     "• <b>🔑 Привязка API</b> (/api) — настройка Binance API ключей.\n\n"
     "<b>⚡ Как работает спотовая автоторговля:</b>\n"
-    "1. При обнаружении подтверждённого импульса (Score 74+, STRONG) бот проверяет свободный USDT-баланс.\n"
-    "2. На бирже размещается спотовый MARKET BUY ордер на указанную сумму (~11 USDT).\n"
-    "3. Сразу же выставляется лимитный ордер на продажу (LIMIT SELL GTC) с профитом +3%.\n"
-    "4. Когда цена доходит до цели, ордер исполняется и средства автоматически возвращаются в USDT!\n\n"
+    f"1. При обнаружении подтверждённого импульса (Score {DEFAULT_TRADE_MIN_SCORE:.0f}+) бот проверяет свободный USDT-баланс.\n"
+    f"2. На бирже размещается спотовый MARKET BUY ордер на указанную сумму (~{DEFAULT_TRADE_AMOUNT:.0f} USDT).\n"
+    f"3. Сразу же ставится OCO-список: тейк-профит +{DEFAULT_TAKE_PROFIT:.1f}% и стоп-лосс -{DEFAULT_STOP_LOSS:.1f}%.\n"
+    "4. Срабатывает то плечо, которое достигнуто первым: цель продаёт в плюс, стоп закрывает убыток. Второе биржа снимает сама.\n\n"
     "<b>🧠 8 факторов раннего обнаружения импульса:</b>\n"
     "1. <b>Всплеск объёма (25б):</b> резкий приток капитала относительно SMA20.\n"
     "2. <b>Taker Buy агрессия (22б):</b> доминирование покупок по рынку (>60-70%).\n"
@@ -3801,11 +3810,138 @@ def api_call(token: str, method: str, payload: Optional[dict] = None, retries: i
             req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # 429 = «слишком часто»: Telegram сам сообщает, сколько ждать
+            # (parameters.retry_after). Без паузы повтор только усугубляет,
+            # а сообщение молча теряется.
+            retry_after = None
+            try:
+                err = json.loads(e.read().decode("utf-8", errors="ignore"))
+                retry_after = (err.get("parameters") or {}).get("retry_after")
+            except Exception:
+                pass
+            if e.code == 429 and retry_after:
+                wait = min(int(retry_after) + 1, 90)
+                print(f"[Telegram 429] ждём {wait}с перед повтором ({method})", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            if attempt == retries:
+                raise
+            time.sleep(0.5 * attempt)
         except Exception:
             if attempt == retries:
                 raise
             time.sleep(0.5 * attempt)
     return {}
+
+def _split_message(text: str, limit: int = 4000) -> List[str]:
+    """
+    Режет длинный текст на части по границам строк.
+
+    Telegram отвергает сообщение длиннее 4096 символов — ЦЕЛИКОМ, поэтому
+    длинный портфель или статистика просто не доходили до пользователя.
+    """
+    if len(text) <= limit:
+        return [text]
+    parts: List[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        while len(line) > limit:                    # одна гигантская строка
+            parts.append(line[:limit])
+            line = line[limit:]
+        joined = f"{cur}\n{line}" if cur else line
+        if len(joined) > limit:
+            if cur:
+                parts.append(cur)
+            cur = line
+        else:
+            cur = joined
+    if cur:
+        parts.append(cur)
+    return parts
+
+def send_telegram_photo(token: str, chat_id: Union[str, int], png_bytes: bytes,
+                        caption: str = "", reply_markup: Optional[dict] = None,
+                        filename: str = "chart.png") -> bool:
+    """
+    Отправляет картинку в Telegram. Только urllib: собираем multipart/form-data
+    вручную, потому что os/http.client multipart сам не умеет, а тянуть
+    requests в проект на stdlib нет смысла.
+    """
+    boundary = "----PumpPulse" + hashlib.md5(f"{time.time()}".encode()).hexdigest()[:16]
+    parts: List[bytes] = []
+
+    def field(name: str, value: str) -> None:
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode("utf-8")
+        )
+
+    field("chat_id", str(chat_id))
+    if caption:
+        # Telegram ограничивает подпись к фото 1024 символами
+        field("caption", caption[:1024])
+        field("parse_mode", "HTML")
+    if reply_markup:
+        field("reply_markup", json.dumps(reply_markup))
+
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"photo\"; "
+        f"filename=\"{filename}\"\r\nContent-Type: image/png\r\n\r\n".encode("utf-8")
+    )
+    parts.append(png_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    for attempt in range(1, 3):
+        try:
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return bool(json.loads(resp.read().decode("utf-8")).get("ok"))
+        except Exception as e:
+            if attempt == 2:
+                print(f"Telegram sendPhoto error: {e}", file=sys.stderr)
+                return False
+            time.sleep(0.5 * attempt)
+    return False
+
+def send_symbol_chart(token: str, chat_id: Union[str, int], symbol: str,
+                      bars: int = 120, reply_markup: Optional[dict] = None) -> bool:
+    """
+    Строит и отправляет график 15m с индикаторами (Боллинджер, RSI, стохастик).
+    Свечи 15m собираются из уже знакомых боту 5m — отдельный запрос не нужен.
+    """
+    symbol = normalize_symbol(symbol)
+    base = base_asset(symbol)
+    try:
+        import chart
+    except Exception as e:
+        send_telegram(token, chat_id,
+                      f"❌ Модуль графика недоступен: <code>{e}</code>\n\n"
+                      f"Файл <code>chart.py</code> должен лежать рядом с ботом.")
+        return False
+
+    raw5 = fetch_klines(symbol, limit=max(500, bars * 5))
+    candles = aggregate_timeframe(raw5, TF_MS["15m"])
+    if len(candles) < 30:
+        send_telegram(token, chat_id,
+                      f"❌ Недостаточно данных для графика <b>{base}/USDT</b> "
+                      f"(свечей 15m: {len(candles)}).")
+        return False
+
+    try:
+        png = chart.render_chart(symbol, candles, bars=bars)
+        caption = chart.chart_caption(symbol, candles, bars=bars)
+    except Exception as e:
+        send_telegram(token, chat_id, f"❌ Ошибка построения графика {base}: <code>{e}</code>")
+        return False
+
+    return send_telegram_photo(token, chat_id, png, caption,
+                               reply_markup=reply_markup,
+                               filename=f"{base}_15m.png")
 
 def drop_pending_updates(token: str) -> None:
     try:
@@ -3814,27 +3950,48 @@ def drop_pending_updates(token: str) -> None:
         pass
 
 def send_telegram(token: str, chat_id: Union[str, int], text: str, reply_markup: Optional[dict] = None, retries: int = 3) -> Optional[int]:
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+    """
+    Отправляет текст. Длинные сообщения режутся на части: Telegram отвергает
+    всё сообщение целиком, если оно длиннее 4096 символов, поэтому крупный
+    портфель или статистика раньше просто не доходили до пользователя.
+    Клавиатура прикрепляется к первой части (к последней её не поставить —
+    тогда кнопки окажутся под «хвостом» текста).
+    """
+    chunks = _split_message(text)
+    first_id: Optional[int] = None
 
-    for attempt in range(1, retries + 1):
-        try:
-            res = api_call(token, "sendMessage", payload)
-            if res.get("ok"):
-                return res["result"]["message_id"]
-            time.sleep(0.5 * attempt)
-        except Exception as e:
-            if attempt == retries:
-                print(f"Telegram send error: {e}", file=sys.stderr)
-                return None
-            time.sleep(0.5 * attempt)
-    return None
+    for idx, chunk in enumerate(chunks):
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if idx == 0 and reply_markup:
+            payload["reply_markup"] = reply_markup
+
+        for attempt in range(1, retries + 1):
+            try:
+                res = api_call(token, "sendMessage", payload)
+                if res.get("ok"):
+                    if idx == 0:
+                        first_id = res["result"]["message_id"]
+                    break
+                # Разрезали по середине HTML-тега — Telegram не примет разметку.
+                # Отправляем эту часть как обычный текст, лишь бы дошло.
+                desc = str(res.get("description", ""))
+                if payload.get("parse_mode") and "entit" in desc.lower():
+                    print(f"Telegram parse error, отправляю часть {idx + 1} без разметки: {desc}",
+                          file=sys.stderr)
+                    payload.pop("parse_mode", None)
+                    continue
+                time.sleep(0.5 * attempt)
+            except Exception as e:
+                if attempt == retries:
+                    print(f"Telegram send error (часть {idx + 1}/{len(chunks)}): {e}", file=sys.stderr)
+                    break
+                time.sleep(0.5 * attempt)
+    return first_id
 
 def edit_message(token: str, chat_id: Union[str, int], message_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
     payload: Dict[str, Any] = {
@@ -3867,6 +4024,8 @@ def set_bot_commands(token: str) -> None:
         {"command": "menu", "description": "📋 Открыть клавиатуру меню"},
         {"command": "hide", "description": "🙈 Скрыть клавиатуру"},
         {"command": "scan", "description": "Сканер спота сейчас"},
+        {"command": "whale", "description": "🐋 Скан крупных сделок (киты)"},
+        {"command": "chart", "description": "📉 График 15m с индикаторами (/chart SOL)"},
         {"command": "portfolio", "description": "Портфель и PnL"},
         {"command": "trade", "description": "Статус автоторговли и профит"},
         {"command": "targetsell", "description": "🎯 Автопродажа по целевой цене"},
@@ -3928,6 +4087,70 @@ def format_factor_breakdown(sig: PumpSignal, tf: str) -> str:
 
 
 # ───────────────────────── Одноразовый отчёт (для CI) ─────────────────────────
+
+
+def execute_whale_scan_and_report(token: str, chat_id: Union[str, int], state: dict) -> None:
+    """
+    Разовый whale-скан по кнопке «🐋 Скан китов».
+
+    Раньше у этой кнопки не было обработчика, и она попадала под общее правило
+    «скан» в роутере текстов — то есть МОЛЧА запускала обычный скан пампов.
+    Пользователь думал, что смотрит китовые сделки, а видел совсем другое.
+    """
+    settings = state.get("settings", {})
+    status_id = send_telegram(token, chat_id, "⏳ <i>Сканирую крупные сделки (киты)…</i>")
+
+    def say(text: str) -> None:
+        if status_id:
+            edit_message(token, chat_id, status_id, text, reply_markup=main_keyboard())
+        else:
+            send_telegram(token, chat_id, text, reply_markup=main_keyboard())
+
+    try:
+        import whale_scan
+    except Exception as e:
+        say(f"❌ Модуль whale_scan недоступен: <code>{e}</code>\n\n"
+            f"Файл <code>whale_scan.py</code> должен лежать рядом с ботом.")
+        return
+
+    min_score = float(settings.get("whale_min_score", whale_scan.DEFAULT_MIN_SCORE))
+    top_n = int(settings.get("whale_top_n", whale_scan.DEFAULT_TOP_N))
+    try:
+        signals, meta = whale_scan.run_whale_scan(min_score=min_score, top_n=top_n)
+    except Exception as e:
+        say(f"❌ Ошибка whale-скана: <code>{e}</code>")
+        return
+
+    scanned = meta.get("scanned", 0)
+    duration = meta.get("duration_ms", 0) / 1000.0
+
+    if not signals:
+        near = meta.get("near", [])[:4]
+        near_lines = "\n".join(
+            f"  • {n['base']}: score {n['score']:.0f}, поток {n['net_flow_pct']:+.0f}%, "
+            f"доля китов {n['whale_share'] * 100:.0f}%"
+            for n in near
+        ) or "  —"
+        text = (
+            f"🐋 <b>Whale-скан: крупных сделок не найдено</b>\n\n"
+            f"• Просканировано пар: <code>{scanned}</code> за <code>{duration:.1f}с</code>\n"
+            f"• Порог Whale Score: <code>{min_score:.0f}</code>\n"
+            f"• Сигналов: <b>0</b>\n\n"
+            f"<b>Ближайшие к порогу:</b>\n{near_lines}"
+        )
+    else:
+        blocks = [whale_scan.format_whale_alert(s) for s in signals[:5]]
+        text = (
+            f"🐋 <b>Whale-скан</b>: {scanned} пар за {duration:.1f}с\n"
+            f"• Порог: <code>{min_score:.0f}</code> · найдено сигналов: <b>{len(signals)}</b>\n\n"
+            + "\n\n".join(blocks)
+        )
+
+    # Telegram ограничивает сообщение 4096 символами: длинный список алертов
+    # молча не отправился бы, поэтому обрезаем осознанно.
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n…<i>(список обрезан, сигналов больше)</i>"
+    say(text)
 
 
 def execute_scan_and_report(
@@ -4239,7 +4462,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
         "<b>👋 Приветствую в Pump Pulse Scanner 2.1!</b>\n\n"
         "Я сканирую спотовый рынок Binance (USDT-пары) в реальном времени "
         "и мгновенно сообщу о зарождении пампа (Score 58-74+, ДО выстрела).\n"
-        "Также умею автоматически торговать на вашем Binance Spot с TP +3%.\n\n"
+        f"Также умею автоматически торговать на вашем Binance Spot: цель +{DEFAULT_TAKE_PROFIT:.1f}%, стоп -{DEFAULT_STOP_LOSS:.1f}%.\n\n"
         "• Выберите действие кнопками ниже\n"
         "• Или напишите: <code>scan</code>, <code>portfolio</code>, <code>trade</code> и т.д."
     )
@@ -4253,9 +4476,40 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
             return True
         return str(user_id) in [str(c) for c in state["allowed_chats"]]
 
+    def begin_add_symbol(chat_id_local: Union[str, int], raw_symbol: str) -> None:
+        """
+        Начинает добавление актива по уже известному тикеру.
+
+        Раньше ветка /add собирала ФИКТИВНОЕ обновление и рекурсивно звала
+        handle_update, а тот первой же строкой читает u["update_id"] и падал
+        с KeyError — исключение проглатывал поллинг, так что команда
+        «/add SOL» молча не делала ничего.
+        """
+        symbol = normalize_symbol(raw_symbol)
+        if not symbol.isalnum() or len(symbol) > 20:
+            send_telegram(token, chat_id_local,
+                          "❌ Неверный тикер. Попробуйте снова (например, SOL):",
+                          reply_markup=cancel_keyboard())
+            return
+        price = get_price(symbol)
+        if price is None:
+            send_telegram(token, chat_id_local,
+                          f"❌ Монета <code>{symbol}</code> не найдена на Binance Spot. "
+                          f"Попробуйте другой тикер:", reply_markup=cancel_keyboard())
+            return
+        user_fsm[chat_id_local] = {"state": "waiting_qty",
+                                   "data": {"symbol": symbol, "price": price}}
+        send_telegram(token, chat_id_local,
+                      f"✅ Монета: <b>{base_asset(symbol)}/USDT</b>\n"
+                      f"Текущая цена: <code>{fmt_price(price)} USDT</code>\n\n"
+                      f"Введите <b>количество</b> (например, 10):",
+                      reply_markup=cancel_keyboard())
+
     def handle_update(u: dict) -> None:
         nonlocal last_update_id
-        last_update_id = u["update_id"]
+        # .get, а не []: синтетическое обновление без update_id (например,
+        # вызов обработчика из другого места) не должно ронять опрос.
+        last_update_id = u.get("update_id", last_update_id)
 
         if "message" in u:
             msg = u["message"]
@@ -4306,16 +4560,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
                 if cur_st == "waiting_symbol":
                     user_fsm.pop(chat_id_local, None)
-                    symbol = normalize_symbol(text)
-                    if not symbol.isalnum() or len(symbol) > 20:
-                        send_telegram(token, chat_id_local, "❌ Неверный тикер. Попробуйте снова (например, SOL):", reply_markup=cancel_keyboard())
-                        return
-                    price = get_price(symbol)
-                    if price is None:
-                        send_telegram(token, chat_id_local, f"❌ Монета <code>{symbol}</code> не найдена на Binance Spot. Попробуйте другой тикер:", reply_markup=cancel_keyboard())
-                        return
-                    send_telegram(token, chat_id_local, f"✅ Монета: <b>{base_asset(symbol)}/USDT</b>\nТекущая цена: <code>{fmt_price(price)} USDT</code>\n\nВведите <b>количество</b> (например, 10):", reply_markup=cancel_keyboard())
-                    user_fsm[chat_id_local] = {"state": "waiting_qty", "data": {"symbol": symbol, "price": price}}
+                    begin_add_symbol(chat_id_local, text)
                     return
 
                 if cur_st == "waiting_qty":
@@ -4480,6 +4725,39 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 print(f"-> Настройки для {chat_id_local}")
                 send_telegram(token, chat_id_local, settings_text(state), reply_markup=settings_inline_kb(state))
 
+            # Ветка китов ОБЯЗАНА стоять до ветки «скан»: правило
+            # «скан» в text_lower иначе перехватывает «🐋 Скан китов»
+            # и вместо китового скана запускает обычный.
+            elif "кит" in text_lower or cmd in ("whale", "whales", "киты"):
+                print(f"-> Whale-скан для {chat_id_local}")
+                execute_whale_scan_and_report(token, chat_id_local, state)
+
+            elif cmd in ("chart", "график", "графики") or text_lower.startswith(("/chart", "/график")):
+                # График по запросу: раньше его можно было получить только из
+                # сообщения сигнала (а они редки) или из меню портфеля (пустое
+                # при отсутствии позиций) — произвольную монету спросить было нечем.
+                chart_args = clean_text.split()[1:]
+                if not chart_args:
+                    kb = portfolio_charts_inline_kb(state)
+                    rows = kb.get("inline_keyboard", [])
+                    if len(rows) > 1:
+                        send_telegram(token, chat_id_local,
+                                      "📉 <b>График 15m с индикаторами</b>\n\nВыберите монету:",
+                                      reply_markup=kb)
+                    else:
+                        send_telegram(
+                            token, chat_id_local,
+                            "📉 <b>График 15m с индикаторами</b>\n\n"
+                            "Укажите монету, например: <code>/chart SOL</code>\n\n"
+                            "<i>Состав: свечи 15m + Боллинджер (20, 2σ), RSI 14 и стохастик (14, 3).</i>",
+                            reply_markup=main_keyboard(),
+                        )
+                    return
+                chart_sym = normalize_symbol(chart_args[0])
+                print(f"-> График 15m для {chart_sym} ({chat_id_local})")
+                send_symbol_chart(token, chat_id_local, chart_sym,
+                                  reply_markup=main_keyboard())
+
             elif cmd in ("scan", "скан") or (is_menu_action and "скан" in text_lower):
                 print(f"-> Скан для {chat_id_local}")
                 execute_scan_and_report(token, chat_id_local, state)
@@ -4514,7 +4792,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     lines.append("<b>🎯 Активные сделки:</b>")
                     for sym, tr in active.items():
                         lines.append(
-                            f"  • {tr.get('base', base_asset(sym))}/USDT: вход {fmt_price(tr.get('buy_price', 0))} → TP {fmt_price(tr.get('tp_price', 0))} (+{tr.get('tp_pct', 3.0):.1f}%)"
+                            f"  • {tr.get('base', base_asset(sym))}/USDT: вход {fmt_price(tr.get('buy_price', 0))} → TP {fmt_price(tr.get('tp_price', 0))} (+{tr.get('tp_pct', DEFAULT_TAKE_PROFIT):.1f}%)"
                         )
                     lines.append("")
                 if history:
@@ -4529,10 +4807,9 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
             elif cmd in ("add", "добавить") or (is_menu_action and "добав" in text_lower):
                 args = clean_text.split()[1:]
                 if args:
-                    user_fsm[chat_id_local] = {"state": "waiting_symbol", "data": {}}
-                    # если пользователь сразу указал тикер — обрабатываем
-                    msg = {"message": {"chat": {"id": chat_id_local}, "from": {"id": user_id}, "text": args[0]}}
-                    handle_update(msg)
+                    # Тикер указан сразу — сразу и продолжаем, без фиктивного
+                    # обновления и рекурсии (см. begin_add_symbol).
+                    begin_add_symbol(chat_id_local, args[0])
                     return
                 print(f"-> Добавление актива для {chat_id_local}")
                 user_fsm[chat_id_local] = {"state": "waiting_symbol", "data": {}}
@@ -5047,6 +5324,14 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 )
                 user_fsm[cb_chat] = {"state": "waiting_quick_add_qty", "data": {"symbol": symbol, "price": price}}
 
+            elif cb_data.startswith("chart:"):
+                # График 15m с индикаторами по запросу. Картинка отправляется
+                # ТОЛЬКО по нажатию: прикреплять её к каждому сигналу означало
+                # бы отдельную отправку фото каждые несколько минут.
+                chart_sym = cb_data.split(":", 1)[1]
+                answer_callback(token, cb_id, "Строю график…")
+                send_symbol_chart(token, cb_chat, chart_sym)
+
             elif cb_data.startswith("factors:"):
                 parts = cb_data.split(":")
                 symbol = parts[1]
@@ -5066,6 +5351,13 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     send_telegram(token, cb_chat, "❌ Не удалось рассчитать факторы.")
                     return
                 send_telegram(token, cb_chat, format_factor_breakdown(sig, tf))
+
+            else:
+                # Неизвестная или устаревшая кнопка. Без этой ветки Telegram
+                # бесконечно крутит индикатор на кнопке: обработчик обязан
+                # вызвать answerCallbackQuery, а иначе кажется, что бот завис.
+                print(f"⚠️ Неизвестный callback: {cb_data!r}")
+                answer_callback(token, cb_id, "Кнопка устарела — откройте меню заново")
 
     # ── Polling loop ──
     print("🤖 Бот запущен и слушает сообщения...")
