@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Pump Pulse Scanner (Telegram Bot 2.1) + Whale Scan (режим «Скан действий китов»).
+Pump Pulse Scanner (Telegram Bot 2.1)
 
 Сканирует USDT-спот на Binance, считает multi-TF score
 (объём, breakout, ATR, RSI, EMA, taker buy, vs BTC, ускорение)
 и предоставляет полнофункциональный Telegram-интерфейс:
   - Интерактивное меню и Reply-кнопки
   - Фоновый автоскан рынка в реальном времени с защитой от дублирования
-  - Режим «🐋 Скан действий китов»: крупные принты, чистый поток, стены, OI
   - Управление портфелем (добавление, удаление, расчёт PnL)
   - Настройки порогов и фильтров через Inline-кнопки
   - Прямые ссылки на графики Binance и TradingView
@@ -59,16 +58,6 @@ except ImportError:
         except Exception:
             pass
 
-# ───────────────────────── Whale Scan (совместный режим) ─────────────────────────
-# Модуль лежит рядом в репозитории (whale_scan.py). Если его нет — бот работает
-# как раньше, без режима китов (безопасная деградация).
-try:
-    import whale_scan as ws
-    WHALE_MODULE_OK = True
-except Exception as _whale_import_err:
-    ws = None  # type: ignore[assignment]
-    WHALE_MODULE_OK = False
-    print(f"⚠️ Модуль whale_scan.py недоступен, режим «Скан китов» отключён: {_whale_import_err}", file=sys.stderr)
 
 # ───────────────────────── Config ─────────────────────────
 
@@ -109,11 +98,6 @@ DEFAULT_TRAILING_DISTANCE = float(os.environ.get("TRAILING_DISTANCE_PCT", "0.8")
 DEFAULT_DYNAMIC_TP = os.environ.get("DYNAMIC_TP", "true").strip().lower() in ("true", "1")
 DEFAULT_AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").strip().lower() in ("true", "1")
 DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "70.0"))
-
-# Параметры режима «Скан действий китов»
-DEFAULT_WHALE_MIN_SCORE = float(os.environ.get("WHALE_MIN_SCORE", "60"))
-DEFAULT_WHALE_AUTOSCAN = os.environ.get("WHALE_AUTOSCAN", "true").strip().lower() in ("true", "1")
-DEFAULT_WHALE_TOP_N = int(os.environ.get("WHALE_TOP_N", "30"))
 
 IS_CI = (
     os.environ.get("GITHUB_ACTIONS") == "true"
@@ -779,14 +763,10 @@ def default_state() -> dict:
             "take_profit_pct": DEFAULT_TAKE_PROFIT,
             "max_open_trades": 3,
             "trade_min_score": DEFAULT_TRADE_MIN_SCORE,
-            # ── Режим «Скан действий китов» ──
-            "whale_autoscan": DEFAULT_WHALE_AUTOSCAN,
-            "whale_min_score": DEFAULT_WHALE_MIN_SCORE,
         },
         "active_trades": {},      # symbol -> trade dict
         "trade_history": [],      # list of closed trades
         "sent_alerts": {},        # pump alert_key -> timestamp
-        "sent_whale_alerts": {},  # whale alert_key -> timestamp
         "allowed_chats": [],
     }
 
@@ -808,8 +788,6 @@ def load_state() -> dict:
             d["sent_alerts"] = {k: now for k in sent}
         elif isinstance(sent, dict):
             d["sent_alerts"] = sent
-        sent_w = data.get("sent_whale_alerts", {})
-        d["sent_whale_alerts"] = sent_w if isinstance(sent_w, dict) else {}
         d["allowed_chats"] = list(set(data.get("allowed_chats", [])))
     except Exception as e:
         print(f"Не удалось прочитать {STATE_FILE}: {e}", file=sys.stderr)
@@ -832,7 +810,6 @@ def save_state(state: dict, sync_git: bool = False) -> None:
         # Очищаем устаревшие алерты (старше 24ч)
         cutoff = int(time.time()) - 86400
         state["sent_alerts"] = {k: ts for k, ts in state["sent_alerts"].items() if ts > cutoff}
-        state["sent_whale_alerts"] = {k: ts for k, ts in state["sent_whale_alerts"].items() if ts > cutoff}
 
         tmp = STATE_FILE + ".tmp"
         try:
@@ -2944,7 +2921,6 @@ def settings_text(state: dict) -> str:
         entry_label = f"🎯 Откат -{entry_pb:.1f}% (лимитный вход)"
 
     auto_trade_label = f"🟢 Включена (+{tp_pct:.1f}% TP, -{sl_pct:.1f}% SL)" if s.get("auto_trade", False) else "🔴 Выключена"
-    whale_scan_label = "🟢 Включён" if s.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN) else "🔴 Выключен"
     interval_m = s.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL) // 60
 
     api_key, api_secret = get_api_credentials(state)
@@ -2974,9 +2950,6 @@ def settings_text(state: dict) -> str:
         f"• <b>Stop-Loss:</b> <code>-{sl_pct:.1f}%</code>\n"
         f"• <b>Trailing Stop:</b> автоподтяжка при <code>+{trail_act:.1f}%</code> (отступ <code>{trail_dist:.1f}%</code>)\n"
         f"• <b>Статус API Binance:</b> {api_status}\n\n"
-        "<b>🐋 Скан действий китов:</b>\n"
-        f"• <b>Автоскан китов:</b> {whale_scan_label}\n"
-        f"• <b>Порог Whale Score:</b> <code>{s.get('whale_min_score', DEFAULT_WHALE_MIN_SCORE):.0f}</code>\n\n"
         "<i>Используйте кнопки ниже для быстрой настройки:</i>"
     )
 
@@ -2986,7 +2959,6 @@ def settings_inline_kb(state: dict) -> dict:
     filter_label = "🔔 Сигналы: Только Strong" if s.get("filter_level") == "strong_only" else "🔔 Сигналы: Strong + Watch"
     autotrade_label = "🔴 Выключить автоторговлю" if s.get("auto_trade", False) else "⚡ Включить автоторговлю"
     dyn_tp_btn_label = "🧮 Выкл умный ATR TP" if s.get("dynamic_tp", DEFAULT_DYNAMIC_TP) else "🧮 Вкл умный ATR TP"
-    whale_autoscan_label = "🔴 Выключить скан китов" if s.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN) else "🐋 Включить скан китов"
 
     trade_mode = s.get("trade_mode", "fixed")
     cur_sl = float(s.get("stop_loss_pct", DEFAULT_STOP_LOSS))
@@ -3074,18 +3046,6 @@ def settings_inline_kb(state: dict) -> dict:
                 {"text": filter_label, "callback_data": "filter:toggle"},
             ],
             [
-                {"text": whale_autoscan_label, "callback_data": "whale:toggle"},
-            ],
-            [
-                {"text": "🐋 Порог −5", "callback_data": "whale:score:-5"},
-                {"text": "🐋 Порог +5", "callback_data": "whale:score:+5"},
-            ],
-            [
-                {"text": "🐋 55", "callback_data": "whale:score:set:55"},
-                {"text": "🐋 65 (базовый)", "callback_data": "whale:score:set:65"},
-                {"text": "🐋 75 (строгий)", "callback_data": "whale:score:set:75"},
-            ],
-            [
                 {"text": "⏱ 3 мин", "callback_data": "interval:180"},
                 {"text": "⏱ 5 мин", "callback_data": "interval:300"},
                 {"text": "⏱ 10 мин", "callback_data": "interval:600"},
@@ -3157,51 +3117,22 @@ def trade_buy_amount_kb(symbol: str, state: dict) -> dict:
         ]]
     }
 
-def whale_inline_kb(sig) -> dict:
-    """Клавиатура для карточки whale-сигнала (sig — объект whale_scan.WhaleSignal)."""
-    base = sig.base
-    binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
-    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sig.symbol}"
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📊 Binance Spot", "url": binance_url},
-                {"text": "📈 TradingView", "url": tv_url},
-            ],
-            [
-                {"text": "🔎 Детали китов", "callback_data": f"whale:details:{sig.symbol}"},
-            ],
-            [
-                {"text": f"➕ Добавить {base} в портфель", "callback_data": f"add_coin:{sig.symbol}:{sig.price}"},
-                {"text": "🐋 Проверить другую монету", "callback_data": "whale:symbol_prompt"},
-            ],
-        ]
-    }
 
 HELP_TEXT = (
-    "<b>🚀 Pump Pulse Scanner 2.1 & Binance Spot Trader + Whale Scan</b>\n\n"
+    "<b>🚀 Pump Pulse Scanner 2.1 & Binance Spot Trader</b>\n\n"
     "Бот отслеживает аномальную активность на спотовом рынке Binance (USDT-пары) "
     "и поддерживает автоматическую покупку с мгновенным выставлением Take-Profit (+3%).\n\n"
     "<b>📌 Основные функции:</b>\n"
     "• <b>🔍 Скан сейчас</b> (/scan) — сканирование всего спота прямо сейчас.\n"
-    "• <b>🐋 Скан китов</b> (/whale) — детектор крупных сделок (от $100k) на споте.\n"
-    "• <b>🐋 /whale BTC</b> — мгновенный глубокий анализ китов по одной монете.\n"
     "• <b>💼 Портфель</b> (/portfolio) — баланс Binance, активные сделки и PnL.\n"
     "• <b>⚡ Торговля</b> (/trade) — статус автоторговли и история профита.\n"
+    "• <b>🎯 Автопродажи</b> (/targetsell) — настройка целевой цены продажи (TP).\n"
     "• <b>➕ Добавить актив</b> (/add) — внести купленную монету вручную.\n"
     "• <b>🗑 Удалить актив</b> (/del) — убрать позицию в 1 клик.\n"
     "• <b>⚙️ Настройки</b> (/settings) — включение автоторговли, размер ставки и TP.\n"
     "• <b>🔑 Привязка API</b> (/api) — настройка Binance API ключей.\n\n"
-    "<b>🐋 Как работает «Скан действий китов»:</b>\n"
-    "1. За окно 15 минут анализируются агрегированные сделки (aggTrades) топ-30 пар по ликвидности.\n"
-    "2. «Принт кита» — сделка от $100 000 и одновременно ≥ 25× медианы пары.\n"
-    "3. Считаются 7 факторов (100 баллов): доля китов в потоке (25), чистый поток BUY−SELL (25), "
-    "концентрация топ-20 принтов (15), доминирование покупок (10), ускорение размера сделок (10), "
-    "стены в стакане (10), подтверждение фьючерсами OI/Taker (5).\n"
-    "4. Оценки: 🐋 АККУМУЛЯЦИЯ (киты набирают — бычий сигнал), РАЗГРУЗКА (киты продают — не входить!), АКТИВНОСТЬ.\n"
-    "5. Работает и как режим в этом боте (кнопка 🐋 + автоскан), и как отдельный workflow whale-scan.yml.\n\n"
     "<b>⚡ Как работает спотовая автоторговля:</b>\n"
-    "1. При обнаружении подтверждённого импульса (Score 74+, STRONG) или аккумуляции китов бот проверяет свободный USDT-баланс.\n"
+    "1. При обнаружении подтверждённого импульса (Score 74+, STRONG) бот проверяет свободный USDT-баланс.\n"
     "2. На бирже размещается спотовый MARKET BUY ордер на указанную сумму (~11 USDT).\n"
     "3. Сразу же выставляется лимитный ордер на продажу (LIMIT SELL GTC) с профитом +3%.\n"
     "4. Когда цена доходит до цели, ордер исполняется и средства автоматически возвращаются в USDT!\n\n"
@@ -3295,7 +3226,6 @@ def set_bot_commands(token: str) -> None:
         {"command": "menu", "description": "📋 Открыть клавиатуру меню"},
         {"command": "hide", "description": "🙈 Скрыть клавиатуру"},
         {"command": "scan", "description": "Сканер спота сейчас"},
-        {"command": "whale", "description": "🐋 Скан действий китов"},
         {"command": "portfolio", "description": "Портфель и PnL"},
         {"command": "trade", "description": "Статус автоторговли и профит"},
         {"command": "targetsell", "description": "🎯 Автопродажа по целевой цене"},
@@ -3355,157 +3285,9 @@ def format_factor_breakdown(sig: PumpSignal, tf: str) -> str:
         lines += [f"  • {r}" for r in row.risks]
     return "\n".join(lines)
 
-# ───────────────────────── Режим «Скан действий китов» (интеграция) ─────────────────────────
-
-def execute_whale_scan_and_report(token: str, chat_id: Union[str, int], state: dict) -> None:
-    """Запуск полного скана китов по топ-парам с отправкой результатов в чат."""
-    if not WHALE_MODULE_OK:
-        send_telegram(token, chat_id, "⚠️ Модуль <code>whale_scan.py</code> не найден рядом с ботом. Добавьте файл в репозиторий.", reply_markup=main_keyboard())
-        return
-    status_msg_id = send_telegram(token, chat_id, "🐋 <i>Сканирую крупные сделки (китов) на спотовом рынке Binance... Подождите.</i>")
-    try:
-        s = state["settings"]
-        signals, meta = ws.run_whale_scan(
-            min_score=s.get("whale_min_score", DEFAULT_WHALE_MIN_SCORE),
-            top_n=DEFAULT_WHALE_TOP_N,
-        )
-        duration = meta["duration_ms"] / 1000.0
-        if signals:
-            summary_text = (
-                f"🐋 <b>Скан китов завершён за {duration:.1f}с</b>\n\n"
-                f"• Проверено пар: <code>{meta['universe']}</code>\n"
-                f"• Просканировано топ-пар: <code>{meta['scanned']}</code>\n"
-                f"• Порог Whale Score: <code>{meta['min_score']:.0f}</code>\n"
-                f"• Активность китов найдена: <b>{len(signals)}</b>\n\n"
-                f"Ниже — подробные карточки:"
-            )
-            if status_msg_id:
-                edit_message(token, chat_id, status_msg_id, summary_text)
-            else:
-                send_telegram(token, chat_id, summary_text)
-            for sig in signals[:5]:
-                send_telegram(token, chat_id, ws.format_whale_alert(sig), reply_markup=whale_inline_kb(sig))
-                time.sleep(0.15)
-            send_telegram(token, chat_id, "🔘 Скан китов завершён. Главное меню активно:", reply_markup=main_keyboard())
-        else:
-            near_lines = "\n".join(
-                f"{i}. <b>{n['base']}</b> — score <code>{n['score']:.0f}</code>, "
-                f"поток {n['net_flow_pct']:+.0f}%, доля китов {n['whale_share']*100:.0f}% "
-                f"({n['whale_buys']}B/{n['whale_sells']}S)"
-                for i, n in enumerate(meta["near"][:4], 1)
-            ) or "<i>нет данных</i>"
-            report_text = (
-                f"🐋 <b>Скан китов завершён за {duration:.1f}с</b>\n\n"
-                f"• Просканировано топ-пар: <code>{meta['scanned']}</code>\n"
-                f"• Порог Whale Score: <code>{meta['min_score']:.0f}</code>\n"
-                f"• Сигналов: <b>0</b> <i>(киты спят)</i>\n\n"
-                f"<b>Ближайшие к порогу:</b>\n{near_lines}\n\n"
-                f"💡 <i>Снизьте порог кнопками 🐋 в Настройках, чтобы ловить активность раньше.</i>"
-            )
-            if status_msg_id:
-                edit_message(token, chat_id, status_msg_id, report_text)
-            else:
-                send_telegram(token, chat_id, report_text)
-            send_telegram(token, chat_id, "🔘 Главное меню активно:", reply_markup=main_keyboard())
-    except Exception as e:
-        print(f"❌ Ошибка скана китов: {e}", file=sys.stderr)
-        traceback.print_exc()
-        send_telegram(token, chat_id, f"⚠️ <b>Ошибка скана китов:</b>\n<code>{e}</code>", reply_markup=main_keyboard())
-
-def whale_deep_dive(token: str, chat_id: Union[str, int], symbol: str) -> None:
-    """Глубокий анализ китов по одной монете (команда /whale BTC или кнопка «Детали китов»)."""
-    if not WHALE_MODULE_OK:
-        send_telegram(token, chat_id, "⚠️ Модуль <code>whale_scan.py</code> не найден.", reply_markup=main_keyboard())
-        return
-    symbol = normalize_symbol(symbol)
-    status_msg_id = send_telegram(token, chat_id, f"🐋 <i>Загружаю последние крупные сделки {symbol}...</i>")
-    try:
-        sig = ws.deep_dive(symbol)
-        if not sig:
-            text = (f"⚠️ Не удалось загрузить сделки по <code>{symbol}</code> "
-                    f"(пара не найдена на споте или биржа недоступна).")
-            if status_msg_id:
-                edit_message(token, chat_id, status_msg_id, text)
-            else:
-                send_telegram(token, chat_id, text)
-            return
-        text = ws.format_whale_detail(sig)
-        if status_msg_id:
-            edit_message(token, chat_id, status_msg_id, text, reply_markup=whale_inline_kb(sig))
-        else:
-            send_telegram(token, chat_id, text, reply_markup=whale_inline_kb(sig))
-    except Exception as e:
-        print(f"❌ Ошибка детализации китов: {e}", file=sys.stderr)
-        send_telegram(token, chat_id, f"⚠️ <b>Ошибка анализа:</b>\n<code>{e}</code>", reply_markup=main_keyboard())
-
-def run_whale_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
-    """Разовый whale-скан для CLI: python pump_bot.py --whale"""
-    print("=== Режим разового скана китов (Whale Oneshot) ===")
-    if not WHALE_MODULE_OK:
-        print("❌ Модуль whale_scan.py недоступен", file=sys.stderr)
-        return
-    state = load_state()
-    min_score = state.get("settings", {}).get("whale_min_score", DEFAULT_WHALE_MIN_SCORE)
-    signals, meta = ws.run_whale_scan(min_score=min_score, top_n=DEFAULT_WHALE_TOP_N)
-    print(f"Whale scan: {meta['duration_ms']/1000:.1f}с, scanned={meta['scanned']}, сигналов={len(signals)}")
-    if not token or not chat_id:
-        for s in signals:
-            print(f"[{s.grade.upper()}] {s.symbol} score={s.score:.0f} net_flow={s.net_flow_pct:+.0f}% "
-                  f"share={s.whale_share*100:.0f}% prints={s.whale_buys}B/{s.whale_sells}S")
-        for n in meta["near"][:5]:
-            print(f"  ~ {n['base']}: score={n['score']:.0f} (порог {meta['min_score']:.0f})")
-        return
-    now = int(time.time())
-    sent: dict = state.setdefault("sent_whale_alerts", {})
-    target_chats: Set[str] = set()
-    if chat_id and (str(chat_id).lstrip("-").isdigit() or str(chat_id).startswith("@")):
-        target_chats.add(str(chat_id))
-    for c in state.get("allowed_chats", []):
-        cid_str = str(c).strip()
-        if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
-            target_chats.add(cid_str)
-    sent_count = 0
-    w_sym_cd = state.setdefault("whale_symbol_cooldown", {})
-    for sig in signals:
-        if sig.alert_key in sent:
-            print(f"• Пропуск {sig.symbol}: алерт за этот час уже отправлен")
-            continue
-        if now - int(w_sym_cd.get(sig.symbol, 0)) < 1800:
-            print(f"• Пропуск {sig.symbol}: кулдаун 30 мин (анти-спам)")
-            continue
-        sent[sig.alert_key] = now
-        w_sym_cd[sig.symbol] = now
-        sent_count += 1
-        for cid in target_chats:
-            ok = send_telegram(token, cid, ws.format_whale_alert(sig), reply_markup=whale_inline_kb(sig))
-            print(f"• {sig.symbol} ({sig.grade} {sig.score:.0f}) → {cid}: {'sent' if ok else 'fail'}")
-    if sent_count > 0:
-        save_state(state)
-        print(f"Отправлено новых whale-сигналов: {sent_count}")
-    else:
-        print("Новых whale-сигналов нет.")
-        is_manual = (
-            os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-            or os.environ.get("NOTIFY_EMPTY", "false").lower() in ("true", "1")
-            or "--notify-always" in sys.argv
-        )
-        if is_manual:
-            near_lines = "\n".join(
-                f"  • {n['base']}: score {n['score']:.0f}, поток {n['net_flow_pct']:+.0f}%, доля китов {n['whale_share']*100:.0f}%"
-                for n in meta["near"][:4]
-            ) or "  —"
-            msg = (
-                f"🐋 <b>Whale Scan — отчёт</b>\n\n"
-                f"• Просканировано топ-пар: <code>{meta['scanned']}</code>\n"
-                f"• Порог Whale Score: <code>{min_score:.0f}</code>\n"
-                f"• Сигналов: <b>0</b> <i>(киты спят)</i>\n\n"
-                f"<b>Ближайшие к порогу:</b>\n{near_lines}"
-            )
-            for cid in target_chats:
-                send_telegram(token, cid, msg)
-            print("Отправлен статус-отчёт whale-сканера.")
 
 # ───────────────────────── Одноразовый отчёт (для CI) ─────────────────────────
+
 
 def execute_scan_and_report(
     token: str,
@@ -3734,56 +3516,9 @@ def autoscan_worker(token: str, primary_chat_id: Union[str, int], state: dict, s
                         except Exception as e:
                             print(f"[AutoTrade Error for {sig.symbol}]: {e}", file=sys.stderr)
 
-            # 2. Режим «Скан действий китов» (совместный: свои алерты + опционально автоторговля)
-            new_whale_count = 0
-            if WHALE_MODULE_OK and settings.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN):
-                try:
-                    whale_signals, _wmeta = ws.run_whale_scan(
-                        min_score=settings.get("whale_min_score", DEFAULT_WHALE_MIN_SCORE),
-                        top_n=DEFAULT_WHALE_TOP_N,
-                    )
-                    sent_whales: dict = state.setdefault("sent_whale_alerts", {})
-                    whale_sym_cd: dict = state.setdefault("whale_symbol_cooldown", {})
-                    for wsig in whale_signals:
-                        if wsig.alert_key in sent_whales:
-                            continue
-                        if now - int(whale_sym_cd.get(wsig.symbol, 0)) < 1800:
-                            continue
-                        sent_whales[wsig.alert_key] = now
-                        whale_sym_cd[wsig.symbol] = now
-                        new_whale_count += 1
-                        wtext = ws.format_whale_alert(wsig)
-                        wkb = whale_inline_kb(wsig)
-                        for cid in target_chats:
-                            try:
-                                send_telegram(token, cid, wtext, reply_markup=wkb)
-                            except Exception as e:
-                                print(f"Ошибка отправки whale-алерта в {cid}: {e}", file=sys.stderr)
-
-                        # Совместный режим: автопокупка по подтверждённой аккумуляции китов
-                        if (settings.get("auto_trade", False)
-                                and wsig.grade == "accumulation"
-                                and wsig.score >= settings.get("trade_min_score", DEFAULT_TRADE_MIN_SCORE)):
-                            if primary_str:
-                                try:
-                                    print(f"[WhaleScan] Автопокупка по китам {wsig.symbol} (score {wsig.score:.1f})...")
-                                    whale_sig = PumpSignal(
-                                        symbol=wsig.symbol, base=wsig.base, price=wsig.price,
-                                        change_24h=0.0, quote_volume_24h=0.0,
-                                        high_24h=wsig.price, low_24h=wsig.price,
-                                        btc_relative_24h=0.0, best_tf="whale",
-                                        best_score=wsig.score, grade="strong",
-                                        alert_key=f"whale_trade_{wsig.symbol}_{now}", by_tf=[],
-                                    )
-                                    execute_pump_auto_trade(token, primary_str, state, whale_sig)
-                                except Exception as e:
-                                    print(f"[WhaleScan AutoTrade Error for {wsig.symbol}]: {e}", file=sys.stderr)
-                except Exception as e:
-                    print(f"[WhaleScan Error]: {e}", file=sys.stderr)
-
-            if new_alerts_count > 0 or new_whale_count > 0:
+            if new_alerts_count > 0:
                 save_state(state, sync_git=True)
-                print(f"[Autoscan] Новых сигналов: pump={new_alerts_count}, whale={new_whale_count}, чатов: {len(target_chats)}")
+                print(f"[Autoscan] Новых сигналов: pump={new_alerts_count}, чатов: {len(target_chats)}")
 
         except Exception as e:
             print(f"[Autoscan Error]: {e}", file=sys.stderr)
@@ -3853,14 +3588,12 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
         trade_thread.start()
 
     welcome = (
-        "<b>👋 Приветствую в Pump Pulse Scanner 2.1 + Whale Scan!</b>\n\n"
+        "<b>👋 Приветствую в Pump Pulse Scanner 2.1!</b>\n\n"
         "Я сканирую спотовый рынок Binance (USDT-пары) в реальном времени "
         "и мгновенно сообщу о зарождении пампа (Score 58-74+, ДО выстрела).\n"
-        "Также умею детектировать <b>действия китов</b> (крупные сделки от $100k) и "
-        "автоматически торговать на вашем Binance Spot с TP +3%.\n\n"
-        "🐋 <b>Новинка:</b> кнопка «Скан китов» в меню и команда /whale.\n\n"
+        "Также умею автоматически торговать на вашем Binance Spot с TP +3%.\n\n"
         "• Выберите действие кнопками ниже\n"
-        "• Или напишите: <code>scan</code>, <code>whale</code>, <code>whale SOL</code>, <code>portfolio</code> и т.д."
+        "• Или напишите: <code>scan</code>, <code>portfolio</code>, <code>trade</code> и т.д."
     )
     send_telegram(token, chat_id, welcome, reply_markup=main_keyboard())
 
@@ -4003,11 +3736,6 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     )
                     return
 
-                if cur_st == "waiting_whale_symbol":
-                    user_fsm.pop(chat_id_local, None)
-                    whale_deep_dive(token, chat_id_local, text)
-                    return
-
                 if cur_st == "waiting_target_price":
                     data = st.get("data", {})
                     symbol = data.get("symbol", "")
@@ -4067,7 +3795,6 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
             is_menu_action = (
                 "скан" in text_lower
-                or "кит" in text_lower
                 or "portfolio" in text_lower
                 or "портфел" in text_lower
                 or "добав" in text_lower
@@ -4093,17 +3820,9 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 print(f"-> Настройки для {chat_id_local}")
                 send_telegram(token, chat_id_local, settings_text(state), reply_markup=settings_inline_kb(state))
 
-            elif cmd in ("scan", "скан") or (is_menu_action and "скан" in text_lower and "кит" not in text_lower):
+            elif cmd in ("scan", "скан") or (is_menu_action and "скан" in text_lower):
                 print(f"-> Скан для {chat_id_local}")
                 execute_scan_and_report(token, chat_id_local, state)
-
-            elif cmd == "whale" or "кит" in text_lower:
-                print(f"-> Запуск скана китов для {chat_id_local}")
-                args = clean_text.split()[1:]
-                if args:
-                    whale_deep_dive(token, chat_id_local, args[0])
-                else:
-                    execute_whale_scan_and_report(token, chat_id_local, state)
 
             elif cmd in ("portfolio", "портфель") or (is_menu_action and "портфел" in text_lower):
                 print(f"-> Портфель для {chat_id_local}")
@@ -4129,8 +3848,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     f"• API-ключи: {api_status}",
                     f"• Размер ставки: <code>{trade_amt:.1f} USDT</code>",
                     f"• Тейк-профит: <code>+{tp_pct:.1f}%</code>",
-                    f"• Открытых сделок: <code>{len(active)}/3</code>",
-                    f"• Автоскан китов: <code>{'🟢' if settings.get('whale_autoscan', True) else '🔴'}</code>\n",
+                    f"• Открытых сделок: <code>{len(active)}/3</code>\n",
                 ]
                 if active:
                     lines.append("<b>🎯 Активные сделки:</b>")
@@ -4274,9 +3992,8 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     "🤔 Не распознал команду.\n\n"
                     "Попробуйте:\n"
                     "• <code>scan</code> — сканер пампов\n"
-                    "• <code>whale</code> — скан китов\n"
-                    "• <code>whale SOL</code> — анализ китов по монете\n"
                     "• <code>portfolio</code> — портфель\n"
+                    "• <code>trade</code> — автоторговля\n"
                     "• или кнопки меню ниже ⬇️"
                 )
                 send_telegram(token, chat_id_local, hint, reply_markup=main_keyboard())
@@ -4628,47 +4345,6 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     reply_markup=cancel_keyboard(),
                 )
 
-            # ── Режим «Скан действий китов» ──
-            elif cb_data == "whale:toggle":
-                settings["whale_autoscan"] = not settings.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN)
-                save_state(state)
-                st_str = "включён 🟢" if settings["whale_autoscan"] else "выключен 🔴"
-                answer_callback(token, cb_id, f"Скан китов {st_str}")
-                if msg_id:
-                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
-
-            elif cb_data.startswith("whale:score:"):
-                part = cb_data.rsplit(":", 1)[-1]
-                if part == "-5":
-                    settings["whale_min_score"] = max(30.0, settings.get("whale_min_score", DEFAULT_WHALE_MIN_SCORE) - 5)
-                elif part == "+5":
-                    settings["whale_min_score"] = min(95.0, settings.get("whale_min_score", DEFAULT_WHALE_MIN_SCORE) + 5)
-                else:
-                    settings["whale_min_score"] = float(part)
-                save_state(state)
-                answer_callback(token, cb_id, f"Whale Score порог: {settings['whale_min_score']:.0f}")
-                if msg_id:
-                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
-
-            elif cb_data == "whale:scan_now":
-                answer_callback(token, cb_id, "Сканирую действия китов...")
-                execute_whale_scan_and_report(token, cb_chat, state)
-
-            elif cb_data == "whale:symbol_prompt":
-                answer_callback(token, cb_id)
-                user_fsm[cb_chat] = {"state": "waiting_whale_symbol", "data": {}}
-                send_telegram(
-                    token, cb_chat,
-                    "🐋 <b>Проверка конкретной монеты</b>\n\n"
-                    "Введите тикер (например <code>BTC</code>, <code>SOL</code> или <code>PEPE</code>):",
-                    reply_markup=cancel_keyboard(),
-                )
-
-            elif cb_data.startswith("whale:details:"):
-                sym = cb_data.split(":", 2)[2]
-                answer_callback(token, cb_id, f"Анализ китов: {ws.base_of(sym) if WHALE_MODULE_OK else sym}")
-                whale_deep_dive(token, cb_chat, sym)
-
             elif cb_data.startswith("add_coin:"):
                 parts = cb_data.split(":")
                 symbol = parts[1]
@@ -4739,9 +4415,6 @@ def run_test_connection() -> None:
             print(f"✅ BTC: {fmt_price(btc['lastPrice'])} USDT (24ч: {fmt_pct(btc['priceChangePercent'])})")
         raw = fetch_klines("BTCUSDT", limit=3)
         print(f"✅ Klines BTCUSDT: {len(raw)} баров")
-        if WHALE_MODULE_OK:
-            sig = ws.deep_dive("BTC")
-            print(f"✅ Whale deep_dive BTC: {'OK' if sig else 'нет данных'}")
         print("\n🎉 Все системные проверки пройдены успешно!")
     except Exception as e:
         print(f"❌ Ошибка: {e}", file=sys.stderr)
@@ -4779,9 +4452,6 @@ def main() -> None:
         return
     if "--test-trade" in sys.argv:
         run_test_trade()
-        return
-    if "--whale" in sys.argv:
-        run_whale_oneshot(token, chat_id)
         return
 
     if RUN_MODE == "oneshot" or "--oneshot" in sys.argv:
