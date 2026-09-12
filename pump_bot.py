@@ -1325,19 +1325,22 @@ def execute_pump_auto_trade(
         send_telegram(token, chat_id, msg)
         return {"error": "Insufficient USDT balance"}
 
-    if trade_amt < 1.0:
-        msg = (
-            f"⚠️ <b>Слишком маленькая ставка:</b> <code>{trade_amt:.4f} USDT</code>\n"
-            f"Минимальная сумма для торговли — <code>1 USDT</code>.\n"
-            f"Пополните баланс или увеличьте процент ставки."
-        )
-        send_telegram(token, chat_id, msg)
-        return {"error": "Trade amount too small"}
-
     # Получение фильтров торговой пары
     filters = get_symbol_filters(sig.symbol)
     if filters.get("status") != "TRADING":
         return {"error": f"Пара {sig.symbol} временно не торгуется на бирже"}
+
+    min_notional = float(filters.get("min_notional", 5.0))
+    if trade_amt < min_notional:
+        msg = (
+            f"⚠️ <b>Сумма ордера меньше минимума биржи!</b>\n\n"
+            f"• Выбранная сумма: <code>{trade_amt:.2f} USDT</code>\n"
+            f"• Минимальный ордер Binance для {sig.base}/USDT: <code>{min_notional:.1f} USDT</code>\n"
+            f"• Свободно на споте: <code>{free_usdt:.2f} USDT</code>\n\n"
+            f"💡 <i>Биржа Binance требует минимум {min_notional:.0f} USDT на один ордер. Пополните баланс спота хотя бы до {min_notional:.0f} USDT.</i>"
+        )
+        send_telegram(token, chat_id, msg)
+        return {"error": f"Filter failure: NOTIONAL (amount {trade_amt:.2f} < min {min_notional:.1f} USDT)"}
 
     step_size = filters.get("step_size", 1.0)
     tick_size = filters.get("tick_size", 0.01)
@@ -1349,6 +1352,25 @@ def execute_pump_auto_trade(
         limit_buy_price_str = fmt_price_filter(limit_buy_price_raw, tick_size)
         raw_qty = trade_amt / float(limit_buy_price_str)
         qty_str = fmt_qty_filter(raw_qty, step_size)
+
+        # Проверяем, что итоговая сумма не упала ниже min_notional из-за округления вниз
+        total_limit_cost = float(qty_str) * float(limit_buy_price_str)
+        if total_limit_cost < min_notional:
+            # Округляем на один шаг вверх, если позволяет баланс
+            raw_qty_ceil = math.ceil(min_notional / float(limit_buy_price_str) / step_size) * step_size
+            qty_ceil_str = fmt_qty_filter(raw_qty_ceil, step_size)
+            if float(qty_ceil_str) * float(limit_buy_price_str) <= free_usdt:
+                qty_str = qty_ceil_str
+            else:
+                msg = (
+                    f"⚠️ <b>Сумма лимитной покупки {sig.base}/USDT меньше минимума биржи!</b>\n\n"
+                    f"• Рассчитано: <code>{total_limit_cost:.2f} USDT</code> ({qty_str} {sig.base} × {limit_buy_price_str} $)\n"
+                    f"• Минимум биржи: <code>{min_notional:.1f} USDT</code>\n"
+                    f"• Доступно на балансе: <code>{free_usdt:.2f} USDT</code>\n\n"
+                    f"💡 <i>Пополните баланс хотя бы до {min_notional:.0f} USDT для покупки.</i>"
+                )
+                send_telegram(token, chat_id, msg)
+                return {"error": f"Filter failure: NOTIONAL (limit cost {total_limit_cost:.2f} < min {min_notional:.1f} USDT)"}
 
         if float(qty_str) <= 0:
             return {"error": "Quantity calculation zero"}
@@ -3090,13 +3112,15 @@ def trade_buy_amount_kb(symbol: str, state: dict) -> dict:
     default_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
     free_usdt = get_free_usdt_balance(state)
     base = base_asset(symbol)
+    filters = get_symbol_filters(symbol)
+    min_notional = float(filters.get("min_notional", 5.0))
 
-    # Пресеты: фиксированные + «весь баланс»
-    presets = [5, 10, 25, 50]
+    # Пресеты: показываем только суммы >= min_notional и вмещающиеся в баланс
+    presets = [5, 10, 25, 50, 100]
     preset_rows = []
     row = []
     for amt in presets:
-        if amt <= free_usdt + 0.5:          # показываем только то, что вмещает баланс
+        if amt >= min_notional and amt <= free_usdt + 0.5:
             marker = " ✅" if abs(amt - default_amt) < 0.5 else ""
             row.append({"text": f"{amt}${marker}", "callback_data": f"trade_buy_amt:{symbol}:{amt}"})
         if len(row) == 4:
@@ -3105,9 +3129,9 @@ def trade_buy_amount_kb(symbol: str, state: dict) -> dict:
     if row:
         preset_rows.append(row)
 
-    # Кнопка «весь свободный баланс»
+    # Кнопка «весь свободный баланс» (только если баланс покрывает минимум биржи)
     all_row = []
-    if free_usdt >= 1.0:
+    if free_usdt >= min_notional:
         all_row.append({"text": f"💰 Весь баланс ({free_usdt:.1f}$)", "callback_data": f"trade_buy_amt:{symbol}:all"})
     all_row.append({"text": "✍️ Ввести вручную", "callback_data": f"trade_buy_custom_amt:{symbol}"})
 
@@ -3210,11 +3234,11 @@ def edit_message(token: str, chat_id: Union[str, int], message_id: int, text: st
     except Exception as e:
         print(f"Telegram edit error: {e}", file=sys.stderr)
 
-def answer_callback(token: str, callback_id: str, text: Optional[str] = None) -> None:
-    payload = {"callback_query_id": callback_id}
+def answer_callback(token: str, callback_id: str, text: Optional[str] = None, show_alert: bool = False) -> None:
+    payload: Dict[str, Any] = {"callback_query_id": callback_id}
     if text:
         payload["text"] = text
-        payload["show_alert"] = False
+        payload["show_alert"] = show_alert
     try:
         api_call(token, "answerCallbackQuery", payload, retries=1)
     except Exception:
@@ -3746,6 +3770,8 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 if cur_st == "waiting_buy_amount":
                     data = st.get("data", {})
                     sym = data.get("symbol", "")
+                    filters = get_symbol_filters(sym)
+                    min_notional = float(filters.get("min_notional", 5.0))
                     try:
                         chosen_amt = float(text.replace(",", ".").replace("$", "").strip())
                         if chosen_amt <= 0:
@@ -3754,6 +3780,16 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                         send_telegram(
                             token, chat_id_local,
                             "❌ Неверная сумма. Введите число, например: <code>15</code>",
+                            reply_markup=cancel_keyboard(),
+                        )
+                        return
+                    if chosen_amt < min_notional:
+                        send_telegram(
+                            token, chat_id_local,
+                            f"⚠️ <b>Сумма меньше минимума биржи!</b>\n\n"
+                            f"• Введено: <code>{chosen_amt:.2f} USDT</code>\n"
+                            f"• Минимум на Binance: <code>{min_notional:.0f} USDT</code>\n\n"
+                            f"Введите сумму от <code>{min_notional:.0f}</code> USDT:",
                             reply_markup=cancel_keyboard(),
                         )
                         return
@@ -4282,11 +4318,23 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 answer_callback(token, cb_id, f"Выберите сумму для {base_sym}")
                 free_usdt = get_free_usdt_balance(state)
                 default_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
+                filters = get_symbol_filters(sym)
+                min_notional = float(filters.get("min_notional", 5.0))
+
+                low_balance_warn = ""
+                if free_usdt < min_notional:
+                    low_balance_warn = (
+                        f"\n⚠️ <i>Баланс ({free_usdt:.2f} USDT) меньше минимума ордера Binance ({min_notional:.0f} USDT). "
+                        f"Пополните баланс спота для покупки.</i>\n"
+                    )
+
                 prompt = (
                     f"⚡ <b>Купить {base_sym}/USDT</b>\n\n"
                     f"💵 Текущая цена: <code>{fmt_price(mkt_p)} USDT</code>\n"
                     f"💰 Свободный баланс: <code>{free_usdt:.2f} USDT</code>\n"
-                    f"⚙️ Сумма по умолчанию (из настроек): <code>{default_amt:.0f}$</code>\n\n"
+                    f"⚙️ Сумма по умолчанию: <code>{default_amt:.0f}$</code>\n"
+                    f"📏 Мин. ордер Binance: <code>{min_notional:.0f} USDT</code>\n"
+                    f"{low_balance_warn}\n"
                     f"Выберите сумму покупки:"
                 )
                 kb = trade_buy_amount_kb(sym, state)
@@ -4301,13 +4349,24 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 sym = parts[1]
                 amt_str = parts[2] if len(parts) > 2 else "all"
                 base_sym = base_asset(sym)
+                filters = get_symbol_filters(sym)
+                min_notional = float(filters.get("min_notional", 5.0))
                 free_usdt = get_free_usdt_balance(state)
                 if amt_str == "all":
                     chosen_amt = max(0.0, free_usdt - 0.01)
                 else:
                     chosen_amt = float(amt_str)
-                if chosen_amt < 1.0:
-                    answer_callback(token, cb_id, "❌ Недостаточно средств")
+                if chosen_amt < min_notional:
+                    answer_callback(token, cb_id, f"❌ Минимум {min_notional:.0f}$ (у вас {free_usdt:.2f}$)", show_alert=True)
+                    send_telegram(
+                        token, cb_chat,
+                        f"⚠️ <b>Сумма покупки меньше минимума биржи!</b>\n\n"
+                        f"• Выбранная сумма: <code>{chosen_amt:.2f} USDT</code>\n"
+                        f"• Минимальный ордер Binance: <code>{min_notional:.1f} USDT</code>\n"
+                        f"• Свободно на споте: <code>{free_usdt:.2f} USDT</code>\n\n"
+                        f"💡 <i>Пополните баланс USDT на Binance хотя бы до {min_notional:.0f} USDT.</i>",
+                        reply_markup=main_keyboard(),
+                    )
                     return
                 answer_callback(token, cb_id, f"Покупаю {base_sym} на {chosen_amt:.1f}$...")
                 mkt_p = get_price(sym)
@@ -4334,14 +4393,17 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
             elif cb_data.startswith("trade_buy_custom_amt:"):
                 sym = cb_data.split(":", 1)[1]
                 base_sym = base_asset(sym)
+                filters = get_symbol_filters(sym)
+                min_notional = float(filters.get("min_notional", 5.0))
                 answer_callback(token, cb_id, "Введите сумму вручную")
                 user_fsm[cb_chat] = {"state": "waiting_buy_amount", "data": {"symbol": sym}}
                 free_usdt = get_free_usdt_balance(state)
                 send_telegram(
                     token, cb_chat,
                     f"✍️ <b>Введите сумму в USDT</b> для покупки <b>{base_sym}</b>:\n\n"
-                    f"💰 Доступно: <code>{free_usdt:.2f} USDT</code>\n\n"
-                    f"<i>Напишите число, например: <code>15</code> или <code>7.5</code></i>",
+                    f"💰 Доступно: <code>{free_usdt:.2f} USDT</code>\n"
+                    f"📏 Минимум Binance: <code>{min_notional:.0f} USDT</code>\n\n"
+                    f"<i>Напишите число (от {min_notional:.0f} USDT), например: <code>15</code></i>",
                     reply_markup=cancel_keyboard(),
                 )
 
