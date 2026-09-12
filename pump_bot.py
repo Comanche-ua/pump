@@ -102,6 +102,8 @@ KLINES_LIMIT = 250  # 250 баров по 5m (~20 часов подробной 
 DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "11.0"))
 DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "2.0"))
 DEFAULT_STOP_LOSS = float(os.environ.get("STOP_LOSS_PCT", "2.0"))
+DEFAULT_ENTRY_PULLBACK = float(os.environ.get("ENTRY_PULLBACK_PCT", "0.4"))  # Вход на микро-откате (-0.4% по умолчанию)
+DEFAULT_ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_TIMEOUT_SEC", "300"))   # Таймаут жизни лимитного ордера на вход (5 мин)
 DEFAULT_TRAILING_ACTIVATION = float(os.environ.get("TRAILING_ACTIVATION_PCT", "1.0"))
 DEFAULT_TRAILING_DISTANCE = float(os.environ.get("TRAILING_DISTANCE_PCT", "0.8"))
 DEFAULT_DYNAMIC_TP = os.environ.get("DYNAMIC_TP", "true").strip().lower() in ("true", "1")
@@ -1324,7 +1326,67 @@ def execute_pump_auto_trade(
     if filters.get("status") != "TRADING":
         return {"error": f"Пара {sig.symbol} временно не торгуется на бирже"}
 
-    # 1. Размещение MARKET BUY ордера
+    step_size = filters.get("step_size", 1.0)
+    tick_size = filters.get("tick_size", 0.01)
+    entry_pullback_pct = float(settings.get("entry_pullback_pct", DEFAULT_ENTRY_PULLBACK))
+
+    # ── ВАРИАНТ А: УМНЫЙ ВХОД НА МИКРО-ОТКАТЕ (LIMIT BUY PULLBACK) ──
+    if entry_pullback_pct > 0.01 and sig.price > 0:
+        limit_buy_price_raw = sig.price * (1.0 - (entry_pullback_pct / 100.0))
+        limit_buy_price_str = fmt_price_filter(limit_buy_price_raw, tick_size)
+        raw_qty = trade_amt / float(limit_buy_price_str)
+        qty_str = fmt_qty_filter(raw_qty, step_size)
+
+        if float(qty_str) <= 0:
+            return {"error": "Quantity calculation zero"}
+
+        buy_params = {
+            "symbol": sig.symbol,
+            "side": "BUY",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": qty_str,
+            "price": limit_buy_price_str,
+        }
+        buy_res = binance_signed_request("POST", "/api/v3/order", buy_params, state=state)
+        if "error" in buy_res:
+            err_msg = buy_res.get("error", "Unknown error")
+            print(f"[AutoTrade Error Limit Buy]: {err_msg}", file=sys.stderr)
+            send_telegram(token, chat_id, f"❌ <b>Ошибка выставления лимитной покупки {sig.base}/USDT:</b>\n<code>{err_msg}</code>")
+            return buy_res
+
+        buy_order_id = buy_res.get("orderId")
+        entry_record = {
+            "symbol": sig.symbol,
+            "base": sig.base,
+            "order_id": buy_order_id,
+            "target_price": float(limit_buy_price_str),
+            "signal_price": sig.price,
+            "pullback_pct": entry_pullback_pct,
+            "qty": float(qty_str),
+            "cost_usdt": float(qty_str) * float(limit_buy_price_str),
+            "placed_at": int(time.time()),
+            "timeout_sec": DEFAULT_ENTRY_TIMEOUT_SEC,
+            "best_score": sig.best_score,
+            "grade": sig.grade,
+        }
+        state.setdefault("pending_entries", {})[sig.symbol] = entry_record
+        save_state(state, sync_git=True)
+
+        entry_alert = (
+            f"🎯 <b>ВЫСТАВЛЕН ЛИМИТНЫЙ ОРДЕР НА ОТКАТ (-{entry_pullback_pct:.1f}%)!</b>\n\n"
+            f"⏳ Ждём микро-отката для покупки <b>{sig.base}/USDT</b> без переплаты на хаях:\n"
+            f"• Цена сигнала: <code>{fmt_price(sig.price)} $</code>\n"
+            f"• Лимитный вход: <code>{limit_buy_price_str} $</code> (дисконт 🟢 <b>-{entry_pullback_pct:.1f}%</b>)\n"
+            f"• Сумма: <code>{float(qty_str)*float(limit_buy_price_str):.2f} USDT</code> ({qty_str} {sig.base})\n"
+            f"• Ордер: <code>#{buy_order_id} (LIMIT BUY GTC)</code>\n"
+            f"• Таймаут ожидания: <code>5 мин</code>\n\n"
+            f"💡 <i>При исполнении бот сразу выставит Take-Profit ордер на продажу.</i>"
+        )
+        send_telegram(token, chat_id, entry_alert)
+        return entry_record
+
+    # ── ВАРИАНТ Б: ВХОД ПО РЫНКУ (MARKET BUY) ──
     buy_params = {
         "symbol": sig.symbol,
         "side": "BUY",
@@ -1370,9 +1432,6 @@ def execute_pump_auto_trade(
         print(f"[ATR TP error for {sig.symbol}]: {_atr_err}", file=sys.stderr)
 
     tp_raw_price = avg_buy_price * (1.0 + (tp_pct / 100.0))
-    step_size = filters.get("step_size", 1.0)
-    tick_size = filters.get("tick_size", 0.01)
-
     tp_price_str = fmt_price_filter(tp_raw_price, tick_size)
     tp_qty_str = fmt_qty_filter(exec_qty, step_size)
 
@@ -1456,6 +1515,162 @@ def execute_pump_auto_trade(
     )
     send_telegram(token, chat_id, trade_alert)
     return trade_record
+
+def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> None:
+    """
+    Проверяет исполнение лимитных ордеров на вход в откат (Pullback Limit Buy).
+    При исполнении выставляет Take-Profit и переводит в активные сделки.
+    При истечении таймаута (5 мин) отменяет ордер.
+    """
+    pending = state.get("pending_entries", {})
+    if not pending:
+        return
+
+    now = int(time.time())
+    to_remove = []
+    updated = False
+
+    for symbol, entry in list(pending.items()):
+        order_id = entry.get("order_id")
+        if not order_id:
+            to_remove.append(symbol)
+            continue
+
+        res = binance_signed_request("GET", "/api/v3/order", {"symbol": symbol, "orderId": order_id}, state=state)
+        if "error" in res:
+            continue
+
+        status = res.get("status")
+        if status == "FILLED":
+            to_remove.append(symbol)
+            updated = True
+
+            cum_quote = float(res.get("cummulativeQuoteQty", entry.get("cost_usdt", 0.0)))
+            exec_qty = float(res.get("executedQty", entry.get("qty", 0.0)))
+            avg_buy_price = (cum_quote / exec_qty) if exec_qty > 0 else float(entry.get("target_price", 0.0))
+
+            # Расчёт Take-Profit (с динамическим ATR)
+            settings = state.get("settings", {})
+            tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
+            dynamic_tp_enabled = settings.get("dynamic_tp", DEFAULT_DYNAMIC_TP)
+            atr_calculated = False
+            try:
+                candles_atr = fetch_klines(symbol, limit=25)
+                if candles_atr and len(candles_atr) >= 15:
+                    atr_val = atr(candles_atr, 14)
+                    if atr_val and atr_val > 0 and avg_buy_price > 0 and dynamic_tp_enabled:
+                        atr_pct = (atr_val / avg_buy_price) * 100.0
+                        dynamic_tp = max(tp_pct, min(10.0, round(atr_pct * 1.8, 1)))
+                        if dynamic_tp > tp_pct:
+                            tp_pct = dynamic_tp
+                            atr_calculated = True
+            except Exception:
+                pass
+
+            filters = get_symbol_filters(symbol)
+            step_size = filters.get("step_size", 1.0)
+            tick_size = filters.get("tick_size", 0.01)
+
+            tp_raw_price = avg_buy_price * (1.0 + (tp_pct / 100.0))
+            tp_price_str = fmt_price_filter(tp_raw_price, tick_size)
+            tp_qty_str = fmt_qty_filter(exec_qty, step_size)
+
+            sl_pct = float(settings.get("stop_loss_pct", DEFAULT_STOP_LOSS))
+            sl_price = avg_buy_price * (1.0 - (sl_pct / 100.0))
+            trailing_act = float(settings.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION))
+            trailing_dist = float(settings.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE))
+
+            # Размещение LIMIT SELL GTC (Take-Profit)
+            sell_params = {
+                "symbol": symbol,
+                "side": "SELL",
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": tp_qty_str,
+                "price": tp_price_str,
+            }
+            sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+            if "error" in sell_res:
+                reduced_qty = fmt_qty_filter(exec_qty * 0.9985, step_size)
+                if float(reduced_qty) > 0 and reduced_qty != tp_qty_str:
+                    sell_params["quantity"] = reduced_qty
+                    sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+
+            tp_order_id = sell_res.get("orderId")
+            tp_success = bool(tp_order_id)
+
+            trade_rec = {
+                "symbol": symbol,
+                "base": entry.get("base", base_asset(symbol)),
+                "buy_order_id": order_id,
+                "tp_order_id": tp_order_id,
+                "buy_price": avg_buy_price,
+                "highest_price": avg_buy_price,
+                "tp_price": float(tp_price_str),
+                "sl_price": sl_price,
+                "trailing_sl": sl_price,
+                "sl_pct": sl_pct,
+                "trailing_activation_pct": trailing_act,
+                "trailing_distance_pct": trailing_dist,
+                "qty": float(sell_params["quantity"]),
+                "cost_usdt": cum_quote,
+                "tp_pct": tp_pct,
+                "opened_at": int(time.time()),
+                "signal_score": entry.get("best_score", 70.0),
+                "signal_source": "pullback_limit",
+                "status": "tp_placed" if tp_success else "unhedged_buy",
+            }
+            state.setdefault("active_trades", {})[symbol] = trade_rec
+            portfolio_add(state, symbol, float(sell_params["quantity"]), avg_buy_price)
+
+            base = entry.get("base", base_asset(symbol))
+            atr_lbl = " <i>(динамический ATR)</i>" if atr_calculated else ""
+            tp_note = (
+                f"• Ордер тейк-профита: <code>#{tp_order_id} (LIMIT SELL GTC)</code>\n"
+                f"<i>Средства автоматически вернутся в USDT при достижении цели.</i>"
+                if tp_success else f"⚠️ <i>Не удалось выставить лимитник TP. Монета на споте.</i>"
+            )
+            sig_p = float(entry.get("signal_price", avg_buy_price))
+            pullback_saved = sig_p - avg_buy_price
+            pullback_saved_pct = (pullback_saved / sig_p * 100.0) if sig_p > 0 else 0.0
+
+            alert_msg = (
+                f"🎯 <b>ВХОД НА ОТКАТЕ ИСПОЛНЕН!</b>\n\n"
+                f"✅ <b>{base}/USDT</b> куплен по лучшей цене на Binance Spot!\n"
+                f"• Цена сигнала: <code>{fmt_price(sig_p)} $</code>\n"
+                f"• Цена исполнения: <code>{fmt_price(avg_buy_price)} $</code> (скидка 🟢 <b>-{pullback_saved_pct:.2f}%</b>)\n"
+                f"• Потрачено: <code>{cum_quote:.2f} USDT</code> ({fmt_qty(exec_qty)} {base})\n\n"
+                f"🎯 <b>Тейк-профит (+{tp_pct:.1f}%){atr_lbl}:</b> <code>{tp_price_str} $</code>\n"
+                f"🛑 <b>Stop-Loss (-{sl_pct:.1f}%):</b> <code>{fmt_price(sl_price)} $</code>\n"
+                f"🛡 <b>Трейлинг-стоп:</b> автоподтяжка при <code>+{trailing_act:.1f}%</code> (дистанция <code>{trailing_dist:.1f}%</code>)\n\n"
+                f"{tp_note}"
+            )
+            if chat_id:
+                send_telegram(token, chat_id, alert_msg)
+
+        elif status in ("CANCELED", "REJECTED", "EXPIRED"):
+            to_remove.append(symbol)
+            updated = True
+
+        elif now - entry.get("placed_at", now) >= entry.get("timeout_sec", DEFAULT_ENTRY_TIMEOUT_SEC):
+            # Истёк таймаут ожидания отката
+            to_remove.append(symbol)
+            updated = True
+            binance_signed_request("DELETE", "/api/v3/order", {"symbol": symbol, "orderId": order_id}, state=state)
+            base = entry.get("base", base_asset(symbol))
+            print(f"[Timeout Pullback Order {symbol}]: отменён по истечению таймаута")
+            timeout_msg = (
+                f"⏱️ <b>Лимитный ордер на откат {base}/USDT отменён.</b>\n"
+                f"За 5 минут цена не скорректировалась к <code>{fmt_price(entry.get('target_price', 0))} $</code>. Позиция не открыта во избежание покупки на хаях."
+            )
+            if chat_id:
+                send_telegram(token, chat_id, timeout_msg)
+
+    for s in to_remove:
+        pending.pop(s, None)
+
+    if updated:
+        save_state(state, sync_git=True)
 
 def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> None:
     """
@@ -1807,6 +2022,213 @@ def sell_assets_menu_kb(state: dict) -> dict:
     rows.append([{"text": "🔙 Назад в портфель", "callback_data": "port:refresh"}])
     return {"inline_keyboard": rows}
 
+def target_sell_assets_menu_kb(state: dict) -> dict:
+    """Клавиатура выбора актива для настройки автопродажи по целевой цене."""
+    active_trades = state.get("active_trades", {})
+    port = state.get("portfolio", {})
+    all_symbols = sorted(set(list(active_trades.keys()) + list(port.keys())))
+
+    if not all_symbols:
+        return {
+            "inline_keyboard": [
+                [{"text": "🔙 Назад в портфель", "callback_data": "port:refresh"}]
+            ]
+        }
+
+    prices = get_multiple_prices(all_symbols) if all_symbols else {}
+    rows = []
+    for s in all_symbols:
+        base = base_asset(s)
+        cur_p = prices.get(s)
+        p_str = f" ({fmt_price(cur_p)} $)" if cur_p else ""
+        rows.append([
+            {"text": f"🎯 Задать TP для {base}{p_str}", "callback_data": f"target_pick:{s}"}
+        ])
+
+    rows.append([{"text": "🔙 Назад в портфель", "callback_data": "port:refresh"}])
+    return {"inline_keyboard": rows}
+
+def target_sell_coin_presets_kb(symbol: str, cur_price: float, state: dict) -> Tuple[str, dict]:
+    """Формирует меню пресетов целевой цены для монеты."""
+    base = base_asset(symbol)
+    active_trades = state.get("active_trades", {})
+    port = state.get("portfolio", {})
+    trade = active_trades.get(symbol)
+    pos = port.get(symbol)
+    qty = float(trade.get("qty") if trade else pos.get("qty", 0.0) if pos else 0.0)
+    buy_p = float(trade.get("buy_price") if trade else pos.get("avg_price", cur_price) if pos else cur_price)
+    
+    tp_price = float(trade.get("tp_price", 0.0)) if trade else 0.0
+    cur_tp_str = f"\n• Текущий TP-ордер: <code>{fmt_price(tp_price)} $</code>" if tp_price > 0 else ""
+
+    text = (
+        f"🎯 <b>НАСТРОЙКА АВТОПРОДАЖИ (Take-Profit): {base}/USDT</b>\n\n"
+        f"• Количество: <code>{fmt_qty(qty)} {base}</code>\n"
+        f"• Цена входа: <code>{fmt_price(buy_p)} $</code>\n"
+        f"• Текущая цена рынка: <code>{fmt_price(cur_price)} $</code>{cur_tp_str}\n\n"
+        f"<i>Выберите желаемый процент прибыли или введите точную цену:</i>"
+    )
+
+    kb = {
+        "inline_keyboard": [
+            [
+                {"text": f"🎯 +1.5% ({fmt_price(cur_price * 1.015)} $)", "callback_data": f"target_preset:{symbol}:1.5"},
+                {"text": f"🎯 +2.5% ({fmt_price(cur_price * 1.025)} $)", "callback_data": f"target_preset:{symbol}:2.5"},
+            ],
+            [
+                {"text": f"🎯 +3.5% ({fmt_price(cur_price * 1.035)} $)", "callback_data": f"target_preset:{symbol}:3.5"},
+                {"text": f"🎯 +5.0% ({fmt_price(cur_price * 1.050)} $)", "callback_data": f"target_preset:{symbol}:5.0"},
+            ],
+            [
+                {"text": f"🎯 +10.0% ({fmt_price(cur_price * 1.100)} $)", "callback_data": f"target_preset:{symbol}:10.0"},
+                {"text": f"🎯 +15.0% ({fmt_price(cur_price * 1.150)} $)", "callback_data": f"target_preset:{symbol}:15.0"},
+            ],
+            [
+                {"text": "✍️ Ввести свою цену вручную", "callback_data": f"target_custom:{symbol}"},
+            ],
+            [
+                {"text": "🔙 Назад к списку монет", "callback_data": "port:targetsell_menu"},
+            ]
+        ]
+    }
+    return text, kb
+
+def set_custom_target_sell(token: str, chat_id: Union[str, int], state: dict, symbol: str, target_val: Union[str, float]) -> dict:
+    """
+    Устанавливает лимитный ордер на продажу (Take-Profit) по заданной цене или проценту на Binance Spot.
+    """
+    symbol = normalize_symbol(symbol)
+    base = base_asset(symbol)
+
+    cur_price = get_price(symbol)
+    if not cur_price or cur_price <= 0:
+        msg = f"❌ Не удалось получить текущую цену для <b>{base}/USDT</b>."
+        send_telegram(token, chat_id, msg)
+        return {"error": "Price fetch failed"}
+
+    active_trades = state.setdefault("active_trades", {})
+    port = state.setdefault("portfolio", {})
+    trade = active_trades.get(symbol)
+    pos = port.get(symbol)
+
+    # 1. Снимаем старый TP ордер, если есть
+    old_tp_order_id = trade.get("tp_order_id") if trade else None
+    if old_tp_order_id:
+        binance_signed_request("DELETE", "/api/v3/order", {"symbol": symbol, "orderId": old_tp_order_id}, state=state)
+
+    # 2. Получаем реальный объем для продажи
+    assets, err = get_spot_account_assets(state)
+    if err:
+        send_telegram(token, chat_id, f"❌ <b>Ошибка Binance API:</b>\n<code>{err}</code>")
+        return {"error": str(err)}
+
+    asset_info = assets.get(base, {"free": 0.0, "locked": 0.0, "total": 0.0})
+    qty_available = float(asset_info["free"])
+    if qty_available <= 0.00000001:
+        qty_available = float(asset_info["total"])
+    if qty_available <= 0.00000001:
+        qty_available = float(trade.get("qty", 0.0) if trade else pos.get("qty", 0.0) if pos else 0.0)
+
+    filters = get_symbol_filters(symbol)
+    step_size = filters.get("step_size", 0.0001)
+    tick_size = filters.get("tick_size", 0.0001)
+    min_qty = filters.get("min_qty", 0.0)
+    qty_str = fmt_qty_filter(qty_available, step_size)
+
+    if float(qty_str) <= 0 or float(qty_str) < min_qty:
+        err_msg = f"Недостаточно монет {base} на балансе (доступно: {qty_available})."
+        send_telegram(token, chat_id, f"❌ {err_msg}")
+        return {"error": err_msg}
+
+    # 3. Вычисляем целевую цену
+    target_price = 0.0
+    if isinstance(target_val, str):
+        val_clean = target_val.strip().replace(",", ".")
+        if val_clean.endswith("%") or val_clean.startswith("+"):
+            pct_num = float(val_clean.lstrip("+").rstrip("%"))
+            buy_p = float(trade.get("buy_price", cur_price) if trade else pos.get("avg_price", cur_price) if pos else cur_price)
+            target_price = buy_p * (1.0 + (pct_num / 100.0))
+        else:
+            target_price = float(val_clean)
+    else:
+        target_price = float(target_val)
+
+    if target_price <= 0:
+        send_telegram(token, chat_id, "❌ Некорректная цена автопродажи.")
+        return {"error": "Invalid target price"}
+
+    if target_price <= cur_price:
+        send_telegram(token, chat_id, f"⚠️ Целевая цена (<code>{fmt_price(target_price)} $</code>) ниже или равна текущей рыночной (<code>{fmt_price(cur_price)} $</code>).\nДля мгновенной продажи используйте кнопку <b>«🔴 Продать актив»</b>.")
+        return {"error": "Target below market"}
+
+    target_price_str = fmt_price_filter(target_price, tick_size)
+
+    # 4. Размещаем LIMIT SELL GTC ордер на Binance Spot
+    sell_params = {
+        "symbol": symbol,
+        "side": "SELL",
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "quantity": qty_str,
+        "price": target_price_str,
+    }
+    sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+    if "error" in sell_res:
+        reduced_qty = fmt_qty_filter(float(qty_str) * 0.9985, step_size)
+        if float(reduced_qty) > 0 and reduced_qty != qty_str:
+            sell_params["quantity"] = reduced_qty
+            sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+
+    if "error" in sell_res:
+        err_msg = sell_res.get("error", "Unknown error")
+        send_telegram(token, chat_id, f"❌ <b>Ошибка биржи при выставлении ордера:</b>\n<code>{err_msg}</code>")
+        return sell_res
+
+    tp_order_id = sell_res.get("orderId")
+    buy_p = float(trade.get("buy_price", cur_price) if trade else pos.get("avg_price", cur_price) if pos else cur_price)
+    gain_pct = ((float(target_price_str) - buy_p) / buy_p * 100.0) if buy_p > 0 else 0.0
+    exp_quote = float(sell_params["quantity"]) * float(target_price_str)
+
+    trade_rec = {
+        "symbol": symbol,
+        "base": base,
+        "buy_order_id": trade.get("buy_order_id") if trade else None,
+        "tp_order_id": tp_order_id,
+        "buy_price": buy_p,
+        "highest_price": max(cur_price, buy_p),
+        "tp_price": float(target_price_str),
+        "sl_price": trade.get("sl_price", buy_p * 0.98) if trade else buy_p * 0.98,
+        "trailing_sl": trade.get("trailing_sl", buy_p * 0.98) if trade else buy_p * 0.98,
+        "sl_pct": trade.get("sl_pct", 2.0) if trade else 2.0,
+        "trailing_activation_pct": 1.0,
+        "trailing_distance_pct": 0.8,
+        "qty": float(sell_params["quantity"]),
+        "cost_usdt": float(sell_params["quantity"]) * buy_p,
+        "tp_pct": gain_pct,
+        "opened_at": trade.get("opened_at", int(time.time())) if trade else int(time.time()),
+        "signal_score": 80.0,
+        "signal_source": "custom_target",
+        "status": "tp_placed",
+    }
+    active_trades[symbol] = trade_rec
+    if symbol not in port:
+        portfolio_add(state, symbol, float(sell_params["quantity"]), buy_p)
+    save_state(state, sync_git=True)
+
+    success_msg = (
+        f"🎯 <b>АВТОПРОДАЖА УСПЕШНО ВЫСТАВЛЕНА НА BINANCE SPOT!</b>\n\n"
+        f"✅ Ордер <b>LIMIT SELL GTC</b> размещён в стакане биржи:\n"
+        f"• Пара: <b>{base}/USDT</b>\n"
+        f"• Текущая цена: <code>{fmt_price(cur_price)} $</code>\n"
+        f"• 🎯 <b>Цель автопродажи:</b> <code>{target_price_str} $</code> (<b>{gain_pct:+.2f}%</b> от входа)\n"
+        f"• Количество к продаже: <code>{fmt_qty(float(sell_params['quantity']))} {base}</code>\n"
+        f"• Ожидаемая сумма к получению: <b>{exp_quote:,.2f} USDT</b>\n"
+        f"• Номер ордера: <code>#{tp_order_id}</code>\n\n"
+        f"💵 <i>Как только цена коснётся {target_price_str} $, ордер моментально исполнится на бирже и средства вернутся в USDT.</i>"
+    )
+    send_telegram(token, chat_id, success_msg, reply_markup=main_keyboard())
+    return {"success": True, "order_id": tp_order_id, "target_price": target_price_str}
+
 def format_portfolio(state: dict) -> str:
     port = state.get("portfolio", {})
     active_trades = state.get("active_trades", {})
@@ -2103,9 +2525,10 @@ def main_keyboard() -> dict:
             [{"text": "💼 Портфель"}, {"text": "📊 Сделки и Профит"}],
             [{"text": "💳 Баланс Binance"}, {"text": "⚙️ Настройки"}],
             [{"text": "➕ Добавить актив"}, {"text": "🗑 Удалить актив"}],
+            [{"text": "🙈 Скрыть клавиатуру"}],
         ],
         "resize_keyboard": True,
-        "is_persistent": True,
+        "is_persistent": False,
     }
 
 def cancel_keyboard() -> dict:
@@ -2113,11 +2536,11 @@ def cancel_keyboard() -> dict:
         "keyboard": [
             [{"text": "❌ Отмена"}],
             [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
-            [{"text": "💼 Портфель"}, {"text": "📊 Сделки и Профит"}],
-            [{"text": "💳 Баланс Binance"}, {"text": "⚙️ Настройки"}],
+            [{"text": "💼 Портфель"}, {"text": "⚙️ Настройки"}],
+            [{"text": "🙈 Скрыть клавиатуру"}],
         ],
         "resize_keyboard": True,
-        "is_persistent": True,
+        "is_persistent": False,
     }
 
 def portfolio_inline_kb() -> dict:
@@ -2126,6 +2549,9 @@ def portfolio_inline_kb() -> dict:
             [
                 {"text": "🔄 Обновить цены", "callback_data": "port:refresh"},
                 {"text": "📊 Сделки и Профит", "callback_data": "port:trades_stats"},
+            ],
+            [
+                {"text": "🎯 Автопродажа по цене (TP)", "callback_data": "port:targetsell_menu"},
             ],
             [
                 {"text": "➕ Добавить", "callback_data": "port:add"},
@@ -2192,6 +2618,12 @@ def settings_text(state: dict) -> str:
     dyn_tp_label = "🟢 Включён (авто ATR)" if dyn_tp else "🔴 Выключен (фиксированный)"
     trail_act = s.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION)
     trail_dist = s.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE)
+    entry_pb = float(s.get("entry_pullback_pct", DEFAULT_ENTRY_PULLBACK))
+    if entry_pb <= 0.001:
+        entry_label = "⚡ По рынку (мгновенно)"
+    else:
+        entry_label = f"🎯 Откат -{entry_pb:.1f}% (лимитный вход)"
+
     auto_trade_label = f"🟢 Включена (+{tp_pct:.1f}% TP, -{sl_pct:.1f}% SL)" if s.get("auto_trade", False) else "🔴 Выключена"
     whale_scan_label = "🟢 Включён" if s.get("whale_autoscan", DEFAULT_WHALE_AUTOSCAN) else "🔴 Выключен"
     interval_m = s.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL) // 60
@@ -2217,6 +2649,7 @@ def settings_text(state: dict) -> str:
         "<b>⚡ Спотовая торговля Binance:</b>\n"
         f"• <b>Автоторговля пампов:</b> {auto_trade_label}\n"
         f"• <b>Размер ставки:</b> <code>{trade_size_label}</code>\n"
+        f"• <b>Точка входа:</b> <code>{entry_label}</code>\n"
         f"• <b>Базовый Take-Profit:</b> <code>+{tp_pct:.1f}%</code>\n"
         f"• <b>Умный ATR Take-Profit:</b> <code>{dyn_tp_label}</code>\n"
         f"• <b>Stop-Loss:</b> <code>-{sl_pct:.1f}%</code>\n"
@@ -2239,6 +2672,7 @@ def settings_inline_kb(state: dict) -> dict:
     trade_mode = s.get("trade_mode", "fixed")
     cur_sl = float(s.get("stop_loss_pct", DEFAULT_STOP_LOSS))
     cur_tp = float(s.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
+    cur_entry = float(s.get("entry_pullback_pct", DEFAULT_ENTRY_PULLBACK))
 
     def _amt_btn(label: str, mode: str) -> dict:
         active = "✅ " if trade_mode == mode else ""
@@ -2251,6 +2685,10 @@ def settings_inline_kb(state: dict) -> dict:
     def _tp_btn(val: float) -> dict:
         active = "✅ " if abs(cur_tp - val) < 0.05 else ""
         return {"text": f"{active}🎯 TP: +{val:.1f}%", "callback_data": f"trade:tp:{val:.1f}"}
+
+    def _entry_btn(label: str, val: float) -> dict:
+        active = "✅ " if abs(cur_entry - val) < 0.05 else ""
+        return {"text": f"{active}{label}", "callback_data": f"trade:entry:{val:.1f}"}
 
     return {
         "inline_keyboard": [
@@ -2270,6 +2708,16 @@ def settings_inline_kb(state: dict) -> dict:
                 _amt_btn("40% баланса", "pct:40"),
                 _amt_btn("50% баланса", "pct:50"),
             ],
+            # --- Точка входа (Откат / Маркет) ---
+            [
+                _entry_btn("⚡ По рынку", 0.0),
+                _entry_btn("🎯 Откат -0.2%", 0.2),
+            ],
+            [
+                _entry_btn("🎯 Откат -0.4% (оптимал)", 0.4),
+                _entry_btn("🎯 Откат -0.6%", 0.6),
+            ],
+            # --- Take Profit ---
             [
                 _tp_btn(1.0),
                 _tp_btn(1.5),
@@ -2281,6 +2729,7 @@ def settings_inline_kb(state: dict) -> dict:
             [
                 {"text": dyn_tp_btn_label, "callback_data": "trade:dyn_tp:toggle"},
             ],
+            # --- Stop Loss ---
             [
                 _sl_btn(1.5),
                 _sl_btn(2.0),
@@ -2490,11 +2939,14 @@ def answer_callback(token: str, callback_id: str, text: Optional[str] = None) ->
 
 def set_bot_commands(token: str) -> None:
     cmds = [
-        {"command": "start", "description": "Главное меню"},
+        {"command": "start", "description": "Главное меню / открыть кнопки"},
+        {"command": "menu", "description": "📋 Открыть клавиатуру меню"},
+        {"command": "hide", "description": "🙈 Скрыть клавиатуру"},
         {"command": "scan", "description": "Сканер спота сейчас"},
         {"command": "whale", "description": "🐋 Скан действий китов"},
         {"command": "portfolio", "description": "Портфель и PnL"},
         {"command": "trade", "description": "Статус автоторговли и профит"},
+        {"command": "targetsell", "description": "🎯 Автопродажа по целевой цене"},
         {"command": "sell", "description": "🔴 Продать актив досрочно"},
         {"command": "add", "description": "Добавить монету в портфель"},
         {"command": "del", "description": "Удалить монету из портфеля"},
@@ -2872,12 +3324,19 @@ def autoscan_worker(token: str, primary_chat_id: Union[str, int], state: dict, s
                 if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
                     target_chats.add(cid_str)
 
-            # Проверяем исполнение тейк-профитов по активным сделкам
-            if settings.get("auto_trade", False) and state.get("active_trades"):
-                try:
-                    check_active_trades(token, primary_chat_id, state)
-                except Exception as e:
-                    print(f"[AutoTrade Check Error]: {e}", file=sys.stderr)
+            # Проверяем исполнение лимитных ордеров на откат и тейк-профитов
+            if settings.get("auto_trade", False):
+                if state.get("pending_entries"):
+                    try:
+                        check_pending_entries(token, primary_chat_id, state)
+                    except Exception as e:
+                        print(f"[PendingEntries Check Error]: {e}", file=sys.stderr)
+
+                if state.get("active_trades"):
+                    try:
+                        check_active_trades(token, primary_chat_id, state)
+                    except Exception as e:
+                        print(f"[AutoTrade Check Error]: {e}", file=sys.stderr)
 
             # 1. Скан пампов
             signals, meta, _top = run_scan(
@@ -3039,9 +3498,21 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 print(f"🔓 Добавлен новый чат: {chat_id_local}")
 
             text_lower = text.lower()
-            if text_lower in ("/start", "start", "старт", "меню", "/menu"):
+            if text_lower in ("/start", "start", "старт", "меню", "/menu", "/kb", "kb", "меню", "клавиатура"):
                 print(f"-> Показ главного меню для {chat_id_local}")
-                send_telegram(token, chat_id_local, "<b>📋 Главное меню Pump Pulse</b>\n\nВыберите действие:", reply_markup=main_keyboard())
+                send_telegram(token, chat_id_local, "<b>📋 Главное меню Pump Pulse</b>\n\nКлавиатура открыта:", reply_markup=main_keyboard())
+                return
+
+            if text_lower in ("/hide", "/скрыть", "/hidekb", "hide", "скрыть", "🙈 скрыть клавиатуру", "скрыть клавиатуру", "скрыть кнопки", "убрать клавиатуру"):
+                user_fsm.pop(chat_id_local, None)
+                print(f"-> Скрытие клавиатуры для {chat_id_local}")
+                send_telegram(
+                    token, chat_id_local,
+                    "🙈 <b>Клавиатура скрыта.</b>\n\n"
+                    "• Чтобы вернуть кнопки в любой момент, отправьте <b>/menu</b> или <b>/start</b>.\n"
+                    "• Также все команды доступны через кнопку меню команд <code>[/]</code> слева от поля ввода.",
+                    reply_markup={"remove_keyboard": True}
+                )
                 return
 
             if text_lower in ("/cancel", "❌ отмена", "отмена", "cancel", "стоп"):
@@ -3138,6 +3609,13 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 if cur_st == "waiting_whale_symbol":
                     user_fsm.pop(chat_id_local, None)
                     whale_deep_dive(token, chat_id_local, text)
+                    return
+
+                if cur_st == "waiting_target_price":
+                    data = st.get("data", {})
+                    symbol = data.get("symbol", "")
+                    user_fsm.pop(chat_id_local, None)
+                    set_custom_target_sell(token, chat_id_local, state, symbol, text)
                     return
 
             # ── Reply-кнопки и команды ──
@@ -3259,7 +3737,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     return
                 send_telegram(token, chat_id_local, "🗑 <b>Выберите монету для удаления:</b>", reply_markup=kb)
 
-            elif cmd in ("sell", "продать") or (is_menu_action and "прода" in text_lower):
+            elif cmd in ("sell", "продать") or (is_menu_action and "прода" in text_lower and "автопрода" not in text_lower):
                 print(f"-> Меню досрочной продажи для {chat_id_local}")
                 args = clean_text.split()[1:]
                 if args:
@@ -3274,6 +3752,25 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                         "Перед продажей бот покажет <b>окно подтверждения</b> с расчётом PnL и снимет лимитный Take-Profit на бирже."
                     )
                     send_telegram(token, chat_id_local, prompt_text, reply_markup=kb)
+
+            elif cmd in ("targetsell", "tp", "sellat", "цель", "автопродажа") or (is_menu_action and ("автопродаж" in text_lower or "тейк" in text_lower)):
+                print(f"-> Настройка автопродажи (TP) для {chat_id_local}")
+                args = clean_text.split()[1:]
+                if not args:
+                    kb = target_sell_assets_menu_kb(state)
+                    send_telegram(token, chat_id_local, "🎯 <b>Выберите актив для настройки автопродажи (Take-Profit):</b>", reply_markup=kb)
+                elif len(args) == 1:
+                    symbol = normalize_symbol(args[0])
+                    cur_p = get_price(symbol)
+                    if not cur_p:
+                        send_telegram(token, chat_id_local, f"❌ Монета <code>{symbol}</code> не найдена.")
+                    else:
+                        txt, kb = target_sell_coin_presets_kb(symbol, cur_p, state)
+                        send_telegram(token, chat_id_local, txt, reply_markup=kb)
+                elif len(args) >= 2:
+                    symbol = normalize_symbol(args[0])
+                    target_val = args[1]
+                    set_custom_target_sell(token, chat_id_local, state, symbol, target_val)
 
             elif cmd in ("api", "ключ"):
                 args = clean_text.split()[1:]
@@ -3429,9 +3926,52 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     edit_message(token, cb_chat, msg_id, f"⏳ <i>Закрываю позицию {base_asset(sym)}/USDT на Binance...</i>")
                 execute_emergency_market_sell(token, cb_chat, state, sym)
 
-            elif cb_data == "menu:main":
+            elif cb_data == "port:targetsell_menu":
+                answer_callback(token, cb_id, "Меню автопродажи...")
+                kb = target_sell_assets_menu_kb(state)
+                txt = "🎯 <b>ВЫБОР МОНЕТЫ ДЛЯ НАСТРОЙКИ АВТОПРОДАЖИ (Take-Profit)</b>\n\nВыберите монету из портфеля ниже, чтобы установить целевую цену продажи:"
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, txt, reply_markup=kb)
+                else:
+                    send_telegram(token, cb_chat, txt, reply_markup=kb)
+
+            elif cb_data.startswith("target_pick:"):
+                sym = cb_data.split(":", 1)[1]
+                cur_p = get_price(sym)
+                if not cur_p:
+                    answer_callback(token, cb_id, "Ошибка получения цены")
+                    return
+                answer_callback(token, cb_id)
+                txt, kb = target_sell_coin_presets_kb(sym, cur_p, state)
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, txt, reply_markup=kb)
+                else:
+                    send_telegram(token, cb_chat, txt, reply_markup=kb)
+
+            elif cb_data.startswith("target_preset:"):
+                parts = cb_data.split(":")
+                sym = parts[1]
+                pct = parts[2]
+                answer_callback(token, cb_id, f"Выставляю ордер +{pct}%...")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, f"⏳ <i>Размещаю лимитный ордер автопродажи +{pct}% на бирже...</i>")
+                set_custom_target_sell(token, cb_chat, state, sym, f"+{pct}%")
+
+            elif cb_data.startswith("target_custom:"):
+                sym = cb_data.split(":", 1)[1]
+                answer_callback(token, cb_id)
+                cur_p = get_price(sym) or 0.0
+                user_fsm[cb_chat] = {"state": "waiting_target_price", "data": {"symbol": sym}}
+                prompt = (
+                    f"🎯 <b>Ручной ввод целевой цены для {base_asset(sym)}/USDT</b>\n\n"
+                    f"Текущая рыночная цена: <code>{fmt_price(cur_p)} $</code>\n\n"
+                    f"Введите целевую цену (например: <code>{fmt_price(cur_p * 1.05)}</code>) или процент (например: <code>+7.5%</code>):"
+                )
+                send_telegram(token, cb_chat, prompt, reply_markup=cancel_keyboard())
+
+            elif cb_data in ("menu:main", "menu:show_kb"):
                 answer_callback(token, cb_id, "Главное меню")
-                send_telegram(token, cb_chat, "<b>📋 Главное меню Pump Pulse</b>\n\nВыберите действие:", reply_markup=main_keyboard())
+                send_telegram(token, cb_chat, "<b>📋 Главное меню Pump Pulse</b>\n\nКлавиатура открыта:", reply_markup=main_keyboard())
 
             elif cb_data == "menu:settings":
                 answer_callback(token, cb_id, "Настройки")
@@ -3511,6 +4051,15 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                         answer_callback(token, cb_id, f"Ставка: {amt:.0f} USDT")
                     except ValueError:
                         answer_callback(token, cb_id, "Режим обновлён")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cb_data.startswith("trade:entry:"):
+                pb = float(cb_data.split(":", 2)[2])
+                settings["entry_pullback_pct"] = pb
+                save_state(state)
+                lbl = "По рынку (мгновенно)" if pb <= 0.001 else f"Откат -{pb:.1f}%"
+                answer_callback(token, cb_id, f"Вход: {lbl}")
                 if msg_id:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
