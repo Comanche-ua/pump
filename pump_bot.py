@@ -30,6 +30,7 @@ import urllib.request
 import urllib.error
 import concurrent.futures as cf
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Dict, Tuple, Any, Set, Union
 
 # Настройка UTF-8 вывода для Windows консоли
@@ -96,7 +97,15 @@ KLINES_LIMIT = 250  # 250 баров по 5m (~20 часов подробной 
 # узкие стопы (0.5%, 1.0%) значимо убыточны: узкий стоп выбивается обычным
 # шумом, после которого цена возвращается. Подробности — `--help` харнесса.
 DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "11.0"))
-DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "1.5"))
+# Цель 1.0% при стопе 3.0% — НАИМЕНЬШАЯ цель, дающая значимо положительное
+# матожидание. Измеренная лестница «цель → E[решённая сделка]» при стопе 3%:
+#   0.5% → −0.045% (значимо ОТРИЦАТЕЛЬНО: TP-первым 90.4% при безубытке 91.7%)
+#   0.7% → +0.000% (ровно ноль: работа впустую, 0.5% чистыми съедаются издержками)
+#   1.0% → +0.058% (TP-первым 81.9%, безубыток 80.5%)
+#   1.2% → +0.084%   1.5% → +0.110%   2.0% → +0.106%
+# То есть цель 0.5% (в любой трактовке — брутто или нетто) не окупается:
+# на 0.5% брутто издержки съедают больше, чем даёт точность попадания.
+DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "1.0"))
 DEFAULT_STOP_LOSS = float(os.environ.get("STOP_LOSS_PCT", "3.0"))
 DEFAULT_ENTRY_PULLBACK = float(os.environ.get("ENTRY_PULLBACK_PCT", "0.4"))  # Вход на микро-откате (-0.4% по умолчанию)
 DEFAULT_ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_TIMEOUT_SEC", "300"))   # Таймаут жизни лимитного ордера на вход (5 мин)
@@ -109,8 +118,22 @@ DEFAULT_TRAILING_DISTANCE = float(os.environ.get("TRAILING_DISTANCE_PCT", "0.8")
 DEFAULT_DYNAMIC_TP = os.environ.get("DYNAMIC_TP", "true").strip().lower() in ("true", "1")
 DEFAULT_AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").strip().lower() in ("true", "1")
 DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "70.0"))
+
+# Защита позиции силами биржи. OCO-список держит на Binance ОБА ордера
+# (тейк-профит и стоп-лосс) одновременно, и срабатывание одного отменяет
+# другой. Это единственная схема, при которой позиция защищена, пока бот
+# не работает: в CI процесс живёт максимум 330 минут, плюс падения и
+# отсутствие сети. Значение по умолчанию можно выключить через USE_OCO=false —
+# тогда возвращается прежняя схема: лимитный TP на бирже, а стоп следит
+# Python-процесс (и не срабатывает, когда процесс мёртв).
+DEFAULT_USE_OCO = os.environ.get("USE_OCO", "true").strip().lower() in ("true", "1")
 # Прежний дефолт TP — нужен только для миграции уже сохранённого состояния
 PREVIOUS_TAKE_PROFIT_DEFAULT = 2.0
+
+# Коды Binance, означающие «ордера на бирже нет» — в отличие от сетевого сбоя.
+# -2013 Order does not exist, -2011 Unknown order sent. Дают возможность
+# безопасно убирать мёртвые записи, не рискуя потерять живой ордер.
+ORDER_NOT_FOUND_CODES = (-2013, -2011)
 
 IS_CI = (
     os.environ.get("GITHUB_ACTIONS") == "true"
@@ -760,7 +783,17 @@ def run_scan(
     return signals, meta, summaries[:5]
 # ───────────────────────── Состояние: портфель и настройки ─────────────────────────
 
-STATE_LOCK = threading.Lock()
+# RLock, а не Lock: помощники мутируют состояние и сами вызывают save_state,
+# который тоже берёт этот лок — обычный Lock дал бы самоблокировку.
+STATE_LOCK = threading.RLock()
+
+# Однопоточные защиты торговых переходов. Их вызывают И поток монитора
+# (каждые ~20с), И главный поток (команды /portfolio, /trade, кнопки),
+# поэтому без защиты исполненный TP мог обработаться ДВАЖДЫ: двойная запись
+# в trade_history (задвоенный PnL) и двойной вызов portfolio_remove.
+_PENDING_LOCK = threading.Lock()
+_ACTIVE_LOCK = threading.Lock()
+_SYNC_LOCK = threading.Lock()
 
 def default_state() -> dict:
     return {
@@ -780,6 +813,7 @@ def default_state() -> dict:
             "dynamic_tp": DEFAULT_DYNAMIC_TP,
             "trailing_activation_pct": DEFAULT_TRAILING_ACTIVATION,
             "trailing_distance_pct": DEFAULT_TRAILING_DISTANCE,
+            "use_oco": DEFAULT_USE_OCO,
             "max_open_trades": 3,
             "trade_min_score": DEFAULT_TRADE_MIN_SCORE,
         },
@@ -909,25 +943,27 @@ def get_multiple_prices(symbols: List[str]) -> Dict[str, Optional[float]]:
 def portfolio_add(state: dict, symbol: str, qty: float, price: float) -> Tuple[float, float]:
     """Добавляет/докупает позицию и возвращает (новое_количество, средняя_цена)."""
     symbol = normalize_symbol(symbol)
-    pos = state["portfolio"].get(symbol)
-    if pos:
-        old_qty, old_avg = float(pos["qty"]), float(pos["avg_price"])
-        new_qty = old_qty + qty
-        new_avg = (old_qty * old_avg + qty * price) / new_qty if new_qty > 0 else price
-        pos["qty"], pos["avg_price"] = new_qty, new_avg
-    else:
-        new_qty, new_avg = qty, price
-        state["portfolio"][symbol] = {"qty": qty, "avg_price": price, "added_at": int(time.time())}
+    with STATE_LOCK:
+        pos = state["portfolio"].get(symbol)
+        if pos:
+            old_qty, old_avg = float(pos["qty"]), float(pos["avg_price"])
+            new_qty = old_qty + qty
+            new_avg = (old_qty * old_avg + qty * price) / new_qty if new_qty > 0 else price
+            pos["qty"], pos["avg_price"] = new_qty, new_avg
+        else:
+            new_qty, new_avg = qty, price
+            state["portfolio"][symbol] = {"qty": qty, "avg_price": price, "added_at": int(time.time())}
     save_state(state, sync_git=True)
     return new_qty, new_avg
 
 def portfolio_remove(state: dict, symbol: str) -> bool:
     symbol = normalize_symbol(symbol)
-    if symbol in state["portfolio"]:
+    with STATE_LOCK:
+        if symbol not in state["portfolio"]:
+            return False
         state["portfolio"].pop(symbol, None)
-        save_state(state, sync_git=True)
-        return True
-    return False
+    save_state(state, sync_git=True)
+    return True
 
 # ───────────────────────── Binance Spot Trading Engine ─────────────────────────
 
@@ -1223,13 +1259,28 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 _symbol_filters_cache: Dict[str, dict] = {}
+_symbol_filters_cache_at: Dict[str, float] = {}
+
+# TTL кэша фильтров. Вечный кэш опасен: Binance меняет и шаг/тик (дробление,
+# редомициляция), и статус символа (BREAK/halt), а бот продолжал бы считать
+# количество по устаревшим значениям.
+FILTERS_TTL_SEC = float(os.environ.get("FILTERS_TTL_SEC", "600"))
 
 def get_symbol_filters(symbol: str) -> dict:
-    """Получает торговые фильтры для символа (LOT_SIZE stepSize, PRICE_FILTER tickSize, minNotional)."""
-    global _symbol_filters_cache
+    """
+    Торговые фильтры символа (LOT_SIZE stepSize, PRICE_FILTER tickSize, minNotional).
+
+    При сбое сети возвращаем ПОСЛЕДНИЕ ИЗВЕСТНЫЕ фильтры, а не выдуманные:
+    по выдуманному stepSize ордер отвергается биржей. Если фильтры никогда
+    не были получены — отдаём {}, и вызывающий код обязан отказаться от сделки
+    (см. проверку в execute_pump_auto_trade), а не считать количество вслепую.
+    """
+    global _symbol_filters_cache, _symbol_filters_cache_at
     symbol = normalize_symbol(symbol)
-    if symbol in _symbol_filters_cache:
-        return _symbol_filters_cache[symbol]
+    now = time.monotonic()
+    cached = _symbol_filters_cache.get(symbol)
+    if cached and now - _symbol_filters_cache_at.get(symbol, 0.0) < FILTERS_TTL_SEC:
+        return cached
 
     url = f"{BINANCE_TRADE_URL}/api/v3/exchangeInfo?symbol={symbol}"
     try:
@@ -1261,44 +1312,53 @@ def get_symbol_filters(symbol: str) -> dict:
                 "tick_size": tick_size,
                 "min_notional": min_notional,
                 "status": s_info.get("status", "TRADING"),
+                "stale": False,
             }
             _symbol_filters_cache[symbol] = filters
+            _symbol_filters_cache_at[symbol] = now
             return filters
     except Exception as e:
         print(f"[get_symbol_filters error for {symbol}]: {e}", file=sys.stderr)
-        return {"step_size": 0.0001, "min_qty": 0.0001, "tick_size": 0.0001, "min_notional": 5.0, "status": "TRADING"}
+        if cached:
+            stale = dict(cached)
+            stale["stale"] = True
+            return stale
+        return {}
+
+def _step_decimals(step: float) -> int:
+    """
+    Число знаков после запятой у шага биржи (0.001 → 3, 1e-12 → 12).
+    Через Decimal, потому что у шагов мельче 1e-10 старый расчёт по
+    форматной строке давал 0 и превращал количество в целое число.
+    """
+    exp = Decimal(str(step)).normalize().as_tuple().exponent
+    return max(0, -int(exp))
 
 def round_step(val: float, step: float) -> float:
-    """Округляет вниз с учетом stepSize биржи."""
+    """
+    Округляет вниз с учетом stepSize биржи.
+    Арифметика на Decimal: у float-умножения (steps * step) накапливается
+    ошибка представления, и биржа отвергает ордер по LOT_SIZE.
+    """
     if step <= 0:
         return val
-    step_str = f"{step:.10f}".rstrip("0")
-    decimals = len(step_str.split(".")[1]) if "." in step_str else 0
-    steps = math.floor(val / step)
-    return round(steps * step, decimals)
+    d_val, d_step = Decimal(str(val)), Decimal(str(step))
+    return float((d_val - (d_val % d_step)).quantize(d_step))
 
 def round_tick(val: float, tick: float) -> float:
-    """Округляет цену с учетом tickSize биржи."""
+    """Округляет цену с учетом tickSize биржи (через Decimal)."""
     if tick <= 0:
         return val
-    tick_str = f"{tick:.10f}".rstrip("0")
-    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
-    ticks = round(val / tick)
-    return round(ticks * tick, decimals)
+    d_val, d_tick = Decimal(str(val)), Decimal(str(tick))
+    return float((d_val / d_tick).to_integral_value(rounding=ROUND_HALF_UP) * d_tick)
 
 def fmt_qty_filter(val: float, step: float) -> str:
     """Форматирует количество в строковый вид точно под LOT_SIZE фильтр."""
-    rounded = round_step(val, step)
-    step_str = f"{step:.10f}".rstrip("0")
-    decimals = len(step_str.split(".")[1]) if "." in step_str else 0
-    return f"{rounded:.{decimals}f}"
+    return f"{round_step(val, step):.{_step_decimals(step)}f}"
 
 def fmt_price_filter(val: float, tick: float) -> str:
     """Форматирует цену в строковый вид точно под PRICE_FILTER фильтр."""
-    rounded = round_tick(val, tick)
-    tick_str = f"{tick:.10f}".rstrip("0")
-    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
-    return f"{rounded:.{decimals}f}"
+    return f"{round_tick(val, tick):.{_step_decimals(tick)}f}"
 
 def execute_pump_auto_trade(
     token: str,
@@ -1319,34 +1379,39 @@ def execute_pump_auto_trade(
     pending_entries = state.setdefault("pending_entries", {})
     portfolio = state.get("portfolio", {})
 
-    # Проверка на повторный вход: монета уже в активных сделках, в ожидании
-    # лимитного входа или в портфеле. Без проверки pending повторный сигнал
-    # затирал запись о живом лимитном ордере — тот исполнялся «в никуда».
-    if sig.symbol in pending_entries:
-        waiting_id = pending_entries[sig.symbol].get("order_id")
-        print(f"[AutoTrade] Пропуск {sig.symbol}: уже ждёт исполнения лимитный ордер #{waiting_id}")
-        return {"error": f"По монете {sig.symbol} уже выставлен лимитный ордер на вход"}
+    # Все проверки и РЕЗЕРВ слота — под одним локом, без сетевых вызовов внутри.
+    # Иначе поток автоскана и ручная покупка кнопкой могут одновременно пройти
+    # проверки и открыть две сделки по одной монете, причём вторая затрёт
+    # запись первой — и та останется без TP/SL.
+    skip_portfolio_notice = False
+    with STATE_LOCK:
+        error = None
+        if sig.symbol in pending_entries:
+            error = f"По монете {sig.symbol} уже выставлен лимитный ордер на вход"
+        elif sig.symbol in active_trades:
+            error = f"По монете {sig.symbol} уже есть открытая позиция"
+        elif sig.symbol in portfolio:
+            error = f"Монета {sig.symbol} уже в портфеле"
+            skip_portfolio_notice = True
+        elif len(active_trades) + len(pending_entries) >= max_trades:
+            error = (f"Достигнут лимит активных сделок "
+                     f"({len(active_trades) + len(pending_entries)}/{max_trades})")
+        else:
+            # Бронь слота: order_id=None. Если сделка не состоится,
+            # check_pending_entries снимет её как запись без ордера.
+            pending_entries[sig.symbol] = {"order_id": None, "reserved_at": int(time.time())}
 
-    if sig.symbol in active_trades:
-        print(f"[AutoTrade] Пропуск {sig.symbol}: уже есть активная сделка")
-        return {"error": f"По монете {sig.symbol} уже есть открытая позиция"}
-
-    if sig.symbol in portfolio:
-        print(f"[AutoTrade] Пропуск {sig.symbol}: монета уже есть в портфеле")
-        send_telegram(
-            token, chat_id,
-            f"ℹ️ <b>Пропуск сигнала {sig.base}/USDT</b>\n\n"
-            f"Монета уже есть в вашем портфеле (средняя цена входа: "
-            f"<code>{fmt_price(portfolio[sig.symbol].get('avg_price', 0))} USDT</code>).\n"
-            f"Повторная покупка пропущена для защиты от усреднения вниз.",
-        )
-        return {"error": f"Монета {sig.symbol} уже в портфеле"}
-
-    # Проверка лимита открытых сделок (ожидающие вход тоже занимают слот)
-    slots_used = len(active_trades) + len(pending_entries)
-    if slots_used >= max_trades:
-        print(f"[AutoTrade] Достигнут лимит открытых сделок ({slots_used}/{max_trades})")
-        return {"error": f"Достигнут лимит активных сделок ({slots_used}/{max_trades})"}
+    if error:
+        print(f"[AutoTrade] Пропуск {sig.symbol}: {error}")
+        if skip_portfolio_notice:
+            send_telegram(
+                token, chat_id,
+                f"ℹ️ <b>Пропуск сигнала {sig.base}/USDT</b>\n\n"
+                f"Монета уже есть в вашем портфеле (средняя цена входа: "
+                f"<code>{fmt_price(portfolio[sig.symbol].get('avg_price', 0))} USDT</code>).\n"
+                f"Повторная покупка пропущена для защиты от усреднения вниз.",
+            )
+        return {"error": error}
 
     # Проверка наличия API-ключей
     api_key, api_secret = get_api_credentials(state)
@@ -1392,8 +1457,15 @@ def execute_pump_auto_trade(
 
     # Получение фильтров торговой пары
     filters = get_symbol_filters(sig.symbol)
+    if not filters.get("step_size"):
+        # Без точных фильтров считать количество нельзя: биржа отвергнет ордер
+        # по LOT_SIZE/PRICE_FILTER, а вход уже будет считаться начатым.
+        return {"error": f"Не удалось получить торговые фильтры {sig.symbol} — вход отменён"}
     if filters.get("status") != "TRADING":
         return {"error": f"Пара {sig.symbol} временно не торгуется на бирже"}
+    if filters.get("stale"):
+        print(f"[AutoTrade] {sig.symbol}: фильтры из кэша (сеть недоступна) — "
+              f"количество может быть отвергнуто биржей")
 
     min_notional = float(filters.get("min_notional", 5.0))
     if trade_amt < min_notional:
@@ -1556,27 +1628,39 @@ def execute_pump_auto_trade(
     trailing_activation_pct = float(settings.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION))
     trailing_distance_pct = float(settings.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE))
 
-    # 3. Размещение LIMIT SELL GTC ордера (Тейк-профит)
-    sell_params = {
-        "symbol": sig.symbol,
-        "side": "SELL",
-        "type": "LIMIT",
-        "timeInForce": "GTC",
-        "quantity": tp_qty_str,
-        "price": tp_price_str,
-    }
-    sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+    # 3. Защита позиции: сначала биржевой OCO (TP + стоп живут на бирже,
+    #    позиция защищена даже когда бот выключен), при отказе — прежняя
+    #    схема с одиночным LIMIT SELL и стопом в процессе бота.
+    oco = {}
+    if bool(settings.get("use_oco", DEFAULT_USE_OCO)):
+        oco = place_protection_oco(sig.symbol, avg_buy_price, exec_qty,
+                                   tp_pct, sl_pct, filters, state)
 
-    # Если биржа вернула ошибку баланса из-за удержанной комиссии BNB/монеты — пробуем списать на 0.15% меньше
-    if "error" in sell_res:
-        err_str = str(sell_res.get("error", ""))
-        print(f"[AutoTrade TP Retry for {sig.symbol}]: {err_str}", file=sys.stderr)
-        reduced_qty = fmt_qty_filter(exec_qty * 0.9985, step_size)
-        if float(reduced_qty) > 0 and reduced_qty != tp_qty_str:
-            sell_params["quantity"] = reduced_qty
-            sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+    if oco:
+        tp_order_id = oco.get("tp_order_id")
+        tp_price_str = fmt_price_filter(oco["tp_price"], tick_size)
+    else:
+        # 3b. Размещение LIMIT SELL GTC ордера (Тейк-профит)
+        sell_params = {
+            "symbol": sig.symbol,
+            "side": "SELL",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": tp_qty_str,
+            "price": tp_price_str,
+        }
+        sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
 
-    tp_order_id = sell_res.get("orderId")
+        # Если биржа вернула ошибку баланса из-за удержанной комиссии BNB/монеты — пробуем списать на 0.15% меньше
+        if "error" in sell_res:
+            err_str = str(sell_res.get("error", ""))
+            print(f"[AutoTrade TP Retry for {sig.symbol}]: {err_str}", file=sys.stderr)
+            reduced_qty = fmt_qty_filter(exec_qty * 0.9985, step_size)
+            if float(reduced_qty) > 0 and reduced_qty != tp_qty_str:
+                sell_params["quantity"] = reduced_qty
+                sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+
+        tp_order_id = sell_res.get("orderId")
     tp_success = bool(tp_order_id)
 
     # 4. Сохранение сделки в активные и в портфель со всеми параметрами риск-менеджмента
@@ -1585,6 +1669,10 @@ def execute_pump_auto_trade(
         "base": sig.base,
         "buy_order_id": buy_order_id,
         "tp_order_id": tp_order_id,
+        # OCO: список и стоп-плечо. Их наличие означает, что стоп сторожит
+        # биржа — позиция защищена, пока бот не работает.
+        "order_list_id": oco.get("order_list_id"),
+        "sl_order_id": oco.get("sl_order_id"),
         "buy_price": avg_buy_price,
         "highest_price": avg_buy_price,
         "tp_price": float(tp_price_str),
@@ -1593,7 +1681,9 @@ def execute_pump_auto_trade(
         "sl_pct": sl_pct,
         "trailing_activation_pct": trailing_activation_pct,
         "trailing_distance_pct": trailing_distance_pct,
-        "qty": float(sell_params["quantity"]),
+        # Фактически исполненный объём (в ветке без OCO sell_params может
+        # не существовать вовсе).
+        "qty": exec_qty,
         "cost_usdt": cum_quote,
         "tp_pct": tp_pct,
         "opened_at": int(time.time()),
@@ -1602,7 +1692,9 @@ def execute_pump_auto_trade(
         "status": "tp_placed" if tp_success else "unhedged_buy",
     }
     active_trades[sig.symbol] = trade_record
-    portfolio_add(state, sig.symbol, float(sell_params["quantity"]), avg_buy_price)
+    # Снимаем бронь слота: сделка ушла в активные, «ожидание входа» больше не нужно
+    state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+    portfolio_add(state, sig.symbol, exec_qty, avg_buy_price)
     save_state(state, sync_git=True)
 
     # 5. Уведомление в Telegram
@@ -1633,6 +1725,20 @@ def execute_pump_auto_trade(
 
 def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> None:
     """
+    Однопоточная обёртка: переход «ожидание → активная сделка» не должен
+    выполняться одновременно из потока монитора и из главного потока,
+    иначе сделка обрабатывается дважды.
+    """
+    if not _PENDING_LOCK.acquire(blocking=False):
+        print("[check_pending_entries] уже выполняется в другом потоке — пропуск такта")
+        return
+    try:
+        _check_pending_entries(token, chat_id, state)
+    finally:
+        _PENDING_LOCK.release()
+
+def _check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> None:
+    """
     Проверяет исполнение лимитных ордеров на вход в откат (Pullback Limit Buy).
     При исполнении выставляет Take-Profit и переводит в активные сделки.
     При истечении таймаута (5 мин) отменяет ордер.
@@ -1656,6 +1762,36 @@ def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> 
             continue
 
         status = res.get("status")
+        executed = float(res.get("executedQty", 0.0) or 0.0)
+        timed_out = now - entry.get("placed_at", now) >= entry.get("timeout_sec", DEFAULT_ENTRY_TIMEOUT_SEC)
+
+        # Частичное исполнение по таймауту. Снимаем остаток, но уже купленные
+        # монеты — НАСТОЯЩАЯ позиция: раньше их просто выбрасывали вместе с
+        # ордером, и они оставались на споте без тейк-профита и без стопа.
+        # Обрабатываем их штатной веткой исполнения ниже.
+        if status == "PARTIALLY_FILLED" and timed_out and executed > 0:
+            cancel_res = binance_signed_request(
+                "DELETE", "/api/v3/order", {"symbol": symbol, "orderId": order_id}, state=state)
+            if cancel_res.get("code") in ORDER_NOT_FOUND_CODES:
+                # Остаток уже не существует — значит ордер дошёл до конца,
+                # перечитываем финальное состояние вместо догадок.
+                again = binance_signed_request(
+                    "GET", "/api/v3/order", {"symbol": symbol, "orderId": order_id}, state=state)
+                if "error" not in again:
+                    cancel_res = again
+            executed = float(cancel_res.get("executedQty", executed) or executed)
+            print(f"[Pending Fill {symbol}]: частично исполнен на {executed}, "
+                  f"остаток снят, позиция берётся под контроль")
+            if executed > 0:
+                merged = dict(res)
+                if "error" not in cancel_res:
+                    merged.update(cancel_res)
+                merged.pop("error", None)
+                merged["status"] = "FILLED"
+                merged["executedQty"] = str(executed)
+                res = merged
+                status = "FILLED"
+
         if status == "FILLED":
             to_remove.append(symbol)
             updated = True
@@ -1683,35 +1819,55 @@ def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> 
                 pass
 
             filters = get_symbol_filters(symbol)
+            have_filters = bool(filters.get("step_size"))
             step_size = filters.get("step_size", 1.0)
             tick_size = filters.get("tick_size", 0.01)
-
-            tp_raw_price = avg_buy_price * (1.0 + (tp_pct / 100.0))
-            tp_price_str = fmt_price_filter(tp_raw_price, tick_size)
-            tp_qty_str = fmt_qty_filter(exec_qty, step_size)
 
             sl_pct = float(settings.get("stop_loss_pct", DEFAULT_STOP_LOSS))
             sl_price = avg_buy_price * (1.0 - (sl_pct / 100.0))
             trailing_act = float(settings.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION))
             trailing_dist = float(settings.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE))
 
-            # Размещение LIMIT SELL GTC (Take-Profit)
-            sell_params = {
-                "symbol": symbol,
-                "side": "SELL",
-                "type": "LIMIT",
-                "timeInForce": "GTC",
-                "quantity": tp_qty_str,
-                "price": tp_price_str,
-            }
-            sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
-            if "error" in sell_res:
-                reduced_qty = fmt_qty_filter(exec_qty * 0.9985, step_size)
-                if float(reduced_qty) > 0 and reduced_qty != tp_qty_str:
-                    sell_params["quantity"] = reduced_qty
-                    sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+            tp_order_id = None
+            tp_price_str = f"{avg_buy_price * (1.0 + tp_pct / 100.0):.8f}"
+            oco = {}
+            use_oco = bool(settings.get("use_oco", DEFAULT_USE_OCO))
+            if have_filters and use_oco:
+                # Сначала пробуем биржевой OCO: он держит TP и стоп на бирже
+                # одновременно, поэтому позиция защищена и без бота.
+                oco = place_protection_oco(symbol, avg_buy_price, exec_qty,
+                                           tp_pct, sl_pct, filters, state)
+                if oco:
+                    tp_order_id = oco.get("tp_order_id")
+                    tp_price_str = fmt_price_filter(oco["tp_price"], tick_size)
+            if not oco and have_filters:
+                tp_raw_price = avg_buy_price * (1.0 + (tp_pct / 100.0))
+                tp_price_str = fmt_price_filter(tp_raw_price, tick_size)
+                tp_qty_str = fmt_qty_filter(exec_qty, step_size)
 
-            tp_order_id = sell_res.get("orderId")
+                # Размещение LIMIT SELL GTC (Take-Profit)
+                sell_params = {
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "timeInForce": "GTC",
+                    "quantity": tp_qty_str,
+                    "price": tp_price_str,
+                }
+                sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+                if "error" in sell_res:
+                    reduced_qty = fmt_qty_filter(exec_qty * 0.9985, step_size)
+                    if float(reduced_qty) > 0 and reduced_qty != tp_qty_str:
+                        sell_params["quantity"] = reduced_qty
+                        sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+                tp_order_id = sell_res.get("orderId")
+            else:
+                # Фильтры недоступны — количество для TP посчитать нечем, биржа
+                # отвергнет ордер. Позицию всё равно ЗАПИСЫВАЕМ, чтобы её вёл
+                # стоп-лосс по цене, и сообщаем, что TP не выставлен.
+                if have_filters:
+                    print(f"[Pending Fill {symbol}]: OCO не выставлен, TP отложен", file=sys.stderr)
+
             tp_success = bool(tp_order_id)
 
             trade_rec = {
@@ -1719,6 +1875,10 @@ def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> 
                 "base": entry.get("base", base_asset(symbol)),
                 "buy_order_id": order_id,
                 "tp_order_id": tp_order_id,
+                # OCO: список и стоп-плечо. Их наличие означает, что стоп
+                # сторожит биржа, а не процесс бота.
+                "order_list_id": oco.get("order_list_id"),
+                "sl_order_id": oco.get("sl_order_id"),
                 "buy_price": avg_buy_price,
                 "highest_price": avg_buy_price,
                 "tp_price": float(tp_price_str),
@@ -1727,7 +1887,10 @@ def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> 
                 "sl_pct": sl_pct,
                 "trailing_activation_pct": trailing_act,
                 "trailing_distance_pct": trailing_dist,
-                "qty": float(sell_params["quantity"]),
+                # Фактически исполненный объём, а НЕ скорректированный на 0.15%
+                # объём ордера TP: иначе позиция в портфеле и в истории
+                # расходится с реальным балансом.
+                "qty": exec_qty,
                 "cost_usdt": cum_quote,
                 "tp_pct": tp_pct,
                 "opened_at": int(time.time()),
@@ -1736,7 +1899,7 @@ def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> 
                 "status": "tp_placed" if tp_success else "unhedged_buy",
             }
             state.setdefault("active_trades", {})[symbol] = trade_rec
-            portfolio_add(state, symbol, float(sell_params["quantity"]), avg_buy_price)
+            portfolio_add(state, symbol, exec_qty, avg_buy_price)
 
             base = entry.get("base", base_asset(symbol))
             atr_lbl = " <i>(динамический ATR)</i>" if atr_calculated else ""
@@ -1767,11 +1930,18 @@ def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> 
             to_remove.append(symbol)
             updated = True
 
-        elif now - entry.get("placed_at", now) >= entry.get("timeout_sec", DEFAULT_ENTRY_TIMEOUT_SEC):
-            # Истёк таймаут ожидания отката
+        elif timed_out:
+            # Истёк таймаут ожидания отката, ничего не исполнено.
+            cancel_res = binance_signed_request(
+                "DELETE", "/api/v3/order", {"symbol": symbol, "orderId": order_id}, state=state)
+            if "error" in cancel_res and cancel_res.get("code") not in ORDER_NOT_FOUND_CODES:
+                # Отменить не удалось — ордер может быть ещё жив. Запись НЕ
+                # выбрасываем, иначе его возможное исполнение пройдёт мимо бота.
+                print(f"[Timeout Pullback Order {symbol}]: отмена не удалась "
+                      f"({cancel_res.get('error')}) — запись оставлена", file=sys.stderr)
+                continue
             to_remove.append(symbol)
             updated = True
-            binance_signed_request("DELETE", "/api/v3/order", {"symbol": symbol, "orderId": order_id}, state=state)
             base = entry.get("base", base_asset(symbol))
             print(f"[Timeout Pullback Order {symbol}]: отменён по истечению таймаута")
             timeout_msg = (
@@ -1789,6 +1959,19 @@ def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> 
 
 def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> None:
     """
+    Однопоточная обёртка: закрытие позиции (TP/SL) не должно обрабатываться
+    из двух потоков одновременно — это задваивало бы PnL в истории.
+    """
+    if not _ACTIVE_LOCK.acquire(blocking=False):
+        print("[check_active_trades] уже выполняется в другом потоке — пропуск такта")
+        return
+    try:
+        _check_active_trades(token, chat_id, state)
+    finally:
+        _ACTIVE_LOCK.release()
+
+def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> None:
+    """
     Проверяет исполнение выставленных тейк-профит ордеров на Binance,
     а также отслеживает Stop-Loss и Trailing-Stop по текущей цене в реальном времени.
     """
@@ -1805,6 +1988,68 @@ def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> No
 
     for symbol, trade in list(active_trades.items()):
         tp_order_id = trade.get("tp_order_id")
+        sl_order_id = trade.get("sl_order_id")
+
+        # 0. Сначала стоп-плечо биржевого OCO. Если оно исполнилось, позицию
+        #    закрыла биржа (тейк-профит при этом отменён автоматически), и
+        #    учитывать это надо ДО проверки TP — иначе сработавший стоп
+        #    выглядел бы как «TP отменён», и позиция оставалась в мониторинге.
+        if sl_order_id:
+            sl_res = binance_signed_request(
+                "GET", "/api/v3/order", {"symbol": symbol, "orderId": sl_order_id}, state=state)
+            if "error" not in sl_res and sl_res.get("status") == "FILLED":
+                symbols_to_remove.append(symbol)
+                updated = True
+                cum_quote = float(sl_res.get("cummulativeQuoteQty", 0.0) or 0.0)
+                filled_qty = float(sl_res.get("executedQty", 0.0) or 0.0)
+                cost = float(trade.get("cost_usdt", 0.0))
+                pnl = cum_quote - cost if cum_quote else 0.0
+                pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
+                sell_price = (cum_quote / filled_qty) if filled_qty > 0 else float(trade.get("sl_price", 0.0))
+
+                closed_rec = dict(trade)
+                closed_rec.update({
+                    "closed_at": int(time.time()),
+                    "sell_price": sell_price,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "ending_balance": get_free_usdt_balance(state),
+                    "status": "oco_stop_loss",
+                })
+                history = state.setdefault("trade_history", [])
+                history.append(closed_rec)
+                if len(history) > 100:
+                    history.pop(0)
+                portfolio_remove(state, symbol)
+                print(f"[OCO {symbol}]: стоп-плечо исполнено биржей по {sell_price}")
+
+                if chat_id:
+                    base_sl = trade.get("base", base_asset(symbol))
+                    send_telegram(
+                        token, chat_id,
+                        f"🛑 <b>СТОП-ЛОСС СРАБОТАЛ НА БИРЖЕ (OCO)</b>\n\n"
+                        f"Позиция <b>{base_sl}/USDT</b> закрыта стоп-плечом OCO "
+                        f"без участия бота:\n"
+                        f"• Вход: <code>{fmt_price(trade.get('buy_price', 0))} $</code>\n"
+                        f"• Выход: <code>{fmt_price(sell_price)} $</code>\n"
+                        f"• Результат: 🔴 <b>{pnl:+.2f} USDT ({fmt_pct(pnl_pct)})</b>\n\n"
+                        f"💡 <i>Второе плечо списка (тейк-профит) отменено биржей автоматически.</i>",
+                    )
+                continue
+            if "error" in sl_res and sl_res.get("code") in ORDER_NOT_FOUND_CODES:
+                # Стоп-плеча на бирже больше нет — возвращаем позицию под
+                # присмотр процесса, иначе она останется вообще без защиты.
+                trade["sl_order_id"] = None
+                trade["order_list_id"] = None
+                updated = True
+                print(f"[OCO {symbol}]: стоп-плечо не найдено на бирже — "
+                      f"перехожу на клиентский стоп {trade.get('sl_price')}")
+            elif sl_res.get("status") in ("CANCELED", "EXPIRED", "REJECTED"):
+                trade["sl_order_id"] = None
+                trade["order_list_id"] = None
+                updated = True
+                print(f"[OCO {symbol}]: стоп-плечо {sl_res.get('status')} — "
+                      f"перехожу на клиентский стоп {trade.get('sl_price')}")
 
         # 1. Проверка исполнения Take-Profit на бирже
         if tp_order_id:
@@ -1876,7 +2121,13 @@ def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> No
                         send_telegram(token, chat_id, warn_msg)
                     # без continue: ниже по коду отработают SL и трейлинг-стоп
 
-        # 2. Мониторинг цены для Stop-Loss и Трейлинг-стопа
+        # 2. Мониторинг цены для Stop-Loss и Трейлинг-стопа.
+        # Пока живо стоп-плечо OCO, выход исполняет биржа: клиентский стоп
+        # здесь только вредил бы — он мог продать второй раз или получить
+        # отказ по балансу, заблокированному под стопом.
+        if trade.get("sl_order_id"):
+            continue
+
         cur_p = current_prices.get(symbol)
         if cur_p is None:
             cur_p = get_price(symbol)
@@ -1985,9 +2236,14 @@ def reconcile_state_with_exchange(token: str, chat_id: Union[str, int], state: d
         res = binance_signed_request("GET", "/api/v3/order",
                                      {"symbol": symbol, "orderId": order_id}, state=state)
         if "error" in res:
-            # Не удаляем запись: ошибка сети неотличима от «ордера нет»,
-            # а потерять живой ордер дороже, чем показать предупреждение.
-            problems.append(f"• {symbol}: не удалось проверить лимитный вход #{order_id} ({res['error']})")
+            # Код от биржи отличает «ордера больше нет» от сетевого сбоя:
+            # -2013/-2011 снимаем спокойно, а на таймаут ничего не трогаем —
+            # потерять живой ордер дороже, чем показать предупреждение.
+            if res.get("code") in ORDER_NOT_FOUND_CODES:
+                state["pending_entries"].pop(symbol, None)
+                problems.append(f"• {symbol}: лимитного ордера #{order_id} нет на бирже — снят с ожидания")
+            else:
+                problems.append(f"• {symbol}: не удалось проверить лимитный вход #{order_id} ({res['error']})")
             continue
         status = res.get("status")
         if status == "FILLED":
@@ -2007,7 +2263,12 @@ def reconcile_state_with_exchange(token: str, chat_id: Union[str, int], state: d
         res = binance_signed_request("GET", "/api/v3/order",
                                      {"symbol": symbol, "orderId": tp_order_id}, state=state)
         if "error" in res:
-            problems.append(f"• {symbol}: не удалось проверить TP-ордер #{tp_order_id} ({res['error']})")
+            if res.get("code") in ORDER_NOT_FOUND_CODES:
+                trade["tp_order_id"] = None
+                trade["status"] = "tp_missing"
+                problems.append(f"• {symbol}: TP-ордера #{tp_order_id} нет на бирже — позиция без тейк-профита")
+            else:
+                problems.append(f"• {symbol}: не удалось проверить TP-ордер #{tp_order_id} ({res['error']})")
         elif res.get("status") == "CANCELED":
             trade["tp_order_id"] = None
             trade["status"] = "tp_order_canceled"
@@ -2026,6 +2287,141 @@ def reconcile_state_with_exchange(token: str, chat_id: Union[str, int], state: d
             )
     else:
         print("[Reconcile] Состояние сходится с биржей")
+
+
+def build_oco_legs(
+    symbol: str,
+    avg_buy_price: float,
+    qty: float,
+    tp_pct: float,
+    sl_pct: float,
+    filters: dict,
+    cur_price: Optional[float] = None,
+) -> Tuple[dict, Optional[str]]:
+    """
+    Строит параметры обеих ног защиты ОТДЕЛЬНЫМИ ордерами:
+    тейк-профит = LIMIT_MAKER SELL, стоп-лосс = STOP_LOSS SELL (по рынку).
+
+    Единый источник истины для количества и цен: и боевое выставление OCO,
+    и предварительная проверка через POST /api/v3/order/test собирают ноги
+    ИМЕННО здесь, поэтому проверяется то, что реально уйдёт на биржу,
+    а не его копия.
+
+    Возвращает (legs, None) либо ({}, причина, почему выставить нельзя).
+    """
+    step = filters.get("step_size")
+    tick = filters.get("tick_size")
+    if not step:
+        return {}, "нет торговых фильтров символа"
+    if not tick:
+        return {}, "нет шага цены (tickSize)"
+    if tp_pct <= 0 or not (0 < sl_pct < 100):
+        return {}, f"некорректные TP/SL ({tp_pct}/{sl_pct})"
+
+    tp_price = float(fmt_price_filter(avg_buy_price * (1.0 + tp_pct / 100.0), tick))
+    sl_trigger = float(fmt_price_filter(avg_buy_price * (1.0 - sl_pct / 100.0), tick))
+    qty_str = fmt_qty_filter(qty, step)
+    if float(qty_str) <= 0:
+        return {}, f"количество {qty} меньше шага {step}"
+    if tp_price <= sl_trigger:
+        return {}, f"цель {tp_price} не выше стопа {sl_trigger}"
+
+    if cur_price is None:
+        cur_price = get_price(symbol) or 0.0
+    if cur_price > 0 and tp_price <= cur_price:
+        return {}, (f"цель {tp_price} не выше рынка {cur_price} — "
+                    f"LIMIT_MAKER будет отвергнут")
+    if cur_price > 0 and sl_trigger >= cur_price:
+        return {}, f"стоп {sl_trigger} не ниже рынка {cur_price}"
+
+    legs = {
+        "tp": {"symbol": symbol, "side": "SELL", "type": "LIMIT_MAKER",
+               "quantity": qty_str, "price": fmt_price_filter(tp_price, tick)},
+        "sl": {"symbol": symbol, "side": "SELL", "type": "STOP_LOSS",
+               "quantity": qty_str, "stopPrice": fmt_price_filter(sl_trigger, tick)},
+        "tp_price": tp_price,
+        "sl_price": sl_trigger,
+        "qty": float(qty_str),
+        "cur_price": cur_price,
+    }
+    return legs, None
+
+
+def place_protection_oco(
+    symbol: str,
+    avg_buy_price: float,
+    qty: float,
+    tp_pct: float,
+    sl_pct: float,
+    filters: dict,
+    state: dict,
+    cur_price: Optional[float] = None,
+) -> dict:
+    """
+    Ставит на бирже OCO-список: тейк-профит (LIMIT_MAKER) и стоп-лосс
+    (STOP_LOSS по рынку) одновременно. Срабатывание одного плеча
+    автоматически отменяет другое, и позиция защищена без участия бота.
+
+    Возвращает поля для записи сделки либо {} — тогда вызывающий код обязан
+    откатиться на прежнюю схему (лимитный TP + стоп в процессе бота).
+    """
+    legs, reason = build_oco_legs(symbol, avg_buy_price, qty, tp_pct, sl_pct,
+                                  filters, cur_price)
+    if not legs:
+        print(f"[OCO {symbol}]: не выставлен — {reason}", file=sys.stderr)
+        return {}
+
+    params = {
+        "symbol": symbol,
+        "side": "SELL",
+        "quantity": legs["tp"]["quantity"],
+        "aboveType": legs["tp"]["type"],
+        "abovePrice": legs["tp"]["price"],
+        "belowType": legs["sl"]["type"],
+        "belowStopPrice": legs["sl"]["stopPrice"],
+        "newOrderRespType": "FULL",
+    }
+    res = binance_signed_request("POST", "/api/v3/orderList/oco", params, state=state)
+    if "error" in res or res.get("orderListId") is None:
+        print(f"[OCO {symbol}]: не удалось выставить ({res.get('error')}) — "
+              f"откат на лимитный TP с клиентским стопом", file=sys.stderr)
+        return {}
+
+    tp_order_id = None
+    sl_order_id = None
+    for o in (res.get("orders") or res.get("orderReports") or []):
+        otype = str(o.get("type", ""))
+        if otype == "LIMIT_MAKER":
+            tp_order_id = o.get("orderId")
+        elif "STOP" in otype or "TAKE_PROFIT" in otype:
+            sl_order_id = o.get("orderId")
+
+    print(f"[OCO {symbol}]: выставлен список #{res.get('orderListId')} "
+          f"(TP #{tp_order_id} {legs['tp_price']}, SL #{sl_order_id} {legs['sl_price']})")
+    return {
+        "order_list_id": res.get("orderListId"),
+        "tp_order_id": tp_order_id,
+        "sl_order_id": sl_order_id,
+        "tp_price": legs["tp_price"],
+        "sl_price": legs["sl_price"],
+        "qty": legs["qty"],
+    }
+
+
+def cancel_protection_oco(symbol: str, trade: dict, state: dict) -> dict:
+    """
+    Снимает OCO-список перед ручной или экстренной продажей: пока список
+    жив, монеты заблокированы под стоп-плечом, и MARKET SELL отвергнется
+    по недостатку свободного баланса.
+    """
+    list_id = (trade or {}).get("order_list_id")
+    if not list_id:
+        return {}
+    res = binance_signed_request(
+        "DELETE", "/api/v3/orderList",
+        {"symbol": symbol, "orderListId": list_id}, state=state)
+    print(f"[Cancel OCO list #{list_id} for {symbol}]: {res}")
+    return res
 
 
 def execute_emergency_market_sell(
@@ -2052,7 +2448,16 @@ def execute_emergency_market_sell(
         send_telegram(token, chat_id, f"❌ {err}")
         return {"error": err}
 
-    # 1. Если есть открытый TP ордер на бирже — отменяем его для разблокировки монет
+    # 1. Разблокировка монет перед продажей. С OCO монеты держит стоп-плечо
+    #    списка, поэтому снимать только TP недостаточно — MARKET SELL
+    #    отвергнется по недостатку свободного баланса.
+    if (trade or {}).get("order_list_id"):
+        cancel_res = cancel_protection_oco(symbol, trade, state)
+        if "error" in cancel_res and cancel_res.get("code") not in ORDER_NOT_FOUND_CODES:
+            return {"error": f"Не удалось снять OCO-список: {cancel_res.get('error')}"}
+        trade["order_list_id"] = None
+        trade["sl_order_id"] = None
+
     tp_order_id = trade.get("tp_order_id") if trade else None
     if tp_order_id:
         cancel_res = binance_signed_request(
@@ -2062,6 +2467,8 @@ def execute_emergency_market_sell(
             state=state,
         )
         print(f"[Cancel TP order #{tp_order_id} for {symbol}]: {cancel_res}")
+        if "error" not in cancel_res or cancel_res.get("code") in ORDER_NOT_FOUND_CODES:
+            trade["tp_order_id"] = None
 
     # 2. Получаем реальный спотовый баланс монеты
     assets, err = get_spot_account_assets(state)
@@ -2483,6 +2890,20 @@ def set_custom_target_sell(token: str, chat_id: Union[str, int], state: dict, sy
 
 def sync_trades_and_active_positions(state: dict) -> None:
     """
+    Однопоточная обёртка: функция переписывает записи active_trades целиком,
+    а вызывается и из команд главного потока, и из монитора — параллельный
+    запуск затирал бы свежие данные чужой копией записи.
+    """
+    if not _SYNC_LOCK.acquire(blocking=False):
+        print("[sync_trades] уже выполняется в другом потоке — пропуск")
+        return
+    try:
+        _sync_trades_and_active_positions(state)
+    finally:
+        _SYNC_LOCK.release()
+
+def _sync_trades_and_active_positions(state: dict) -> None:
+    """
     Автоматически синхронизирует открытые позиции и историю сделок с Binance Spot:
     1. Обнаруживает любые купленные активы на спотовом балансе (TRX, SOL, BTC и т.д.).
     2. Привязывает открытые лимитные ордера Take-Profit (/api/v3/openOrders).
@@ -2501,7 +2922,10 @@ def sync_trades_and_active_positions(state: dict) -> None:
 
         # 1. Получаем все открытые ордера на Binance Spot
         open_orders_res = binance_signed_request("GET", "/api/v3/openOrders", state=state)
-        open_orders = open_orders_res if isinstance(open_orders_res, list) else []
+        # Сбой запроса НЕ равен «ордеров нет»: при ошибке нельзя стирать
+        # tp_order_id, иначе живая защита исчезает из состояния бота.
+        open_orders_ok = isinstance(open_orders_res, list)
+        open_orders = open_orders_res if open_orders_ok else []
 
         # 2. Получаем балансы спота
         assets, err = get_spot_account_assets(state)
@@ -2559,28 +2983,61 @@ def sync_trades_and_active_positions(state: dict) -> None:
             if buy_price <= 0:
                 buy_price = cur_p
 
-            if tp_price <= 0 and buy_price > 0:
+            if tp_price <= 0 and buy_price > 0 and open_orders_ok:
+                # Живого TP-ордера нет — показываем целевую цену как ориентир,
+                # но не выдаём её за выставленный ордер.
                 tp_price = buy_price * (1.0 + tp_pct_default / 100.0)
 
             tp_pct_actual = ((tp_price - buy_price) / buy_price * 100.0) if buy_price > 0 else tp_pct_default
 
+            # СЛИВАЕМ с прежней записью, а не заменяем её целиком. Полная
+            # перезапись теряла то, что бот знает лучше биржи: пик для
+            # трейлинга, настройки трейлинга, метки проваленного выхода,
+            # а при сбое запроса openOrders — ещё и рабочий tp_order_id
+            # (позиция выглядела без TP, хотя ордер жил на бирже).
+            prev = trade_rec or {}
+            sl_pct_prev = float(prev.get("sl_pct", settings.get("stop_loss_pct", DEFAULT_STOP_LOSS)))
+            sl_price_prev = float(prev.get("sl_price", 0.0) or 0.0)
+            if sl_price_prev <= 0 and buy_price > 0:
+                sl_price_prev = buy_price * (1.0 - sl_pct_prev / 100.0)
+
+            if not open_orders_ok:
+                # Состояние ордеров неизвестно — сохраняем прежние значения,
+                # чтобы не объявить позицию незащищённой ошибочно.
+                tp_order_id = prev.get("tp_order_id")
+                status = prev.get("status", "holding")
+                if not tp_price:
+                    tp_price = float(prev.get("tp_price", 0.0) or 0.0)
+            else:
+                status = "tp_placed" if tp_order_id else "holding"
+                if prev.get("status") == "exit_failed" and not tp_order_id:
+                    status = "exit_failed"      # стоп ещё не сработал, не гасим метку
+
             active_trades[sym] = {
                 "symbol": sym,
                 "base": asset,
-                "buy_order_id": trade_rec.get("buy_order_id") if trade_rec else None,
+                "buy_order_id": prev.get("buy_order_id"),
                 "tp_order_id": tp_order_id,
                 "buy_price": buy_price,
-                "highest_price": max(cur_p, buy_price),
+                # пик движения НЕ понижаем: иначе трейлинг теряет максимум
+                "highest_price": max(cur_p, buy_price, float(prev.get("highest_price", 0.0) or 0.0)),
                 "tp_price": tp_price,
-                "sl_price": trade_rec.get("sl_price", buy_price * 0.98) if trade_rec else buy_price * 0.98,
-                "trailing_sl": trade_rec.get("trailing_sl", buy_price * 0.98) if trade_rec else buy_price * 0.98,
-                "sl_pct": trade_rec.get("sl_pct", 2.0) if trade_rec else 2.0,
+                "sl_price": sl_price_prev,
+                "trailing_sl": float(prev.get("trailing_sl", sl_price_prev) or sl_price_prev),
+                "sl_pct": sl_pct_prev,
+                "trailing_activation_pct": float(prev.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION)),
+                "trailing_distance_pct": float(prev.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE)),
                 "qty": tot_qty,
                 "cost_usdt": tot_qty * buy_price,
                 "tp_pct": tp_pct_actual,
-                "opened_at": opened_at or int(time.time()),
-                "status": "tp_placed" if tp_order_id else "holding",
+                "opened_at": int(prev.get("opened_at", opened_at) or opened_at) or int(time.time()),
+                "status": status,
             }
+            # Метки повторных попыток выхода переносим, иначе алерт о
+            # несработавшем стопе начнёт сыпаться каждые 20 секунд.
+            for keep in ("exit_failed_at", "exit_alert_at", "exit_error", "signal_score", "signal_source"):
+                if keep in prev:
+                    active_trades[sym][keep] = prev[keep]
             if sym not in portfolio:
                 portfolio[sym] = {
                     "symbol": sym,
