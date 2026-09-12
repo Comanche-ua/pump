@@ -87,17 +87,30 @@ MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "50"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
 KLINES_LIMIT = 250  # 250 баров по 5m (~20 часов подробной истории)
 
-# Параметры спотовой автоторговли
+# Параметры спотовой автоторговли.
+# TP/SL подобраны бэктестом (backtest/backtest.py) и подтверждены на трёх
+# независимых выборках: in-sample (40 пар), другой период (тот же набор со
+# сдвигом на 30 дней), другая вселенная (ранги 41-80 по объёму). Значимо
+# положительный матожидаемый исход во ВСЕХ трёх дают только конфигурации,
+# где СТОП ШИРЕ ЦЕЛИ (1.5%/3.0% и 2.0%/3.0%). Симметричный 2.0%/2.0% и любые
+# узкие стопы (0.5%, 1.0%) значимо убыточны: узкий стоп выбивается обычным
+# шумом, после которого цена возвращается. Подробности — `--help` харнесса.
 DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "11.0"))
-DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "2.0"))
-DEFAULT_STOP_LOSS = float(os.environ.get("STOP_LOSS_PCT", "2.0"))
+DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "1.5"))
+DEFAULT_STOP_LOSS = float(os.environ.get("STOP_LOSS_PCT", "3.0"))
 DEFAULT_ENTRY_PULLBACK = float(os.environ.get("ENTRY_PULLBACK_PCT", "0.4"))  # Вход на микро-откате (-0.4% по умолчанию)
 DEFAULT_ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_TIMEOUT_SEC", "300"))   # Таймаут жизни лимитного ордера на вход (5 мин)
-DEFAULT_TRAILING_ACTIVATION = float(os.environ.get("TRAILING_ACTIVATION_PCT", "1.0"))
+# Активация трейлинга ВЫШЕ цели — иначе трейлинг перебивает лимитный TP:
+# при активации +1% и дистанции 0.8% стоп встаёт на high-0.8%, то есть раньше
+# TP. Теперь фиксированный TP решает исход, а трейлинг остаётся страховкой
+# на случай, если лимитный TP снят или не выставлен.
+DEFAULT_TRAILING_ACTIVATION = float(os.environ.get("TRAILING_ACTIVATION_PCT", "2.5"))
 DEFAULT_TRAILING_DISTANCE = float(os.environ.get("TRAILING_DISTANCE_PCT", "0.8"))
 DEFAULT_DYNAMIC_TP = os.environ.get("DYNAMIC_TP", "true").strip().lower() in ("true", "1")
 DEFAULT_AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").strip().lower() in ("true", "1")
 DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "70.0"))
+# Прежний дефолт TP — нужен только для миграции уже сохранённого состояния
+PREVIOUS_TAKE_PROFIT_DEFAULT = 2.0
 
 IS_CI = (
     os.environ.get("GITHUB_ACTIONS") == "true"
@@ -759,14 +772,22 @@ def default_state() -> dict:
             "scan_interval_sec": DEFAULT_SCAN_INTERVAL,
             "filter_level": "strong_and_watch",  # "strong_only" или "strong_and_watch"
             "auto_trade": DEFAULT_AUTO_TRADE,
+            "trade_mode": "fixed",                # "fixed" | "all" | "pct:N"
             "trade_amount_usdt": DEFAULT_TRADE_AMOUNT,
             "take_profit_pct": DEFAULT_TAKE_PROFIT,
+            "stop_loss_pct": DEFAULT_STOP_LOSS,
+            "entry_pullback_pct": DEFAULT_ENTRY_PULLBACK,
+            "dynamic_tp": DEFAULT_DYNAMIC_TP,
+            "trailing_activation_pct": DEFAULT_TRAILING_ACTIVATION,
+            "trailing_distance_pct": DEFAULT_TRAILING_DISTANCE,
             "max_open_trades": 3,
             "trade_min_score": DEFAULT_TRADE_MIN_SCORE,
         },
         "active_trades": {},      # symbol -> trade dict
         "trade_history": [],      # list of closed trades
         "sent_alerts": {},        # pump alert_key -> timestamp
+        "pending_entries": {},    # symbol -> выставленный, но ещё не исполненный LIMIT BUY
+        "symbol_alert_cooldown": {},  # symbol -> timestamp последнего алерта
         "allowed_chats": [],
     }
 
@@ -779,6 +800,22 @@ def load_state() -> dict:
             data = json.load(f)
         d["portfolio"].update(data.get("portfolio", {}))
         d["settings"].update(data.get("settings", {}))
+
+        # Миграция настроек торговли (однократная).
+        # Сохранённый TP, равный ПРЕЖНЕМУ дефолту 2.0%, — это не осознанный
+        # выбор пользователя, а старое значение по умолчанию. Бэктест показал,
+        # что 2.0% при стопе 2.0% значимо убыточен, поэтому такие записи
+        # переносим на новый дефолт. Вручную изменённые значения не трогаем.
+        if not d["settings"].get("trade_defaults_migrated"):
+            saved_tp = d["settings"].get("take_profit_pct")
+            if saved_tp is not None and abs(float(saved_tp) - PREVIOUS_TAKE_PROFIT_DEFAULT) < 1e-9:
+                d["settings"]["take_profit_pct"] = DEFAULT_TAKE_PROFIT
+                d["settings"]["stop_loss_pct"] = DEFAULT_STOP_LOSS
+                d["settings"]["trailing_activation_pct"] = DEFAULT_TRAILING_ACTIVATION
+                print(f"Миграция настроек торговли: TP {PREVIOUS_TAKE_PROFIT_DEFAULT}% → "
+                      f"{DEFAULT_TAKE_PROFIT}%, SL → {DEFAULT_STOP_LOSS}%, "
+                      f"активация трейлинга → {DEFAULT_TRAILING_ACTIVATION}% (дефолты из бэктеста)")
+            d["settings"]["trade_defaults_migrated"] = True
         d["active_trades"].update(data.get("active_trades", {}))
         d["trade_history"] = data.get("trade_history", [])[-50:]
         sent = data.get("sent_alerts", {})
@@ -788,6 +825,10 @@ def load_state() -> dict:
             d["sent_alerts"] = {k: now for k in sent}
         elif isinstance(sent, dict):
             d["sent_alerts"] = sent
+        # pending_entries НЕЛЬЗЯ терять при рестарте: по ним на бирже висит
+        # живой LIMIT BUY, который иначе исполнится в никуда (монеты без TP/SL)
+        d["pending_entries"] = data.get("pending_entries", {}) or {}
+        d["symbol_alert_cooldown"] = data.get("symbol_alert_cooldown", {}) or {}
         d["allowed_chats"] = list(set(data.get("allowed_chats", [])))
     except Exception as e:
         print(f"Не удалось прочитать {STATE_FILE}: {e}", file=sys.stderr)
@@ -806,18 +847,33 @@ def _git_sync_state() -> None:
         pass
 
 def save_state(state: dict, sync_git: bool = False) -> None:
+    cutoff = int(time.time()) - 86400
     with STATE_LOCK:
-        # Очищаем устаревшие алерты (старше 24ч)
-        cutoff = int(time.time()) - 86400
-        state["sent_alerts"] = {k: ts for k, ts in state["sent_alerts"].items() if ts > cutoff}
+        # Чистим устаревшее, МУТИРУЯ словари на месте: переприсваивание
+        # (state["sent_alerts"] = {...}) ломает ссылки, которые уже держат
+        # другие потоки, и их записи уходят в выброшенный словарь.
+        sent = state.setdefault("sent_alerts", {})
+        for k in [k for k, ts in sent.items() if ts <= cutoff]:
+            sent.pop(k, None)
+        cooldown = state.setdefault("symbol_alert_cooldown", {})
+        for k in [k for k, ts in cooldown.items() if ts <= cutoff]:
+            cooldown.pop(k, None)
 
         tmp = STATE_FILE + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, STATE_FILE)
-        except Exception as e:
-            print(f"Не удалось сохранить {STATE_FILE}: {e}", file=sys.stderr)
+        for attempt in range(3):
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, STATE_FILE)
+                break
+            except RuntimeError as e:
+                # Другой поток изменил коллекцию прямо во время сериализации.
+                # Раньше это молча теряло запись состояния целиком.
+                print(f"Повтор сохранения {STATE_FILE} (попытка {attempt + 1}/3): {e}", file=sys.stderr)
+                time.sleep(0.05)
+            except Exception as e:
+                print(f"Не удалось сохранить {STATE_FILE}: {e}", file=sys.stderr)
+                break
 
         if sync_git and os.environ.get("GITHUB_ACTIONS") == "true":
             threading.Thread(target=_git_sync_state, daemon=True).start()
@@ -1260,9 +1316,17 @@ def execute_pump_auto_trade(
     max_trades = int(settings.get("max_open_trades", 3))
 
     active_trades = state.setdefault("active_trades", {})
+    pending_entries = state.setdefault("pending_entries", {})
     portfolio = state.get("portfolio", {})
 
-    # Проверка на повторный вход: монета уже есть в активных сделках или портфеле
+    # Проверка на повторный вход: монета уже в активных сделках, в ожидании
+    # лимитного входа или в портфеле. Без проверки pending повторный сигнал
+    # затирал запись о живом лимитном ордере — тот исполнялся «в никуда».
+    if sig.symbol in pending_entries:
+        waiting_id = pending_entries[sig.symbol].get("order_id")
+        print(f"[AutoTrade] Пропуск {sig.symbol}: уже ждёт исполнения лимитный ордер #{waiting_id}")
+        return {"error": f"По монете {sig.symbol} уже выставлен лимитный ордер на вход"}
+
     if sig.symbol in active_trades:
         print(f"[AutoTrade] Пропуск {sig.symbol}: уже есть активная сделка")
         return {"error": f"По монете {sig.symbol} уже есть открытая позиция"}
@@ -1278,10 +1342,11 @@ def execute_pump_auto_trade(
         )
         return {"error": f"Монета {sig.symbol} уже в портфеле"}
 
-    # Проверка лимита открытых сделок
-    if len(active_trades) >= max_trades:
-        print(f"[AutoTrade] Достигнут лимит открытых сделок ({len(active_trades)}/{max_trades})")
-        return {"error": f"Достигнут лимит активных сделок ({len(active_trades)}/{max_trades})"}
+    # Проверка лимита открытых сделок (ожидающие вход тоже занимают слот)
+    slots_used = len(active_trades) + len(pending_entries)
+    if slots_used >= max_trades:
+        print(f"[AutoTrade] Достигнут лимит открытых сделок ({slots_used}/{max_trades})")
+        return {"error": f"Достигнут лимит активных сделок ({slots_used}/{max_trades})"}
 
     # Проверка наличия API-ключей
     api_key, api_secret = get_api_credentials(state)
@@ -1794,16 +1859,22 @@ def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> No
                     continue
 
                 elif status == "CANCELED":
-                    symbols_to_remove.append(symbol)
+                    # TP снят на бирже (вручную или по причине биржи). Раньше
+                    # сделка молча снималась с мониторинга — монеты оставались
+                    # на споте без TP и без стопа. Теперь ведём её по цене.
+                    trade["tp_order_id"] = None
+                    trade["status"] = "tp_order_canceled"
                     updated = True
                     base = trade.get("base", base_asset(symbol))
                     warn_msg = (
-                        f"⚠️ <b>Тейк-профит ордер #{tp_order_id} по {base}/USDT был отменён на бирже.</b>\n"
-                        f"Сделка снята с автоматического мониторинга бота."
+                        f"⚠️ <b>Тейк-профит ордер #{tp_order_id} по {base}/USDT отменён на бирже.</b>\n\n"
+                        f"Позиция <b>остаётся под контролем стопа и трейлинга</b> "
+                        f"(уровень стопа: <code>{fmt_price(trade.get('sl_price', 0))} $</code>).\n"
+                        f"💡 Проверьте позицию и при необходимости продайте через /sell."
                     )
                     if chat_id:
                         send_telegram(token, chat_id, warn_msg)
-                    continue
+                    # без continue: ниже по коду отработают SL и трейлинг-стоп
 
         # 2. Мониторинг цены для Stop-Loss и Трейлинг-стопа
         cur_p = current_prices.get(symbol)
@@ -1843,7 +1914,30 @@ def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> No
                 print(f"[StopTrigger for {symbol}]: cur={cur_p} <= stop={effective_stop} (trailing={is_trailing})")
 
                 # Экстренное закрытие по рынку
-                execute_emergency_market_sell(token, chat_id, state, symbol)
+                sell_res = execute_emergency_market_sell(token, chat_id, state, symbol)
+                if "error" in sell_res or not sell_res.get("success"):
+                    # Продать не удалось. Позицию НЕ бросаем: если снять её с
+                    # мониторинга сейчас, монеты останутся без стопа навсегда.
+                    trade["status"] = "exit_failed"
+                    trade["exit_error"] = str(sell_res.get("error", "unknown"))
+                    updated = True
+                    print(f"[StopTrigger for {symbol}]: продажа не удалась: {sell_res.get('error')}")
+                    # Алерт не чаще раза в 10 минут: стоп проверяется каждые ~20с,
+                    # иначе Telegram получает десятки одинаковых сообщений
+                    now_ts = int(time.time())
+                    if chat_id and now_ts - int(trade.get("exit_alert_at", 0)) > 600:
+                        trade["exit_alert_at"] = now_ts
+                        send_telegram(
+                            token, chat_id,
+                            f"🚨 <b>STOP-LOSS НЕ СРАБОТАЛ по {base}/USDT!</b>\n\n"
+                            f"• Уровень стопа: <code>{fmt_price(effective_stop)} $</code>\n"
+                            f"• Цена сейчас: <code>{fmt_price(cur_p)} $</code>\n"
+                            f"• Ошибка: <code>{sell_res.get('error', 'unknown')}</code>\n\n"
+                            f"⚠️ <i>Позиция остаётся в мониторинге — бот повторит попытку. "
+                            f"Проверьте баланс и ордера на Binance вручную!</i>",
+                        )
+                    continue
+
                 symbols_to_remove.append(symbol)
                 updated = True
 
@@ -1867,6 +1961,72 @@ def check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> No
 
     if updated:
         save_state(state, sync_git=True)
+
+def reconcile_state_with_exchange(token: str, chat_id: Union[str, int], state: dict) -> None:
+    """
+    Сверка состояния с биржей сразу после запуска.
+
+    Главный источник потерянных позиций: бот выключается (в CI — каждые
+    5 часов по лимиту workflow) с живым ордером на бирже. После рестарта
+    состояние расходится с реальностью, и такие позиции никто не ведёт.
+    Функция ничего не продаёт — только находит расхождения и сообщает.
+    """
+    api_key, api_secret = get_api_credentials(state)
+    if not api_key or not api_secret:
+        return
+
+    problems = []
+
+    for symbol, entry in list(state.get("pending_entries", {}).items()):
+        order_id = entry.get("order_id")
+        if not order_id:
+            state["pending_entries"].pop(symbol, None)
+            continue
+        res = binance_signed_request("GET", "/api/v3/order",
+                                     {"symbol": symbol, "orderId": order_id}, state=state)
+        if "error" in res:
+            # Не удаляем запись: ошибка сети неотличима от «ордера нет»,
+            # а потерять живой ордер дороже, чем показать предупреждение.
+            problems.append(f"• {symbol}: не удалось проверить лимитный вход #{order_id} ({res['error']})")
+            continue
+        status = res.get("status")
+        if status == "FILLED":
+            problems.append(
+                f"• {symbol}: лимитный вход #{order_id} исполнился, пока бот не работал — "
+                f"позиция осталась без тейк-профита!"
+            )
+        elif status in ("CANCELED", "EXPIRED", "REJECTED"):
+            state["pending_entries"].pop(symbol, None)
+            problems.append(f"• {symbol}: лимитный вход #{order_id} в статусе {status} — снят с ожидания")
+
+    for symbol, trade in state.get("active_trades", {}).items():
+        tp_order_id = trade.get("tp_order_id")
+        if not tp_order_id:
+            problems.append(f"• {symbol}: активная сделка без ордера тейк-профита")
+            continue
+        res = binance_signed_request("GET", "/api/v3/order",
+                                     {"symbol": symbol, "orderId": tp_order_id}, state=state)
+        if "error" in res:
+            problems.append(f"• {symbol}: не удалось проверить TP-ордер #{tp_order_id} ({res['error']})")
+        elif res.get("status") == "CANCELED":
+            trade["tp_order_id"] = None
+            trade["status"] = "tp_order_canceled"
+            problems.append(f"• {symbol}: TP-ордер #{tp_order_id} отменён — позиция ведётся только по стопу")
+
+    if problems:
+        save_state(state)
+        print("[Reconcile] Расхождения с биржей:\n" + "\n".join(problems))
+        if chat_id:
+            send_telegram(
+                token, chat_id,
+                "🔄 <b>Сверка состояния с биржей после запуска</b>\n\n"
+                + "\n".join(problems[:15])
+                + "\n\n💡 <i>Проверьте эти позиции вручную: пока бот был выключен, "
+                  "события на бирже шли без его участия.</i>",
+            )
+    else:
+        print("[Reconcile] Состояние сходится с биржей")
+
 
 def execute_emergency_market_sell(
     token: str,
@@ -3593,6 +3753,13 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
     set_bot_commands(token)
     drop_pending_updates(token)
+
+    # Сверяем состояние с биржей ДО старта воркеров: иначе забытый лимитный
+    # вход или сделка без живого TP так и останутся без присмотра.
+    try:
+        reconcile_state_with_exchange(token, chat_id, state)
+    except Exception as e:
+        print(f"[Reconcile] Ошибка сверки состояния: {e}", file=sys.stderr)
 
     stop_event = threading.Event()
     scan_thread: Optional[threading.Thread] = None
