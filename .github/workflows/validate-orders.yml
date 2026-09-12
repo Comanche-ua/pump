@@ -1,0 +1,77 @@
+name: Validate Orders + Tests
+
+# Зачем этот workflow:
+#   1) `tests/` — регрессионные тесты денежных путей бота (запускаются на push);
+#   2) `tools/validate_orders.py --live` — предварительная проверка ордеров
+#      на РЕАЛЬНОЙ бирже через POST /api/v3/order/test.
+#
+# ВАЖНО ПРО БЕЗОПАСНОСТЬ: проверка ордеров НЕ создаёт ордера. Инструмент
+# tools/validate_orders.py умеет вызывать только /api/v3/order/test — биржа
+# валидирует параметры, подпись и средства, но ордер в стакан не попадает.
+# Поэтому live-шаг можно безопасно запускать кнопкой на боевом аккаунте.
+
+on:
+  workflow_dispatch:            # ручной запуск: тесты + проверка ордеров
+    inputs:
+      symbols:
+        description: "Пары через запятую (можно базовые тикеры: SOL,ADA,DOGE)"
+        default: "SOLUSDT,ADAUSDT,DOGEUSDT"
+        required: false
+      notional:
+        description: "USDT для расчёта тестового количества"
+        default: "15"
+        required: false
+  push:                         # только регрессионные тесты, без обращения к аккаунту
+    paths:
+      - "pump_bot.py"
+      - "whale_scan.py"
+      - "tools/validate_orders.py"
+      - "tests/**"
+      - ".github/workflows/validate-orders.yml"
+
+concurrency:
+  group: validate-orders
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile check
+        run: |
+          python -m py_compile pump_bot.py whale_scan.py
+          python -m py_compile tools/validate_orders.py
+
+      - name: Regression tests (денежные пути, без сети)
+        # Сеть во время тестов подменяется заглушками, ключи не нужны.
+        run: python tests/test_trade_safety.py
+
+      - name: Validate orders via order/test (ордера НЕ создаются)
+        # Только ручной запуск: это подписанные запросы к боевому аккаунту.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          BINANCE_TRADE_URL: ${{ secrets.BINANCE_TRADE_URL }}
+          BINANCE_PROXY: ${{ secrets.BINANCE_PROXY }}
+          BINANCE_DATA_BASE: ${{ secrets.BINANCE_DATA_BASE }}
+          # Дефолты из бэктеста, чтобы проверялись боевые параметры
+          TAKE_PROFIT_PCT: "1.0"
+          STOP_LOSS_PCT: "3.0"
+          USE_OCO: "true"
+        run: |
+          python tools/validate_orders.py --live \
+            --symbols "${{ github.event.inputs.symbols || 'SOLUSDT,ADAUSDT,DOGEUSDT' }}" \
+            --notional "${{ github.event.inputs.notional || '15' }}"
