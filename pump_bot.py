@@ -4258,30 +4258,41 @@ def format_portfolio(state: dict) -> str:
     return "\n".join(lines)
 
 def format_trades_and_profit_stats(state: dict) -> str:
-    # 1. Синхронизируем открытые позиции и историю реальных сделок с Binance
-    sync_trades_and_active_positions(state)
-
+    """
+    Компактный журнал сделок по дням (сегодня / вчера).
+    НЕ вызывает sync — работает только с данными state + один batch-запрос цен для открытых позиций.
+    """
     active_trades = state.get("active_trades", {})
-    portfolio = state.get("portfolio", {})
-    history = state.get("trade_history", [])
-    settings = state.get("settings", {})
+    portfolio     = state.get("portfolio", {})
+    history       = state.get("trade_history", [])
+    settings      = state.get("settings", {})
+
     trade_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
-    tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
-    auto_trade_status = "🟢 Включена" if settings.get("auto_trade", False) else "🔴 Выключена"
+    tp_pct    = float(settings.get("take_profit_pct",   DEFAULT_TAKE_PROFIT))
+    auto_on   = settings.get("auto_trade", False)
+    auto_icon = "🟢" if auto_on else "🔴"
 
     api_key, api_secret = get_api_credentials(state)
-    has_api = bool(api_key and api_secret)
+    has_api   = bool(api_key and api_secret)
     free_usdt = get_free_usdt_balance(state) if has_api else 0.0
 
-    lines = [
-        "📊 <b>СТАТИСТИКА АВТОТОРГОВЛИ И РЕАЛИЗОВАННЫЙ ПРОФИТ</b>\n",
-        f"• <b>Автоторговля:</b> {auto_trade_status} (ставка: <code>{trade_amt:.0f} $</code>, TP: <code>+{tp_pct:.1f}%</code>)",
-        f"• <b>Свободный баланс:</b> <code>{free_usdt:,.2f} USDT</code>\n",
-        "─────────────────────"
-    ]
+    # ── Определяем границы «сегодня» и «вчера» ─────────────────────────
+    now_ts   = time.time()
+    tz_off   = time.timezone if (time.localtime().tm_isdst == 0) else time.altzone
+    now_loc  = now_ts - tz_off
+    day_sec  = 86400
+    today_start    = int(now_loc // day_sec) * day_sec + tz_off
+    yesterday_start = today_start - day_sec
 
-    # 2. ОТКРЫТЫЕ СДЕЛКИ И СПОТОВЫЕ АКТИВЫ
-    open_items = {}
+    def day_label(ts: float) -> str:
+        if ts >= today_start:
+            return "today"
+        if ts >= yesterday_start:
+            return "yesterday"
+        return "older"
+
+    # ── Открытые позиции: один batch-запрос цен ─────────────────────────
+    open_items: dict = {}
     for sym, tr in active_trades.items():
         open_items[sym] = dict(tr)
     for sym, pos in portfolio.items():
@@ -4289,131 +4300,170 @@ def format_trades_and_profit_stats(state: dict) -> str:
             open_items[sym] = {
                 "symbol": sym,
                 "base": base_asset(sym),
-                "buy_price": float(pos.get("avg_price", 0.0)),
-                "qty": float(pos.get("qty", 0.0)),
-                "cost_usdt": float(pos.get("qty", 0.0)) * float(pos.get("avg_price", 0.0)),
-                "tp_price": float(pos.get("avg_price", 0.0)) * (1.0 + tp_pct / 100.0),
-                "tp_pct": tp_pct,
-                "opened_at": pos.get("added_at", int(time.time())),
+                "buy_price":  float(pos.get("avg_price", 0.0)),
+                "qty":        float(pos.get("qty", 0.0)),
+                "cost_usdt":  float(pos.get("qty", 0.0)) * float(pos.get("avg_price", 0.0)),
+                "tp_price":   float(pos.get("avg_price", 0.0)) * (1.0 + tp_pct / 100.0),
+                "tp_pct":     tp_pct,
+                "opened_at":  pos.get("added_at", int(now_ts)),
             }
 
+    cur_prices: dict = {}
     if open_items:
-        symbols = list(open_items.keys())
-        prices = get_multiple_prices(symbols) if symbols else {}
+        cur_prices = get_multiple_prices(list(open_items.keys())) or {}
 
-        total_cost = 0.0
-        total_val = 0.0
-        total_exp_gain = 0.0
+    # ── Собираем строки журнала по дням ──────────────────────────────────
+    # Ключ → список строк записей (one-liner)
+    buckets: dict = {"today": [], "yesterday": [], "older": []}
 
-        lines.append("⚡ <b>ОТКРЫТЫЕ СДЕЛКИ (BINANCE SPOT):</b>\n")
-        for sym, tr in open_items.items():
-            base = tr.get("base", base_asset(sym))
-            bp = float(tr.get("buy_price", 0.0))
-            tp = float(tr.get("tp_price", 0.0))
-            qty = float(tr.get("qty", 0.0))
-            cost = float(tr.get("cost_usdt", qty * bp))
-            tp_order_id = tr.get("tp_order_id")
-            opened_at = tr.get("opened_at", 0)
-            date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(opened_at)) if opened_at else "В процессе"
+    DAY_NAMES = {"today": "Сегодня", "yesterday": "Вчера", "older": "Ранее"}
 
-            cur_price = prices.get(sym)
-            if cur_price is not None:
-                cur_val = qty * cur_price
-                trade_pnl = cur_val - cost
-                trade_pnl_pct = (trade_pnl / cost * 100.0) if cost > 0 else 0.0
-                total_val += cur_val
-            else:
-                cur_val = cost
-                trade_pnl = 0.0
-                trade_pnl_pct = 0.0
-                total_val += cost
+    # Закрытые сделки (history)
+    closed_total_pnl = 0.0
+    closed_today_pnl = 0.0
+    closed_yday_pnl  = 0.0
+    win_today = 0; total_today = 0
+    win_yday  = 0; total_yday  = 0
 
-            total_cost += cost
-            exp_gain = (qty * tp) - cost if tp > 0 else 0.0
-            total_exp_gain += exp_gain
-            sign = "🟢" if trade_pnl >= 0 else "🔴"
+    for h in reversed(history):           # от новых к старым
+        ts      = float(h.get("closed_at", 0))
+        base    = h.get("base", base_asset(h.get("symbol", "?")))
+        pnl     = float(h.get("pnl", 0.0))
+        pnl_pct = float(h.get("pnl_pct", 0.0))
+        reason  = h.get("status", "")
+        closed_total_pnl += pnl
 
-            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
-            binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+        t_str = time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
+        sign  = "🟢" if pnl >= 0 else "🔴"
+        # причина закрытия (коротко)
+        if "tp" in reason.lower() or "take" in reason.lower():
+            tag = "TP"
+        elif "sl" in reason.lower() or "stop" in reason.lower():
+            tag = "SL"
+        elif "trail" in reason.lower():
+            tag = "TSL"
+        elif "manual" in reason.lower():
+            tag = "MNL"
+        else:
+            tag = "—"
 
-            tp_str = f"<code>{fmt_price(tp)} $</code> (+{tr.get('tp_pct', tp_pct):.1f}%)" if tp > 0 else "не задан"
-            tp_order_str = f" [Ордер #{tp_order_id}]" if tp_order_id else ""
-            exp_gain_str = f"+{exp_gain:.2f} USDT" if exp_gain > 0 else "—"
+        row = f"{t_str}  <b>{base:<6}</b>  {sign} <b>{pnl:+.2f} USDT</b>  ({pnl_pct:+.1f}%)  [{tag}]"
 
-            lines.append(
-                f"📅 <b>{date_str}</b>\n"
-                f"• <b>Актив:</b> {sign} <b>{base}/USDT</b>\n"
-                f"• <b>Цена:</b> вход <code>{fmt_price(bp)} $</code> → рынок <code>{fmt_price(cur_price) if cur_price else '—'} $</code>\n"
-                f"• <b>Куплено:</b> <code>{fmt_qty(qty)} {base}</code> (Потрачено: <code>{cost:,.2f} USDT</code>)\n"
-                f"• <b>Текущий PnL:</b> {sign} <b>{trade_pnl:+.2f} USDT ({fmt_pct(trade_pnl_pct)})</b> (Оценка: <code>{cur_val:,.2f} $</code>)\n"
-                f"• <b>Тейк-профит (TP):</b> {tp_str}{tp_order_str}\n"
-                f"• 💰 <b>Заработок при TP:</b> <b>{exp_gain_str}</b>\n"
-                f"└ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
-            )
+        bucket = day_label(ts)
+        buckets[bucket].append(row)
+        if bucket == "today":
+            closed_today_pnl += pnl; total_today += 1
+            if pnl > 0: win_today += 1
+        elif bucket == "yesterday":
+            closed_yday_pnl += pnl; total_yday += 1
+            if pnl > 0: win_yday += 1
 
-        tot_pnl = total_val - total_cost
-        tot_pct = (tot_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
-        t_sign = "🟢" if tot_pnl >= 0 else "🔴"
+    # Открытые позиции → в сегодняшний bucket (или вчерашний)
+    open_float_pnl  = 0.0
+    open_today_pnl  = 0.0
+    open_yday_pnl   = 0.0
+    for sym, tr in open_items.items():
+        ts   = float(tr.get("opened_at", now_ts))
+        base = tr.get("base", base_asset(sym))
+        bp   = float(tr.get("buy_price", 0.0))
+        qty  = float(tr.get("qty", 0.0))
+        cost = float(tr.get("cost_usdt", qty * bp))
 
-        lines.append("📌 <b>ИТОГО В ОТКРЫТЫХ ПОЗИЦИЯХ:</b>")
-        lines.append(f"• <b>Позиций:</b> <code>{len(open_items)} шт</code>")
-        lines.append(f"• <b>Всего инвестировано:</b> <code>{total_cost:,.2f} USDT</code>")
-        lines.append(f"• <b>Текущая стоимость:</b> <code>{total_val:,.2f} USDT</code>")
-        lines.append(f"• <b>Плавающий PnL:</b> {t_sign} <b>{tot_pnl:+.2f} USDT ({fmt_pct(tot_pct)})</b>")
-        lines.append(f"• <b>Ожидаемый профит при закрытии всех TP:</b> 🟢 <b>+{total_exp_gain:.2f} USDT</b>")
-        lines.append("─────────────────────\n")
-    else:
-        lines.append("⚡ <b>ОТКРЫТЫЕ СДЕЛКИ:</b> <i>Сейчас открытых позиций нет.</i>\n─────────────────────\n")
+        cur_p = cur_prices.get(sym)
+        if cur_p and qty > 0:
+            cur_val   = qty * cur_p
+            float_pnl = cur_val - cost
+            float_pct = (float_pnl / cost * 100.0) if cost > 0 else 0.0
+        else:
+            float_pnl = 0.0
+            float_pct = 0.0
 
-    # 3. РЕАЛИЗОВАННАЯ ПРИБЫЛЬ И ИСТОРИЯ ЗАКРЫТЫХ СДЕЛОК
+        open_float_pnl += float_pnl
+        t_str = time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
+        sign  = "🟢" if float_pnl >= 0 else "🔴"
+        cur_str = f"<code>{fmt_price(cur_p)} $</code>" if cur_p else "—"
+        row = (
+            f"{t_str}  <b>{base:<6}</b>  {sign} — ⏳ <i>в позиции</i>  "
+            f"{float_pnl:+.2f} USDT ({float_pct:+.1f}%)  [вход: <code>{fmt_price(bp)} $</code>  сейчас: {cur_str}]"
+        )
+        bucket = day_label(ts)
+        buckets[bucket].insert(0, row)   # открытые — первыми в своём дне
+        if bucket == "today":   open_today_pnl += float_pnl
+        elif bucket == "yesterday": open_yday_pnl += float_pnl
+
+    # ── Формируем вывод ──────────────────────────────────────────────────
+    lines: list = []
+
+    # Шапка
+    auto_lbl = "🟢 Вкл" if auto_on else "🔴 Выкл"
+    lines.append(
+        f"📊 <b>Сделки и Профит</b>\n"
+        f"⚡ Авто: {auto_lbl}  |  Ставка: <code>{trade_amt:.0f}$</code>  |  TP: <code>+{tp_pct:.1f}%</code>"
+    )
+
+    # Дни
+    for key in ("today", "yesterday", "older"):
+        rows = buckets[key]
+        if not rows:
+            continue
+        # Дата-заголовок
+        if key == "today":
+            day_date = time.strftime("%d.%m", time.localtime(today_start))
+            pnl_closed = closed_today_pnl
+            pnl_open   = open_today_pnl
+            wr = f"{win_today}/{total_today}" if total_today else "—"
+        elif key == "yesterday":
+            day_date = time.strftime("%d.%m", time.localtime(yesterday_start))
+            pnl_closed = closed_yday_pnl
+            pnl_open   = open_yday_pnl
+            wr = f"{win_yday}/{total_yday}" if total_yday else "—"
+        else:
+            day_date = "..."
+            pnl_closed = 0.0
+            pnl_open   = 0.0
+            wr = "—"
+
+        day_pnl = pnl_closed + pnl_open
+        day_sign = "🟢" if day_pnl >= 0 else "🔴"
+        lines.append(
+            f"\n🗓 <b>{DAY_NAMES[key]} ({day_date})</b>  "
+            f"{day_sign} <b>{day_pnl:+.2f} USDT</b>  W/L: {wr}\n"
+            "──────────────────────"
+        )
+        lines.extend(rows)
+
+    # Итого (2 дня)
+    two_day_pnl = closed_today_pnl + closed_yday_pnl + open_today_pnl + open_yday_pnl
+    total_closed = total_today + total_yday
+    total_wins   = win_today + win_yday
+    wr_total = f"{total_wins}/{total_closed}" if total_closed else "—"
+    wr_pct   = f"  ({total_wins/total_closed*100:.0f}%)" if total_closed else ""
+
+    t_sign = "🟢" if two_day_pnl >= 0 else "🔴"
+
+    lines.append(
+        f"\n📌 <b>Итого (2 дня):</b>\n"
+        f"• Закрыто: <b>{total_closed} сделки</b>  |  W/L: {wr_total}{wr_pct}\n"
+        f"• Реализованный P&L: {t_sign} <b>{(closed_today_pnl+closed_yday_pnl):+.2f} USDT</b>"
+    )
+    if open_items:
+        f_sign = "🟢" if open_float_pnl >= 0 else "🔴"
+        lines.append(
+            f"• Открытых позиций: <b>{len(open_items)}</b>  "
+            f"|  Плав. P&L: {f_sign} <b>{open_float_pnl:+.2f} USDT</b>"
+        )
+
+    # Всего за всё время
     if history:
-        closed_pnl_sum = sum(float(h.get("pnl", 0.0)) for h in history)
-        closed_cost_sum = sum(float(h.get("cost_usdt", 0.0)) for h in history)
-        win_count = sum(1 for h in history if float(h.get("pnl", 0.0)) > 0)
-        win_rate = (win_count / len(history) * 100.0) if history else 0.0
-        h_sign = "🟢" if closed_pnl_sum >= 0 else "🔴"
+        win_all  = sum(1 for h in history if float(h.get("pnl", 0.0)) > 0)
+        wr_all   = f"{win_all}/{len(history)} ({win_all/len(history)*100:.0f}%)"
+        all_sign = "🟢" if closed_total_pnl >= 0 else "🔴"
+        lines.append(
+            f"\n🏆 <b>За всё время:</b>  "
+            f"{all_sign} <b>{closed_total_pnl:+.2f} USDT</b>  |  W/L: {wr_all}"
+        )
 
-        lines.append("🏆 <b>РЕАЛИЗОВАННЫЙ ПРОФИТ (ЗАКРЫТЫЕ СДЕЛКИ):</b>")
-        lines.append(f"• <b>Закрыто сделок:</b> <code>{len(history)} шт</code> (Винрейт: <code>{win_rate:.0f}%</code>)")
-        lines.append(f"• <b>Суммарный оборот:</b> <code>{closed_cost_sum:,.2f} USDT</code>")
-        lines.append(f"• 💰 <b>ЧИСТЫЙ РЕАЛИЗОВАННЫЙ ДОХОД:</b> {h_sign} <b>{closed_pnl_sum:+.2f} USDT</b>\n")
-
-        lines.append("📜 <b>ИСТОРИЯ ЗАКРЫТЫХ СДЕЛОК:</b>\n")
-        for h in reversed(history[-10:]):
-            base = h.get("base", base_asset(h.get("symbol", "")))
-            pnl = float(h.get("pnl", 0.0))
-            pnl_pct = float(h.get("pnl_pct", 0.0))
-            closed_at = h.get("closed_at", 0)
-            date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(closed_at)) if closed_at else "—"
-            bp = float(h.get("buy_price", 0.0))
-            sp = float(h.get("sell_price", 0.0))
-            qty = float(h.get("qty", 0.0))
-            cost = float(h.get("cost_usdt", 0.0))
-            revenue = cost + pnl
-            bal_end = float(h.get("ending_balance", 0.0))
-            bal_end_str = f"<code>{bal_end:,.2f} USDT</code>" if bal_end > 0 else f"<code>{free_usdt:,.2f} USDT</code>"
-            p_sign = "🟢" if pnl >= 0 else "🔴"
-
-            lines.append(
-                f"📅 <b>{date_str}</b>\n"
-                f"• <b>Актив:</b> {p_sign} <b>{base}/USDT</b>\n"
-                f"• <b>Цена:</b> вход <code>{fmt_price(bp)} $</code> → продажа <code>{fmt_price(sp)} $</code>\n"
-                f"• <b>Куплено:</b> <code>{fmt_qty(qty)} {base}</code> (Потрачено: <code>{cost:,.2f} USDT</code>)\n"
-                f"• <b>Продано на сумму:</b> <code>{revenue:,.2f} USDT</code>\n"
-                f"• 💰 <b>Заработано:</b> {p_sign} <b>{pnl:+.2f} USDT ({fmt_pct(pnl_pct)})</b>\n"
-                f"• 💵 <b>Баланс на конец:</b> {bal_end_str}\n"
-                f"─────────────────────"
-            )
-    else:
-        lines.append("🏆 <b>РЕАЛИЗОВАННАЯ ПРИБЫЛЬ:</b> <i>История закрытых сделок пока пуста.</i>\n─────────────────────")
-
-    # 4. ОБЩИЙ БАЛАНС И КАПИТАЛ
-    lines.append(f"\n💵 <b>Свободный баланс:</b> <code>{free_usdt:,.2f} USDT</code>")
-    if open_items:
-        total_open = sum(float(tr.get("cost_usdt", 0.0)) for tr in open_items.values())
-        lines.append(f"⚡ <b>В открытых позициях:</b> <code>{total_open:,.2f} USDT</code>")
-        lines.append(f"📊 <b>Общий капитал:</b> <code>{(free_usdt + total_open):,.2f} USDT</code>")
-
+    lines.append(f"\n💵 Свободно: <code>{free_usdt:,.2f} USDT</code>")
     return "\n".join(lines)
 
 def format_system_status(state: dict) -> str:
