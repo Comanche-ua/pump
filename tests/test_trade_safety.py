@@ -33,6 +33,26 @@ def make_trade(**over):
     return trade
 
 
+def make_5m_candles(n=600):
+    """Детерминированная синтетика 5m: цена по синусоиде, объём волной."""
+    import math as _m
+    out = []
+    t0 = 1_700_000_000_000
+    for i in range(n):
+        base = 100.0 + 5.0 * _m.sin(i / 25.0) + 0.02 * i
+        o = base
+        cl = base + 0.3 * _m.sin(i / 3.0)
+        hi = max(o, cl) + 0.4
+        lo = min(o, cl) - 0.4
+        vol = 1000.0 + 400.0 * _m.sin(i / 7.0)
+        out.append(pb.Candle(
+            open_time=t0 + i * 300_000, open=o, high=hi, low=lo, close=cl,
+            volume=vol, quote_volume=vol * cl, trades=int(vol / 10),
+            taker_buy_base=vol * 0.55, close_time=t0 + i * 300_000 + 299_999,
+        ))
+    return out
+
+
 class TradeSafetyTest(unittest.TestCase):
 
     def setUp(self):
@@ -802,6 +822,529 @@ class TradeSafetyTest(unittest.TestCase):
         self.assertTrue(any("LIMIT_MAKER" in t for t in failed),
                         f"правило LIMIT_MAKER не проверяется: {failed}")
 
+    # ── логика меню: кнопки должны делать то, что обещают ─────
+
+    def _source(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "pump_bot.py"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_whale_button_runs_whale_scan_not_pump_scan(self):
+        """
+        Кнопка «🐋 Скан китов» обязана запускать китовый скан и её ветка
+        должна стоять РАНЬШЕ общей ветки «скан»: иначе правило
+        `"скан" in text_lower` перехватывает её и молча делает обычный скан.
+        """
+        src = self._source()
+        i_whale = src.find('elif "кит" in text_lower')
+        i_scan = src.find('elif cmd in ("scan", "скан")')
+        self.assertNotEqual(i_whale, -1, "ветка китовой кнопки пропала")
+        self.assertNotEqual(i_scan, -1)
+        self.assertLess(i_whale, i_scan, "ветка китов должна идти до ветки «скан»")
+        self.assertTrue(hasattr(pb, "execute_whale_scan_and_report"))
+
+    def test_no_stale_percentages_in_ui_texts(self):
+        """
+        После смены дефолтов UI не должен обещать старые числа: ранее в девяти
+        местах было жёстко вписано «+3%» и стоп `0.98` (2%), пока бот торговал
+        другими значениями — пользователь видел одно, бот делал другое.
+        """
+        import re
+        stale = []
+        for line_no, line in enumerate(self._source().splitlines(), 1):
+            if re.search(r"\+3%|0\.98\b", line):
+                stale.append(f"{line_no}: {line.strip()[:70]}")
+        self.assertEqual(stale, [], f"устаревшие числа в UI: {stale}")
+
+    def test_help_text_shows_actual_defaults(self):
+        """Справка обязана показывать реальные TP/SL, а не зашитые числа."""
+        self.assertIn(f"+{pb.DEFAULT_TAKE_PROFIT:.1f}%", pb.HELP_TEXT)
+        self.assertIn(f"-{pb.DEFAULT_STOP_LOSS:.1f}%", pb.HELP_TEXT)
+        self.assertIn(f"Score {pb.DEFAULT_TRADE_MIN_SCORE:.0f}+", pb.HELP_TEXT)
+
+    def test_unknown_callback_gets_answered(self):
+        """
+        Обработчик неизвестной кнопки обязан вызвать answerCallbackQuery,
+        иначе Telegram бесконечно крутит индикатор и бот выглядит зависшим.
+        """
+        src = self._source()
+        i_factors = src.find('elif cb_data.startswith("factors:")')
+        i_else = src.find("Кнопка устарела", i_factors)
+        self.assertNotEqual(i_else, -1, "нет fallback для неизвестных callback-ов")
+        self.assertIn("answer_callback(token, cb_id", src[i_else - 400:i_else + 100])
+
+    # ── график 15m ─────────────────────────────────────────────
+
+    def test_chart_png_is_structurally_valid(self):
+        """
+        Картинка обязана быть настоящим PNG. Проверяем не «файл создан»,
+        а структуру: сигнатуру, IHDR (8 бит, truecolor) и то, что IDAT
+        распаковывается ровно в height*(1 + width*3) байт.
+        """
+        import struct
+        import zlib
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import chart as ch
+
+        candles15 = pb.aggregate_timeframe(make_5m_candles(600), 900_000)
+        png = ch.render_chart("TESTUSDT", candles15)
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"), "нет сигнатуры PNG")
+
+        pos, idat, ihdr = 8, b"", None
+        while pos + 8 <= len(png):
+            ln = struct.unpack(">I", png[pos:pos + 4])[0]
+            tag = png[pos + 4:pos + 8]
+            data = png[pos + 8:pos + 8 + ln]
+            if tag == b"IHDR":
+                ihdr = struct.unpack(">IIBBBBB", data)
+            elif tag == b"IDAT":
+                idat += data
+            pos += 12 + ln
+        self.assertIsNotNone(ihdr, "нет чанка IHDR")
+        w, h, depth, ctype = ihdr[0], ihdr[1], ihdr[2], ihdr[3]
+        self.assertEqual((depth, ctype), (8, 2), "ожидается 8 бит truecolor")
+        raw = zlib.decompress(idat)
+        self.assertEqual(len(raw), h * (1 + w * 3), "размер распакованных данных не совпал")
+
+    def test_chart_handles_short_and_flat_series(self):
+        """Мало свечей или полностью плоская цена не должны ломать рендер."""
+        import chart as ch
+        with self.assertRaises(ValueError):
+            ch.render_chart("TESTUSDT", make_5m_candles(20)[:20])
+
+        flat = [pb.Candle(open_time=i * 900_000, open=50.0, high=50.0, low=50.0,
+                          close=50.0, volume=1.0, quote_volume=50.0, trades=1,
+                          taker_buy_base=0.5, close_time=i * 900_000 + 899_999)
+                for i in range(60)]
+        png = ch.render_chart("FLATUSDT", flat)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+
+    def test_chart_caption_contains_indicators(self):
+        """Числа индикаторов приходят подписью: их можно выделить и скопировать."""
+        import chart as ch
+        candles15 = pb.aggregate_timeframe(make_5m_candles(600), 900_000)
+        caption = ch.chart_caption("TESTUSDT", candles15)
+        for expected in ("15m", "Боллинджер", "RSI 14", "Стохастик", "%K", "%D"):
+            self.assertIn(expected, caption)
+
+    def test_send_symbol_chart_builds_and_sends_photo(self):
+        """Кнопка графика должна реально собрать картинку и отправить фото."""
+        captured = {}
+        self._old_photo = pb.send_telegram_photo
+        pb.send_telegram_photo = lambda tok, chat, png, caption="", **kw: (
+            captured.update(png=png, caption=caption) or True)
+        pb.fetch_klines = lambda sym, limit=250: make_5m_candles(600)
+        try:
+            ok = pb.send_symbol_chart("tok", "1", "TESTUSDT")
+        finally:
+            pb.send_telegram_photo = self._old_photo
+        self.assertTrue(ok)
+        self.assertTrue(captured["png"].startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn("RSI 14", captured["caption"])
+
+    def test_chart_command_is_reachable(self):
+        """
+        График произвольной монеты должен запрашиваться командой: из сигнала
+        его не получить (сигналы редки), а меню портфеля пусто без позиций.
+        """
+        src = self._source()
+        self.assertIn('"command": "chart"', src, "нет /chart в списке команд бота")
+        self.assertIn('elif cmd in ("chart", "график"', src, "нет ветки обработки /chart")
+        self.assertIn("/chart SOL", pb.HELP_TEXT, "команда не упомянута в справке")
+
+    # ── рантайм: /add, лимиты Telegram ─────────────────────────
+
+    def test_add_command_does_not_feed_synthetic_update(self):
+        """
+        «/add SOL» не должен собирать фиктивное обновление: handle_update
+        читает update_id, и рекурсия падала с KeyError, который проглатывал
+        поллинг — команда молча не работала вовсе.
+        """
+        src = self._source()
+        self.assertNotIn("handle_update(msg)", src,
+                         "вернулась рекурсия с фиктивным обновлением")
+        self.assertIn("def begin_add_symbol(", src)
+        self.assertGreaterEqual(src.count("begin_add_symbol(chat_id_local"), 2,
+                                "обе точки входа (FSM и /add) должны звать общий шаг")
+        self.assertIn('u.get("update_id"', src,
+                      "handle_update снова требует update_id и упадёт на синтетике")
+
+    def test_long_message_is_chunked(self):
+        """
+        Telegram отвергает сообщение длиннее 4096 символов ЦЕЛИКОМ — раньше
+        длинный портфель просто не доходил до пользователя.
+        """
+        lines = [f"• строка {i} с каким-то текстом" for i in range(400)]
+        text = "\n".join(lines)                       # заметно больше 4000
+        chunks = pb._split_message(text)
+        self.assertGreater(len(chunks), 1, "длинный текст не разрезан")
+        for c in chunks:
+            self.assertLessEqual(len(c), 4000)
+        # ничего не потеряли и не порвали строки
+        self.assertEqual("\n".join(chunks), text)
+
+    def test_chunking_keeps_short_message_intact(self):
+        self.assertEqual(pb._split_message("короткое сообщение"), ["короткое сообщение"])
+
+    def test_chunking_survives_single_giant_line(self):
+        """Одна строка длиннее лимита тоже должна быть разрезана."""
+        chunks = pb._split_message("x" * 9000)
+        self.assertTrue(all(len(c) <= 4000 for c in chunks))
+        self.assertEqual("".join(chunks), "x" * 9000)
+
+    def test_reply_markup_goes_to_first_chunk_only(self):
+        """Клавиатура крепится к первой части, иначе окажется под хвостом текста."""
+        sent = []
+        real_send = self._old_send          # setUp подменяет send_telegram заглушкой
+        old_api = pb.api_call
+        pb.api_call = lambda token, method, payload=None, **kw: (
+            sent.append(dict(payload or {})) or {"ok": True, "result": {"message_id": 1}})
+        try:
+            big = "\n".join(f"строка {i}" for i in range(500))
+            real_send("tok", "1", big, reply_markup={"keyboard": []})
+        finally:
+            pb.api_call = old_api
+        self.assertGreater(len(sent), 1, "длинный текст не разрезан на части")
+        self.assertIn("reply_markup", sent[0])
+        self.assertNotIn("reply_markup", sent[1])
+
+    def test_api_call_waits_on_429(self):
+        """
+        При 429 Telegram сообщает retry_after, и пауза обязательна: повтор
+        сразу же усугубляет, а сообщение теряется.
+        """
+        import urllib.error
+        sleeps = []
+
+        def fake_urlopen(req, timeout=15):
+            raise urllib.error.HTTPError(
+                req.full_url, 429, "Too Many Requests", {},
+                __import__("io").BytesIO(b'{"parameters":{"retry_after":2}}'))
+
+        old_open, old_sleep = pb.urllib.request.urlopen, pb.time.sleep
+        pb.urllib.request.urlopen = fake_urlopen
+        pb.time.sleep = lambda s: sleeps.append(s)
+        try:
+            res = pb.api_call("tok", "sendMessage", {"chat_id": 1, "text": "x"})
+        finally:
+            pb.urllib.request.urlopen = old_open
+            pb.time.sleep = old_sleep
+        self.assertEqual(res, {})
+        self.assertTrue(any(s >= 2 for s in sleeps),
+                        f"не выдержана пауза retry_after: {sleeps}")
+
+    # ── движок: таймфреймы ─────────────────────────────────────
+
+    def test_every_timeframe_can_produce_bars(self):
+        """
+        Заявлен мульти-TF 5m/15m/1h, но при глубине 250 свечей 5m часовая
+        серия давала всего 21 бар при MIN_BARS=32 — то есть таймфрейм 1h не
+        мог дать НИ ОДНОГО сигнала, и оценка шла только по двум ТФ.
+        Инвариант: для каждого объявленного ТФ окно глубиной KLINES_LIMIT
+        обязано давать минимум MIN_BARS баров.
+        """
+        candles = make_5m_candles(pb.KLINES_LIMIT)
+        for tf in pb.TIMEFRAMES:
+            series = candles if tf == "5m" else pb.aggregate_timeframe(candles, pb.TF_MS[tf])
+            self.assertGreaterEqual(
+                len(series), pb.MIN_BARS,
+                f"ТФ {tf}: из {pb.KLINES_LIMIT} свечей 5m получается {len(series)} баров "
+                f"при MIN_BARS={pb.MIN_BARS} — этот ТФ не участвует в оценке",
+            )
+
+    # ── режим стратегии: RSI + стохастик ───────────────────────
+
+    def _flat_then_rise(self, flat=40, rise=3):
+        """Плоский участок, затем резкий подъём: RSI высокий, %K > %D."""
+        out, t0 = [], 1_700_000_000_000
+        price = 100.0
+        for i in range(flat + rise):
+            up = i >= flat
+            o = price
+            cl = price + (2.0 if up else 0.0)
+            out.append(pb.Candle(
+                open_time=t0 + i * 900_000, open=o, high=max(o, cl) + 0.5,
+                low=min(o, cl) - 0.5, close=cl, volume=100.0, quote_volume=10000.0,
+                trades=10, taker_buy_base=55.0, close_time=t0 + i * 900_000 + 899_999))
+            price = cl
+        return out
+
+    def test_strategy_modes_are_declared(self):
+        self.assertIn("pump", pb.STRATEGY_LABELS)
+        self.assertIn("indicators", pb.STRATEGY_LABELS)
+        self.assertIn(pb.DEFAULT_STRATEGY, pb.STRATEGY_LABELS)
+
+    def test_parabolic_sar_follows_trend_direction(self):
+        """SAR обязан стоять ПОД ценой на росте и НАД ценой на падении."""
+        rising = self._flat_then_rise(flat=5, rise=25)
+        sar, up = pb.parabolic_sar(rising)
+        self.assertTrue(up[-1], "на росте SAR должен быть в восходящем режиме")
+        self.assertLess(sar[-1], rising[-1].close, "SAR восходящего тренда должен быть под ценой")
+
+        falling = [pb.Candle(
+            open_time=c.open_time, open=c.close, high=c.close + 0.5, low=c.close - 0.5,
+            close=c.close - 1.0, volume=100.0, quote_volume=1000.0, trades=5,
+            taker_buy_base=50.0, close_time=c.close_time)
+            for c in reversed(rising)]
+        sar_f, up_f = pb.parabolic_sar(falling)
+        self.assertFalse(up_f[-1], "на падении SAR должен быть в нисходящем режиме")
+        self.assertGreater(sar_f[-1], falling[-1].close, "SAR падения должен быть над ценой")
+
+    def test_fractals_find_local_extremes(self):
+        """Фрактал — локальный экстремум окна ±2, и он не может быть на краю."""
+        candles = self._flat_then_rise(flat=20, rise=0)
+        flat_price = candles[10].close
+        peak = pb.Candle(open_time=candles[11].open_time, open=flat_price,
+                         high=flat_price + 5.0, low=flat_price, close=flat_price + 1.0,
+                         volume=100.0, quote_volume=1000.0, trades=5,
+                         taker_buy_base=50.0, close_time=candles[11].close_time)
+        candles.insert(11, peak)
+        up, down = pb.fractals(candles, k=2)
+        self.assertEqual(up[11], flat_price + 5.0, "максимум окна не распознан как up-фрактал")
+        # последние k баров структурно не могут быть фракталом (ещё не подтверждены)
+        self.assertTrue(all(v is None for v in up[-2:]))
+
+    def test_score_indicators_uses_rsi_sar_fractal(self):
+        """
+        Новое правило: RSI выше порога, SAR под ценой, пробит up-фрактал.
+        Стохастик убран — на трёх выборках он не давал информации.
+        """
+        candles = self._flat_then_rise(flat=30, rise=25)
+        bd = pb.score_indicators("15m", candles, [], 0.0, True, strict=False)
+        self.assertIsNotNone(bd)
+        self.assertEqual([f.id for f in bd.factors], ["rsi_zone", "sar_trend", "fractal_break"])
+        self.assertGreater(bd.sar, 0.0, "значение SAR должно попадать в разбор")
+
+        # С невозможным порогом RSI правило молчит (на монотонном росте RSI=100)
+        self.assertIsNone(pb.score_indicators("15m", candles, [], 0.0, True,
+                                              strict=True, rsi_min=101.0))
+
+    def test_settings_expose_strategy_switch(self):
+        state = pb.default_state()
+        self.assertEqual(state["settings"]["strategy"], pb.DEFAULT_STRATEGY)
+        kb = pb.settings_inline_kb(state)
+        cbs = [b.get("callback_data") for row in kb["inline_keyboard"] for b in row]
+        self.assertIn("strategy:set:pump", cbs)
+        self.assertIn("strategy:set:indicators", cbs)
+        self.assertIn("Режим стратегии", pb.settings_text(state))
+
+    def test_scan_and_autoscan_pass_strategy(self):
+        """Режим обязан доходить до скана, иначе выбор кнопкой ни на что не влияет."""
+        src = self._source()
+        self.assertGreaterEqual(
+            src.count('strategy=settings.get("strategy"'), 1,
+            "автоскан не передаёт выбранный режим")
+        self.assertGreaterEqual(
+            src.count('strategy=s.get("strategy"'), 1,
+            "ручной скан не передаёт выбранный режим")
+
+    # ── модуль стратегий: объём + зелёная свеча ────────────────
+
+    def _strategies(self):
+        # Стратегии живут в самом pump_bot: всё в одном файле.
+        return pb
+
+    def _vol_candles(self, last_volume: float, bullish: bool = True):
+        """40 свечей ровного объёма 100, последняя — заданного объёма."""
+        out, t0, price = [], 1_700_000_000_000, 100.0
+        for i in range(40):
+            last = i == 39
+            vol = last_volume if last else 100.0
+            o = price
+            cl = price + (1.0 if (bullish or not last) else -1.0) if last else price
+            out.append(pb.Candle(
+                open_time=t0 + i * 900_000, open=o, high=max(o, cl) + 0.3,
+                low=min(o, cl) - 0.3, close=cl, volume=vol, quote_volume=vol * cl,
+                trades=int(vol / 10), taker_buy_base=vol * 0.6,
+                close_time=t0 + i * 900_000 + 899_999))
+            price = cl
+        return out
+
+    def test_volume_scorer_fires_on_green_candle_with_volume(self):
+        """Правило: зелёная свеча И объём выше порога (по умолчанию 1.8× медианы)."""
+        st = self._strategies()
+        hot = self._vol_candles(last_volume=300.0, bullish=True)
+        bd = st.score_volume_candle("15m", hot, [], 0.0, True, strict=True)
+        self.assertIsNotNone(bd, "зелёная свеча при 3× объёма должна давать сигнал")
+        self.assertEqual([f.id for f in bd.factors], ["vol_robust", "candle"])
+        self.assertAlmostEqual(bd.volume_ratio, 3.0, places=3)
+
+        quiet = self._vol_candles(last_volume=100.0, bullish=True)
+        self.assertIsNone(st.score_volume_candle("15m", quiet, [], 0.0, True, strict=True),
+                          "при объёме на уровне медианы сигнала быть не должно")
+
+        red = self._vol_candles(last_volume=300.0, bullish=False)
+        self.assertIsNone(st.score_volume_candle("15m", red, [], 0.0, True, strict=True),
+                          "красная свеча при объёме — не сигнал на покупку")
+
+    def test_volume_baseline_is_median_not_mean(self):
+        """
+        База объёма обязана быть медианой: среднее завышается разовым всплеском
+        (на живых данных — до 2.6×), после чего инструмент «слепнет» на часы.
+        """
+        st = self._strategies()
+        volumes = [100.0] * 19 + [1000.0] + [300.0]     # один выброс в прошлом
+        ratio = st.vol_ratio_robust(volumes, period=20)
+        median_base = sorted(volumes[-21:-1])[10]        # медиана предыдущих 20 = 100
+        self.assertAlmostEqual(ratio, 300.0 / median_base, places=6)
+        self.assertGreater(ratio, 300.0 / 145.0,
+                           "похоже, база считается средним (145), а не медианой (100)")
+
+    def test_strategy_registry_and_labels_agree(self):
+        """
+        Каждый режим из реестра обязан быть выбираемым в интерфейсе, иначе
+        стратегия есть в коде, но включить её нельзя.
+        """
+        for mode in pb.STRATEGY_SCORERS:
+            self.assertIn(mode, pb.STRATEGY_LABELS, f"режим {mode} не виден в настройках")
+        self.assertIsNotNone(pb.STRATEGY_SCORERS["volume"])
+        self.assertIsNotNone(pb.STRATEGY_SCORERS["dump"])
+        self.assertIsNone(pb.STRATEGY_SCORERS["pump"], "встроенный скорер берётся из pump_bot")
+
+    # ── Диагностика, Rate Limit и Целостность состояния ─────────
+
+    def test_record_binance_weight_tracking(self):
+        """Проверка фиксации расхода веса Binance из заголовков ответа."""
+        headers = {"x-mbx-used-weight-1m": "450"}
+        pb.record_binance_weight(headers)
+        self.assertEqual(pb.API_WEIGHT_USED_1M, 450)
+        self.assertGreater(pb.API_WEIGHT_UPDATED_AT, 0)
+
+        # Безопасность при отсутствии заголовков или нестандартных объектах
+        pb.record_binance_weight(None)
+        pb.record_binance_weight({})
+        self.assertEqual(pb.API_WEIGHT_USED_1M, 450)
+
+    def test_format_system_status_renders_diagnostics(self):
+        """Отчёт диагностики обязан содержать аптайм, статус API и размер базы."""
+        state = pb.default_state()
+        state["portfolio"]["SOLUSDT"] = {"qty": 2.0, "avg_price": 100.0, "added_at": int(time.time())}
+        text = pb.format_system_status(state)
+        self.assertIn("Системная диагностика", text)
+        self.assertIn("Аптайм процесса", text)
+        self.assertIn("Расход веса", text)
+        self.assertIn("bot_state.json", text)
+        self.assertIn("1", text)  # 1 актив в портфеле
+
+    def test_load_state_prunes_corrupted_portfolio_and_trades(self):
+        """load_state обязан очищать битые записи (отрицательные/нулевые количества)."""
+        state = pb.default_state()
+        state["portfolio"]["CORRUPT1"] = {"qty": 0.0, "avg_price": 10.0}
+        state["portfolio"]["CORRUPT2"] = {"qty": -5.0, "avg_price": 10.0}
+        state["portfolio"]["VALID"] = {"qty": 1.5, "avg_price": 10.0}
+        state["active_trades"]["CORRUPT_TRADE"] = {"qty": 0.0, "buy_price": 10.0}
+        state["active_trades"]["VALID_TRADE"] = {"qty": 2.0, "buy_price": 10.0}
+        pb.save_state(state)
+
+        loaded = pb.load_state()
+        self.assertIn("VALID", loaded["portfolio"])
+        self.assertNotIn("CORRUPT1", loaded["portfolio"])
+        self.assertNotIn("CORRUPT2", loaded["portfolio"])
+        self.assertIn("VALID_TRADE", loaded["active_trades"])
+        self.assertNotIn("CORRUPT_TRADE", loaded["active_trades"])
+
+    def test_sanitize_sensitive_text(self):
+        """Санитизатор обязан маскировать подписи HMAC и API-секреты в любых строках."""
+        raw_url = "https://api.binance.com/api/v3/order?symbol=BTCUSDT&timestamp=1600000000&signature=d3b07384d113edec49eaa6238ad5ff00"
+        sanitized = pb.sanitize_sensitive_text(raw_url)
+        self.assertNotIn("d3b07384d113edec49eaa6238ad5ff00", sanitized)
+        self.assertIn("signature=***MASKED***", sanitized)
+
+        raw_err = "Failed with apiKey=super_secret_123 and secret=my_key_pass"
+        sanitized_err = pb.sanitize_sensitive_text(raw_err)
+        self.assertNotIn("super_secret_123", sanitized_err)
+        self.assertNotIn("my_key_pass", sanitized_err)
+        self.assertIn("apiKey=***MASKED***", sanitized_err)
+        self.assertIn("secret=***MASKED***", sanitized_err)
+
+    def test_sl_cooldown_management(self):
+        """Проверка установки кулдауна после SL и блокировки повторных сделок."""
+        state = pb.default_state()
+        symbol = "COOLDOWNUSDT"
+        
+        # 1. Символ изначально не в кулдауне
+        self.assertIsNone(pb.is_symbol_in_sl_cooldown(state, symbol))
+
+        # 2. Устанавливаем кулдаун на 100 секунд
+        pb.set_symbol_sl_cooldown(state, symbol, duration_sec=100, reason="test_sl")
+        until = pb.is_symbol_in_sl_cooldown(state, symbol)
+        self.assertIsNotNone(until)
+        self.assertGreater(until, time.time())
+
+        # 3. execute_pump_auto_trade обязан отвергнуть сигнал по монете в кулдауне
+        sig = pb.PumpSignal(
+            symbol=symbol,
+            base="COOLDOWN",
+            price=10.0,
+            change_24h=2.5,
+            quote_volume_24h=5000000.0,
+            high_24h=10.5,
+            low_24h=9.5,
+            btc_relative_24h=1.0,
+            best_tf="5m",
+            best_score=80.0,
+            grade="strong",
+            alert_key=f"{symbol}_5m",
+            by_tf=[],
+        )
+        res = pb.execute_pump_auto_trade("fake_token", 12345, state, sig)
+        self.assertIsNotNone(res)
+        self.assertIn("кулдаун", res.get("error", ""))
+
+        # 4. Истекший кулдаун автоматически очищается
+        state["sl_cooldowns"][symbol]["until"] = time.time() - 10
+        self.assertIsNone(pb.is_symbol_in_sl_cooldown(state, symbol))
+        self.assertNotIn(symbol, state["sl_cooldowns"])
+
+    def test_trades_log_csv(self):
+        """Проверка корректной записи и форматирования CSV лога сделок."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tf:
+            temp_csv = tf.name
+
+        try:
+            # Записываем тестовое событие входа
+            pb.log_trade_event(
+                event_type="BUY_MARKET_FILLED",
+                symbol="LOGUSDT",
+                order_id=999111,
+                price=25.50,
+                qty=10.0,
+                quote_amount=255.0,
+                reason="market_entry",
+                file_path=temp_csv,
+            )
+            # Записываем событие выхода
+            pb.log_trade_event(
+                event_type="TP_FILLED",
+                symbol="LOGUSDT",
+                order_id=999222,
+                price=26.00,
+                qty=10.0,
+                quote_amount=260.0,
+                pnl=5.0,
+                pnl_pct=1.96,
+                reason="take_profit",
+                file_path=temp_csv,
+            )
+
+            with open(temp_csv, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+
+            # Должен быть заголовок + 2 записи
+            self.assertEqual(len(lines), 3)
+            self.assertTrue(lines[0].startswith("timestamp,datetime_utc,symbol,event_type"))
+            self.assertIn("LOGUSDT,BUY_MARKET_FILLED,999111,25.5,10,255.0000", lines[1])
+            self.assertIn("LOGUSDT,TP_FILLED,999222,26,10,260.0000,+1.96%,+5.0000", lines[2])
+        finally:
+            if os.path.exists(temp_csv):
+                try:
+                    os.remove(temp_csv)
+                except Exception:
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+

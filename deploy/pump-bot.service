@@ -1,0 +1,24 @@
+[Unit]
+Description=Pump Pulse Trading Bot
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pump-bot
+EnvironmentFile=/opt/pump-bot/.env
+ExecStart=/opt/pump-bot/venv/bin/python3 -u pump_bot.py
+
+# Автоматический перезапуск при сбоях
+Restart=always
+RestartSec=10s
+
+# Ограничение ресурсов и логирование
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pump-bot
+
+[Install]
+WantedBy=multi-user.target

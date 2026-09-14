@@ -1,0 +1,19 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Secrets & Environment
+.env
+.env.*
+*.secret
+*.key
+
+# Local Data / Logs
+trades_log.csv
+*.tmp

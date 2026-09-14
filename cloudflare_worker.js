@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Cloudflare Worker: Binance API Reverse Proxy
  */
 
@@ -9,7 +9,7 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Allow-Headers": "*, X-MBX-APIKEY, X-Worker-Auth, Authorization, Content-Type",
         },
       });
     }
@@ -22,6 +22,7 @@ export default {
         JSON.stringify({
           status: "online",
           service: "Binance API Proxy",
+          auth_required: Boolean(env && env.WORKER_AUTH_TOKEN),
           test_endpoints: [
             "/api/v3/ping",
             "/api/v3/time",
@@ -32,6 +33,25 @@ export default {
           headers: { "Content-Type": "application/json; charset=utf-8" }
         }
       );
+    }
+
+    // Проверка авторизации, если в настройках Cloudflare Worker задан WORKER_AUTH_TOKEN
+    const expectedAuth = env && env.WORKER_AUTH_TOKEN ? String(env.WORKER_AUTH_TOKEN).trim() : null;
+    if (expectedAuth) {
+      const incomingAuth = (request.headers.get("x-worker-auth") || "").trim() ||
+        (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      if (!incomingAuth || incomingAuth !== expectedAuth) {
+        return new Response(
+          JSON.stringify({ error: "Unauthorized: Invalid or missing X-Worker-Auth token" }),
+          {
+            status: 401,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
+          }
+        );
+      }
     }
 
     // Официальный альтернативный кластер Binance (api1/api3)

@@ -22,6 +22,7 @@ import math
 import json
 import hmac
 import hashlib
+import re
 import signal
 import threading
 import traceback
@@ -64,6 +65,7 @@ except ImportError:
 
 BINANCE_BASE = (os.environ.get("BINANCE_DATA_BASE") or os.environ.get("BINANCE_BASE") or "").strip() or "https://data-api.binance.vision"
 BINANCE_TRADE_URL = (os.environ.get("BINANCE_TRADE_URL") or "").strip() or "https://api.binance.com"
+BINANCE_WORKER_AUTH = (os.environ.get("BINANCE_WORKER_AUTH") or os.environ.get("PROXY_AUTH_TOKEN") or "").strip()
 
 # Настройка прокси (если задан BINANCE_PROXY или PROXY_URL) для обхода региональных ограничений (США/GitHub Actions)
 _proxy_cfg = (os.environ.get("BINANCE_PROXY") or os.environ.get("PROXY_URL") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "").strip()
@@ -96,7 +98,7 @@ KLINES_LIMIT = int(os.environ.get("KLINES_LIMIT", "500"))  # 500 баров 5m �
 # где СТОП ШИРЕ ЦЕЛИ (1.5%/3.0% и 2.0%/3.0%). Симметричный 2.0%/2.0% и любые
 # узкие стопы (0.5%, 1.0%) значимо убыточны: узкий стоп выбивается обычным
 # шумом, после которого цена возвращается. Подробности — `--help` харнесса.
-DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "11.0"))
+DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "5.0"))
 # Цель 1.0% при стопе 3.0% — НАИМЕНЬШАЯ цель, дающая значимо положительное
 # матожидание. Измеренная лестница «цель → E[решённая сделка]» при стопе 3%:
 #   0.5% → −0.045% (значимо ОТРИЦАТЕЛЬНО: TP-первым 90.4% при безубытке 91.7%)
@@ -115,6 +117,9 @@ DEFAULT_ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_TIMEOUT_SEC", "300"))   # 
 # на случай, если лимитный TP снят или не выставлен.
 DEFAULT_TRAILING_ACTIVATION = float(os.environ.get("TRAILING_ACTIVATION_PCT", "2.5"))
 DEFAULT_TRAILING_DISTANCE = float(os.environ.get("TRAILING_DISTANCE_PCT", "0.8"))
+DEFAULT_SL_COOLDOWN_SECONDS = int(os.environ.get("SL_COOLDOWN_SECONDS", "3600"))
+TRADES_LOG_FILE = os.environ.get("TRADES_LOG_FILE", "trades_log.csv")
+_TRADES_LOG_LOCK = threading.Lock()
 DEFAULT_DYNAMIC_TP = os.environ.get("DYNAMIC_TP", "true").strip().lower() in ("true", "1")
 DEFAULT_AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").strip().lower() in ("true", "1")
 DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "70.0"))
@@ -133,10 +138,14 @@ DEFAULT_TRADE_MIN_SCORE = float(os.environ.get("TRADE_MIN_SCORE", "70.0"))
 DEFAULT_STRATEGY = (os.environ.get("STRATEGY") or "pump").strip().lower()
 STRATEGY_LABELS = {
     "pump": "📈 Памп-скор (8 факторов)",
-    "indicators": "📊 RSI + Стохастик",
+    "indicators": "📊 RSI + SAR + Фрактал",
+    "volume": "📊 Объём + свеча",
+    "dump": "📉 Дамп → отскок вверх",
 }
 DEFAULT_RSI_MIN = float(os.environ.get("RSI_MIN", "55"))
-DEFAULT_STOCH_MIN = float(os.environ.get("STOCH_MIN", "55"))
+# Порог входа для режима «объём + свеча»: ниже 2.0 — шум объёма,
+# выше 4 — редкость на ликвидных парах.
+VOL_MIN_RATIO = float(os.environ.get("VOL_MIN_RATIO", "1.8"))
 
 DEFAULT_USE_OCO = os.environ.get("USE_OCO", "true").strip().lower() in ("true", "1")
 # Прежний дефолт TP — нужен только для миграции уже сохранённого состояния
@@ -164,11 +173,163 @@ STABLE_OR_FIAT = {
 }
 LEV_RE = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
+# ───────────────────────── Rate Limit & Метрики ─────────────────────────
+API_WEIGHT_USED_1M: int = 0
+API_WEIGHT_UPDATED_AT: float = 0.0
+BOT_START_TIME: float = time.time()
+FSM_TTL_SEC: int = 600  # 10 минут таймаут для состояний FSM
+
+def record_binance_weight(headers) -> None:
+    """Отслеживает текущий расход веса API Binance (1200 в минуту) и предотвращает блокировку IP."""
+    global API_WEIGHT_USED_1M, API_WEIGHT_UPDATED_AT
+    if not headers or not hasattr(headers, "get"):
+        return
+    try:
+        w = headers.get("x-mbx-used-weight-1m") or headers.get("X-MBX-USED-WEIGHT-1M")
+        if w is not None:
+            API_WEIGHT_USED_1M = int(w)
+            API_WEIGHT_UPDATED_AT = time.time()
+            if API_WEIGHT_USED_1M >= 1000:
+                print(f"⚠️ [RateLimit] Высокое использование веса Binance: {API_WEIGHT_USED_1M}/1200! Защитная пауза 1.5с...")
+                time.sleep(1.5)
+            elif API_WEIGHT_USED_1M >= 800:
+                time.sleep(0.3)
+    except Exception:
+        pass
+
+# ───────────────────────── Безопасность и Санитизация ─────────────────────────
+
+def sanitize_sensitive_text(text: Any) -> str:
+    """Маскирует секреты, API-ключи и подписи в URL, телах запросов и сообщениях об ошибках."""
+    if text is None:
+        return ""
+    s = str(text)
+    # Маскируем signature=...
+    s = re.sub(r'(signature=)[a-fA-F0-9]+', r'\1***MASKED***', s)
+    # Маскируем ключи/секреты в URL параметрах и заголовках
+    s = re.sub(r'((?:apiKey|api_key|secret|secretKey|X-MBX-APIKEY|X-Worker-Auth|token|auth)=)[^\s&"\']+', r'\1***MASKED***', s, flags=re.IGNORECASE)
+    return s
+
+# ───────────────────────── Кулдаун после Stop-Loss ─────────────────────────
+
+def get_sl_cooldown_duration(state: Optional[dict] = None) -> int:
+    """Возвращает длительность кулдауна после срабатывания SL в секундах."""
+    if state:
+        return int(state.get("settings", {}).get("sl_cooldown_seconds", DEFAULT_SL_COOLDOWN_SECONDS))
+    return DEFAULT_SL_COOLDOWN_SECONDS
+
+def set_symbol_sl_cooldown(state: dict, symbol: str, duration_sec: Optional[int] = None, reason: str = "stop_loss") -> None:
+    """Помещает символ в кулдаун после срабатывания SL."""
+    if duration_sec is None:
+        duration_sec = get_sl_cooldown_duration(state)
+    if duration_sec <= 0:
+        return
+    now = time.time()
+    cooldowns = state.setdefault("sl_cooldowns", {})
+    cooldowns[symbol] = {
+        "until": now + duration_sec,
+        "set_at": now,
+        "reason": reason,
+        "duration_sec": duration_sec,
+    }
+    until_str = time.strftime('%H:%M:%S', time.localtime(now + duration_sec))
+    print(f"[Cooldown] ❄️ Монета {symbol} помещена в кулдаун на {duration_sec}с (до {until_str}) по причине: {reason}")
+
+def is_symbol_in_sl_cooldown(state: dict, symbol: str) -> Optional[float]:
+    """
+    Проверяет, находится ли символ в кулдауне после Stop-Loss.
+    Возвращает timestamp окончания кулдауна (float) или None.
+    Автоматически очищает истекшие записи.
+    """
+    cooldowns = state.get("sl_cooldowns")
+    if not isinstance(cooldowns, dict) or symbol not in cooldowns:
+        return None
+    entry = cooldowns.get(symbol)
+    if isinstance(entry, (int, float)):
+        until = float(entry)
+    elif isinstance(entry, dict):
+        until = float(entry.get("until", 0.0))
+    else:
+        until = 0.0
+    now = time.time()
+    if now >= until:
+        cooldowns.pop(symbol, None)
+        return None
+    return until
+
+# ───────────────────────── Append-only Логгер Сделок ─────────────────────────
+
+def log_trade_event(
+    event_type: str,
+    symbol: str,
+    order_id: Optional[Union[str, int]] = None,
+    price: Optional[float] = None,
+    qty: Optional[float] = None,
+    quote_amount: Optional[float] = None,
+    pnl: Optional[float] = None,
+    pnl_pct: Optional[float] = None,
+    fee: Optional[float] = None,
+    reason: str = "",
+    meta: Optional[dict] = None,
+    file_path: Optional[str] = None,
+) -> None:
+    """
+    Атомарно записывает торговое событие в append-only CSV лог `trades_log.csv`.
+    Позволяет вести независимый аудит и рассчитывать метрики доходности/проскальзывания.
+    """
+    target_path = file_path or TRADES_LOG_FILE
+    now_ts = time.time()
+    dt_utc = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now_ts))
+
+    row = [
+        f"{now_ts:.3f}",
+        dt_utc,
+        str(symbol),
+        str(event_type),
+        str(order_id if order_id is not None else ""),
+        f"{price:.8f}".rstrip("0").rstrip(".") if price is not None else "",
+        f"{qty:.8f}".rstrip("0").rstrip(".") if qty is not None else "",
+        f"{quote_amount:.4f}" if quote_amount is not None else "",
+        f"{pnl_pct:+.2f}%" if pnl_pct is not None else "",
+        f"{pnl:+.4f}" if pnl is not None else "",
+        f"{fee:.6f}" if fee is not None else "",
+        str(reason),
+        json.dumps(meta, ensure_ascii=False) if meta else "",
+    ]
+
+    line = ",".join(
+        f'"{field.replace(chr(34), chr(34)+chr(34))}"'
+        if any(c in field for c in (",", '"', "\n", "\r"))
+        else field
+        for field in row
+    ) + "\n"
+
+    with _TRADES_LOG_LOCK:
+        try:
+            write_header = not os.path.exists(target_path) or os.path.getsize(target_path) == 0
+            with open(target_path, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write("timestamp,datetime_utc,symbol,event_type,order_id,price,qty,quote_amount,pnl_pct,pnl_usdt,fee,reason,meta\n")
+                f.write(line)
+                f.flush()
+        except Exception as e:
+            print(f"[TradesLog Error]: Не удалось записать событие в {target_path}: {e}", file=sys.stderr)
+
 # ───────────────────────── HTTP ─────────────────────────
 
-def http_get_json(url: str, timeout: int = 12) -> dict | list:
-    req = urllib.request.Request(url, headers={"User-Agent": "pump-pulse/2.1"})
+def http_get_json(url: str, timeout: int = 12, state: Optional[dict] = None) -> dict | list:
+    headers = {"User-Agent": "pump-pulse/2.1"}
+    worker_auth = ""
+    if state:
+        worker_auth = str(state.get("settings", {}).get("worker_auth_token", "")).strip()
+    if not worker_auth:
+        worker_auth = BINANCE_WORKER_AUTH
+    if worker_auth:
+        headers["X-Worker-Auth"] = worker_auth
+
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        record_binance_weight(getattr(resp, "headers", None))
         return json.loads(resp.read().decode("utf-8"))
 
 # ───────────────────────── Types ─────────────────────────
@@ -213,6 +374,10 @@ class TfBreakdown:
     factors: List[FactorScore] = field(default_factory=list)
     reasons: List[str] = field(default_factory=list)
     risks: List[str] = field(default_factory=list)
+    # Значения индикаторов режима «RSI + SAR + фракталы» — нужны, чтобы
+    # проверять РАЗНЫЕ пороги потом, не пересчитывая скоринг заново.
+    sar: float = 0.0
+    fractal_level: float = 0.0
 
 @dataclass
 class PumpSignal:
@@ -727,6 +892,70 @@ def score_window(
         risks=risks,
     )
 
+def parabolic_sar(candles: List[Candle], step: float = 0.02,
+                  max_step: float = 0.2) -> Tuple[List[float], List[bool]]:
+    """
+    Parabolic SAR: (значения, флаг восходящего тренда по барам).
+
+    Классика Уайлдера: точка разворота ускоряется по мере движения цены,
+    разворот — когда цена пробивает SAR. Флаг направления нужен и стратегии
+    (трендовый фильтр), и графику (точки рисуются под/над ценой).
+    """
+    n = len(candles)
+    if n < 3:
+        return [], []
+    sar = [0.0] * n
+    up_list = [True] * n
+    up = candles[1].close >= candles[0].close
+    af = step
+    ep = max(c.high for c in candles[:2]) if up else min(c.low for c in candles[:2])
+    sar[0] = candles[0].low if up else candles[0].high
+    for i in range(1, n):
+        cur = sar[i - 1] + af * (ep - sar[i - 1])
+        if up:
+            cur = min(cur, candles[i - 1].low, candles[max(0, i - 2)].low)
+            if candles[i].low < cur:
+                up = False
+                cur = ep
+                ep = candles[i].low
+                af = step
+            elif candles[i].high > ep:
+                ep = candles[i].high
+                af = min(af + step, max_step)
+        else:
+            cur = max(cur, candles[i - 1].high, candles[max(0, i - 2)].high)
+            if candles[i].high > cur:
+                up = True
+                cur = ep
+                ep = candles[i].high
+                af = step
+            elif candles[i].low < ep:
+                ep = candles[i].low
+                af = min(af + step, max_step)
+        sar[i] = cur
+        up_list[i] = up
+    return sar, up_list
+
+def fractals(candles: List[Candle], k: int = 2):
+    """
+    Фракталы Билла Вильямса: up-фрактал — бар с максимумом в окне ±k,
+    down-фрактал — с минимумом. Возвращает (уровни up, уровни down),
+    None там, где фрактала нет.
+
+    Фрактал подтверждается только через k баров после него — поэтому
+    последние k баров структурно не могут быть фракталами.
+    """
+    n = len(candles)
+    up: List[Optional[float]] = [None] * n
+    down: List[Optional[float]] = [None] * n
+    for i in range(k, n - k):
+        window = candles[i - k:i + k + 1]
+        if candles[i].high >= max(c.high for c in window):
+            up[i] = candles[i].high
+        if candles[i].low <= min(c.low for c in window):
+            down[i] = candles[i].low
+    return up, down
+
 def score_indicators(
     timeframe: str,
     candles: List[Candle],
@@ -734,11 +963,15 @@ def score_indicators(
     change_24h: float,
     forming: bool,
     strict: bool = True,
+    rsi_min: Optional[float] = None,
 ) -> Optional[TfBreakdown]:
     """
-    Режим «RSI + стохастик»: покупка, когда RSI выше порога, стохастик выше
-    порога И %K выше %D (импульс вверх). Пороги — в настройках (rsi_min,
-    stoch_min), по умолчанию 55/55.
+    Режим «RSI + Parabolic SAR + фракталы»: покупка, когда RSI выше порога,
+    SAR находится ПОД ценой (восходящий тренд) и цена пробила последний
+    подтверждённый up-фрактал.
+
+    Стохастик убран: на трёх выборках он не давал информации, а требование
+    «%K > %D» работало против результата (см. свип порогов в харнессе).
 
     Соблюдает контракт score_window — возвращает TfBreakdown либо None,
     поэтому analyze_symbol не знает, какой режим выбран.
@@ -750,48 +983,62 @@ def score_indicators(
     rsi14 = rsi(closes, 14)
     if rsi14 is None:
         return None
-    k_series, d_series = stochastic_series(candles)
-    k_last, d_last = k_series[-1], d_series[-1]
-    if k_last is None or d_last is None:
+
+    sar_series, sar_up = parabolic_sar(candles)
+    if not sar_series:
         return None
+    sar_last, sar_is_up = sar_series[-1], sar_up[-1]
+
+    up_fr, _down_fr = fractals(candles, k=2)
+    last_fractal = next((lvl for lvl in reversed(up_fr) if lvl is not None), None)
 
     last = candles[-1]
     range_ = last.high - last.low
     if range_ <= 0:
         return None
 
-    up = k_last > d_last
-    # Жёсткое условие входа: оба индикатора выше своих порогов и импульс вверх
-    if strict and not (rsi14 > DEFAULT_RSI_MIN and k_last > DEFAULT_STOCH_MIN and up):
+    rsi_min = DEFAULT_RSI_MIN if rsi_min is None else rsi_min
+    sar_below = sar_is_up and sar_last < last.close
+    fractal_broken = last_fractal is not None and last.close > last_fractal
+    # Жёсткое условие входа: RSI выше порога, SAR под ценой (тренд вверх)
+    # и пробит последний up-фрактал (структурное подтверждение).
+    if strict and not (rsi14 > rsi_min and sar_below and fractal_broken):
         return None
 
-    rsi_part = clamp((rsi14 - DEFAULT_RSI_MIN) / max(1.0, 70.0 - DEFAULT_RSI_MIN), 0.0, 1.0)
-    stoch_part = clamp((k_last - DEFAULT_STOCH_MIN) / max(1.0, 85.0 - DEFAULT_STOCH_MIN), 0.0, 1.0)
-    up_part = 1.0 if up else 0.0
+    # Насколько цена выше SAR — мера силы и «свежести» тренда
+    sar_gap = clamp((last.close - sar_last) / last.close / 0.05, 0.0, 1.0)
+    rsi_part = clamp((rsi14 - rsi_min) / max(1.0, 70.0 - rsi_min), 0.0, 1.0)
+    if last_fractal:
+        frac_part = clamp(last.close / last_fractal - 1.0, 0.0, 0.02) / 0.02
+    else:
+        frac_part = 0.0
 
     factors = [
-        FactorScore("rsi_zone", f"RSI выше {DEFAULT_RSI_MIN:.0f}", 40, rsi_part, f"RSI {rsi14:.1f}"),
-        FactorScore("stoch_zone", f"Стохастик выше {DEFAULT_STOCH_MIN:.0f}", 40, stoch_part, f"%K {k_last:.1f}"),
-        FactorScore("stoch_up", "Импульс вверх (%K > %D)", 20, up_part,
-                    f"%K {k_last:.1f} vs %D {d_last:.1f}"),
+        FactorScore("rsi_zone", f"RSI выше {rsi_min:.0f}", 40, rsi_part, f"RSI {rsi14:.1f}"),
+        FactorScore("sar_trend", "Parabolic SAR под ценой", 35, sar_gap,
+                    f"SAR {fmt_price(sar_last)} vs цена {fmt_price(last.close)}"),
+        FactorScore("fractal_break", "Пробит up-фрактал", 25, frac_part,
+                    f"фрактал {fmt_price(last_fractal) if last_fractal else '—'}"),
     ]
     score = sum(f.value * f.weight for f in factors)
-    late = rsi14 >= 75 or k_last >= 95
+    late = rsi14 >= 75
     grade = grade_from(score, late)
 
     reasons = []
-    if rsi14 > DEFAULT_RSI_MIN:
-        reasons.append(f"RSI {rsi14:.1f} выше порога {DEFAULT_RSI_MIN:.0f}")
-    if k_last > DEFAULT_STOCH_MIN:
-        reasons.append(f"стохастик %K {k_last:.1f} выше порога {DEFAULT_STOCH_MIN:.0f}")
-    if up:
-        reasons.append("%K выше %D — импульс вверх")
+    if rsi14 > rsi_min:
+        reasons.append(f"RSI {rsi14:.1f} выше порога {rsi_min:.0f}")
+    if sar_below:
+        reasons.append(f"Parabolic SAR под ценой — тренд вверх")
+    if fractal_broken:
+        reasons.append(f"цена пробила up-фрактал {fmt_price(last_fractal)}")
 
     risks = []
     if rsi14 >= 70:
         risks.append("RSI в зоне перекупленности")
-    if k_last >= 80:
-        risks.append("стохастик в верхней зоне")
+    if not sar_below:
+        risks.append("SAR над ценой — тренд не подтверждён")
+    if not fractal_broken:
+        risks.append("up-фрактал не пробит")
     if last.close < last.open:
         risks.append("текущая свеча красная")
 
@@ -813,7 +1060,266 @@ def score_indicators(
         factors=factors,
         reasons=reasons,
         risks=risks,
+        sar=sar_last,
+        fractal_level=last_fractal or 0.0,
     )
+
+def median(values: List[float]) -> float:
+    s = sorted(values)
+    n = len(s)
+    if not n:
+        return 0.0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def vol_ratio_robust(volumes: List[float], period: int = 20) -> Optional[float]:
+    """
+    Объём бара к МЕДИАНЕ предыдущих, а не к среднему.
+
+    Измерено на живых данных: SMA20 завышается до 2.6× после разового всплеска
+    (THEUSDT: среднее 3.86M против медианы 1.48M) и «слепит» инструмент на ~5
+    часов, пока окно не вычистится. Медиана к одиночному выбросу устойчива.
+    """
+    if len(volumes) < period + 1:
+        return None
+    base = median(list(volumes[-(period + 1):-1]))
+    if base <= 0:
+        return None
+    return volumes[-1] / base
+
+
+def score_volume_candle(
+    timeframe: str,
+    candles: List[Candle],
+    btc_candles: List[Candle],
+    change_24h: float,
+    forming: bool = True,
+    strict: bool = True,
+) -> Optional[TfBreakdown]:
+    """
+    «Зелёная свеча при повышенном объёме».
+
+    Объём ведущий (60 баллов), свеча — мягкое подтверждение (40), и НЕТ
+    требования пробоя: факторный аудит показал, что именно «уже состоявшееся
+    движение» имеет отрицательный наклон, поэтому пробой сознательно не
+    требуется. Идея в том, чтобы поймать приток покупок до того, как цена
+    уйдёт, а не после.
+    """
+    if len(candles) < MIN_BARS:
+        return None
+
+    last = candles[-1]
+    range_ = last.high - last.low
+    if range_ <= 0:
+        return None
+
+    body = abs(last.close - last.open)
+    body_ratio = body / range_
+    close_pos = (last.close - last.low) / range_
+    upper_wick_ratio = (last.high - max(last.close, last.open)) / range_
+    bullish = last.close >= last.open
+
+    vr = vol_ratio_robust([c.volume for c in candles])
+    if vr is None:
+        return None
+
+    # Условие входа: зелёная свеча и объём заметно выше медианы
+    if strict and not (bullish and vr >= VOL_MIN_RATIO):
+        return None
+
+    # Оценка объёма: 60 баллов, насыщение на 4× медианы
+    vol_part = clamp((vr - 1.0) / 3.0, 0.0, 1.0)
+    # Качество свечи: 40 баллов
+    quality = 0.0
+    if bullish:
+        quality += 0.5
+    quality += clamp(body_ratio * 1.0, 0.0, 0.25)
+    quality += clamp(close_pos * 0.3, 0.0, 0.25)
+    quality = clamp(quality, 0.0, 1.0)
+
+    factors = [
+        FactorScore("vol_robust", "Объём к медиане 20", 60, vol_part, f"{vr:.2f}× медианы"),
+        FactorScore("candle", "Зелёная свеча", 40, quality,
+                       f"тело {body_ratio*100:.0f}%, закрытие {close_pos*100:.0f}% диапазона"),
+    ]
+    score = sum(f.value * f.weight for f in factors)
+    # Перегрев: длинная верхняя тень или объём-аномалия 6×+ (разгрузка)
+    late = upper_wick_ratio > 0.45 or vr > 6.0 or change_24h > 7.0
+    grade = grade_from(score, late)
+
+    reasons = []
+    if vr >= VOL_MIN_RATIO:
+        reasons.append(f"объём {vr:.2f}× медианы 20 — приток покупок")
+    if bullish:
+        reasons.append("зелёная свеча")
+    if upper_wick_ratio < 0.15:
+        reasons.append("свеча закрылась у максимума")
+
+    risks = []
+    if upper_wick_ratio > 0.3:
+        risks.append("длинная верхняя тень (продают в рост)")
+    if vr > 6.0:
+        risks.append("объём-аномалия, возможна разгрузка")
+    if not bullish:
+        risks.append("красная свеча при повышенном объёме")
+    if change_24h > 6.0:
+        risks.append(f"суточный рост {change_24h:+.1f}%")
+
+    return TfBreakdown(
+        timeframe=timeframe,
+        score=score,
+        grade=grade,
+        volume_ratio=vr,
+        atr_expansion=0.0,
+        breakout_pct=0.0,
+        rsi=rsi([c.close for c in candles], 14) or 0.0,
+        taker_buy=(last.taker_buy_base / last.volume) if last.volume > 0 else 0.5,
+        vs_btc_pct=0.0,
+        change_pct=pct_change(last.open, last.close),
+        ema_aligned=False,
+        late=late,
+        forming=forming,
+        bar_open_time=last.open_time,
+        factors=factors,
+        reasons=reasons,
+        risks=risks,
+    )
+
+
+def score_dump(
+    timeframe: str,
+    candles: List[Candle],
+    btc_candles: List[Candle],
+    change_24h: float,
+    forming: bool = True,
+    strict: bool = True,
+) -> Optional[TfBreakdown]:
+    """
+    Детектор ДАМПА в зародыше — зеркало памп-скора.
+
+    Зеркальность по факторам: красная свеча вместо зелёной, всплеск объёма
+    (капитуляция), пробой НИЖНЕЙ границы коридора, RSI в перепроданности,
+    доминирование продаж по тейкеру, отставание от BTC.
+
+    Ключевое отличие в применении: бот long-only, поэтому сигнал означает не
+    «шортить», а «готовимся покупать отскок». Вход ставится ВЫШЕ цены
+    (bounce-вход) — зеркало памп-входа на откате вниз.
+    """
+    if len(candles) < MIN_BARS:
+        return None
+
+    last = candles[-1]
+    range_ = last.high - last.low
+    if range_ <= 0:
+        return None
+
+    hist = candles[:-1]
+    vr = vol_ratio_robust([c.volume for c in candles])
+    if vr is None:
+        return None
+
+    body = abs(last.close - last.open)
+    body_ratio = body / range_
+    close_pos_down = (last.high - last.close) / range_   # близость закрытия к минимуму
+    bearish = last.close <= last.open
+
+    prev_low = min((c.low for c in hist[-14:]), default=None)
+    if not prev_low or prev_low <= 0:
+        return None
+    breakdown_pct = pct_change(prev_low, last.close)   # отрицательное при пробое вниз
+
+    closes = [c.close for c in candles]
+    rsi14 = rsi(closes, 14)
+    if rsi14 is None:
+        return None
+    taker_buy = (last.taker_buy_base / last.volume) if last.volume > 0 else 0.5
+
+    if strict and not (bearish and breakdown_pct < 0 and rsi14 < 45):
+        return None
+
+    vol_part = clamp((vr - 1.2) / 3.0, 0.0, 1.0)            # 25
+    sell_part = clamp((0.48 - taker_buy) / 0.26, 0.0, 1.0)  # 22
+    rsi_part = 0.0                                             # 18
+    if 18 <= rsi14 <= 38:
+        rsi_part = 1.0 - abs(rsi14 - 28) / 14.0
+    elif 38 < rsi14 <= 45:
+        rsi_part = clamp(1.0 - (rsi14 - 38) / 10.0, 0.0, 0.6)
+    elif rsi14 < 18:
+        rsi_part = 0.3                                          # уже нож, не отскок
+    brk_part = 0.0                                             # 15
+    if -4.0 <= breakdown_pct <= -0.2:
+        brk_part = clamp(abs(breakdown_pct) / 2.5, 0.25, 1.0)
+    elif breakdown_pct < -4.0:
+        brk_part = 0.3                                          # слишком глубоко упало
+    quality = clamp((0.4 if bearish else 0.0) + body_ratio * 0.3
+                       + close_pos_down * 0.3, 0.0, 1.0)        # 10
+
+    btc_closes = [c.close for c in btc_candles] if btc_candles else []
+    lag = roc(closes, 6) - (roc(btc_closes, 6) if len(btc_closes) >= 7 else 0.0)
+    lag_part = clamp((-lag + 0.3) / 2.0, 0.0, 1.0)           # 10: отставание от BTC
+
+    factors = [
+        FactorScore("vol", "Всплеск объёма", 25, vol_part, f"{vr:.1f}× медианы"),
+        FactorScore("sell", "Доминирование продаж", 22, sell_part,
+                       f"{taker_buy*100:.0f}% Taker Buy"),
+        FactorScore("rsi_low", "RSI в перепроданности", 18, rsi_part, f"RSI {rsi14:.1f}"),
+        FactorScore("breakdown", "Пробой нижней границы", 15, brk_part, f"{breakdown_pct:+.2f}%"),
+        FactorScore("candle", "Красная свеча (капитуляция)", 10, quality,
+                       f"тело {body_ratio*100:.0f}%"),
+        FactorScore("lag_btc", "Отставание от BTC", 10, lag_part, f"{lag:+.2f}%"),
+    ]
+    score = sum(f.value * f.weight for f in factors)
+    # Зеркало фильтра «поздно»: слишком глубокое падение — это не отскок, а нож
+    late = rsi14 < 20 or change_24h < -18.0 or breakdown_pct < -6.0
+    grade = grade_from(score, late)
+
+    reasons = []
+    if vr >= 2.0:
+        reasons.append(f"объём капитуляции {vr:.1f}× медианы")
+    if taker_buy <= 0.42:
+        reasons.append(f"доминируют продажи ({(1 - taker_buy) * 100:.0f}% тейкером)")
+    if rsi14 < 38:
+        reasons.append(f"RSI {rsi14:.0f} — перепроданность")
+    if breakdown_pct < 0:
+        reasons.append(f"пробой нижней границы ({breakdown_pct:+.1f}%)")
+
+    risks = []
+    if rsi14 < 25:
+        risks.append("сильная перепроданность: риск продолжить падение")
+    if change_24h < -12.0:
+        risks.append(f"суточное падение {change_24h:+.1f}% — возможен тренд вниз")
+    if not bearish:
+        risks.append("текущая свеча зелёная — дамп уже выкупают")
+
+    return TfBreakdown(
+        timeframe=timeframe,
+        score=score,
+        grade=grade,
+        volume_ratio=vr,
+        atr_expansion=0.0,
+        breakout_pct=breakdown_pct,
+        rsi=rsi14,
+        taker_buy=taker_buy,
+        vs_btc_pct=lag,
+        change_pct=pct_change(last.open, last.close),
+        ema_aligned=False,
+        late=late,
+        forming=forming,
+        bar_open_time=last.open_time,
+        factors=factors,
+        reasons=reasons,
+        risks=risks,
+    )
+
+
+# Реестр режимов -> скорер. None означает «встроенный в pump_bot»:
+# памп-скор (score_window) и индикаторный (score_indicators) лежат выше.
+STRATEGY_SCORERS = {
+    "pump": None,
+    "indicators": None,
+    "volume": score_volume_candle,
+    "dump": score_dump,
+}
 
 def pick_best(rows: List[TfBreakdown]) -> TfBreakdown:
     order = {"strong": 0, "watch": 1, "late": 2, "none": 3}
@@ -842,7 +1348,9 @@ def analyze_symbol(
     btc_change = btc_ticker["priceChangePercent"] if btc_ticker else 0.0
     btc_rel_24h = ticker["priceChangePercent"] - btc_change
 
-    scorer = score_indicators if strategy == "indicators" else score_window
+    scorer = STRATEGY_SCORERS.get(strategy)
+    if scorer is None:
+        scorer = score_indicators if strategy == "indicators" else score_window
     all_rows: List[TfBreakdown] = []
     for tf in TIMEFRAMES:
         candles = raw15 if tf == "5m" else aggregate_timeframe(raw15, TF_MS[tf])
@@ -1023,6 +1531,20 @@ def load_state() -> dict:
         d["pending_entries"] = data.get("pending_entries", {}) or {}
         d["symbol_alert_cooldown"] = data.get("symbol_alert_cooldown", {}) or {}
         d["allowed_chats"] = list(set(data.get("allowed_chats", [])))
+
+        # Валидация целостности данных состояния
+        port = d["portfolio"]
+        for sym in list(port.keys()):
+            pos = port[sym]
+            if not isinstance(pos, dict) or float(pos.get("qty", 0.0)) <= 0:
+                port.pop(sym, None)
+
+        trades = d["active_trades"]
+        for sym in list(trades.keys()):
+            tr = trades[sym]
+            if not isinstance(tr, dict) or float(tr.get("qty", 0.0)) <= 0:
+                trades.pop(sym, None)
+
     except Exception as e:
         print(f"Не удалось прочитать {STATE_FILE}: {e}", file=sys.stderr)
     return d
@@ -1052,11 +1574,20 @@ def save_state(state: dict, sync_git: bool = False) -> None:
         for k in [k for k, ts in cooldown.items() if ts <= cutoff]:
             cooldown.pop(k, None)
 
+        # Создаем безопасную копию для записи на диск (без API-ключей и секретов)
+        st_to_save = dict(state)
+        if "settings" in st_to_save and isinstance(st_to_save["settings"], dict):
+            st_settings = dict(st_to_save["settings"])
+            st_settings.pop("binance_api_key", None)
+            st_settings.pop("binance_api_secret", None)
+            st_settings.pop("worker_auth_token", None)
+            st_to_save["settings"] = st_settings
+
         tmp = STATE_FILE + ".tmp"
         for attempt in range(3):
             try:
                 with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(state, f, ensure_ascii=False, indent=2)
+                    json.dump(st_to_save, f, ensure_ascii=False, indent=2)
                 os.replace(tmp, STATE_FILE)
                 break
             except RuntimeError as e:
@@ -1161,16 +1692,17 @@ def sanitize_api_key(val: str) -> str:
     return cleaned
 
 def get_api_credentials(state: Optional[dict] = None) -> Tuple[str, str]:
-    """Возвращает (api_key, api_secret) с приоритетом настроек бота над переменными окружения."""
-    key = ""
-    secret = ""
-    if state:
+    """
+    Возвращает (api_key, api_secret).
+    Приоритет: переменные окружения GitHub Secrets (BINANCE_API_KEY, BINANCE_API_SECRET),
+    затем настройки бота.
+    """
+    key = sanitize_api_key(os.environ.get("BINANCE_API_KEY", ""))
+    secret = sanitize_api_key(os.environ.get("BINANCE_API_SECRET", ""))
+    if not key and state:
         key = sanitize_api_key(state.get("settings", {}).get("binance_api_key", ""))
+    if not secret and state:
         secret = sanitize_api_key(state.get("settings", {}).get("binance_api_secret", ""))
-    if not key:
-        key = sanitize_api_key(os.environ.get("BINANCE_API_KEY", ""))
-    if not secret:
-        secret = sanitize_api_key(os.environ.get("BINANCE_API_SECRET", ""))
     return key, secret
 
 def binance_signed_request(
@@ -1199,6 +1731,13 @@ def binance_signed_request(
         "X-MBX-APIKEY": api_key,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PumpPulseBot/2.1",
     }
+    worker_auth = ""
+    if state:
+        worker_auth = str(state.get("settings", {}).get("worker_auth_token", "")).strip()
+    if not worker_auth:
+        worker_auth = BINANCE_WORKER_AUTH
+    if worker_auth:
+        headers["X-Worker-Auth"] = worker_auth
 
     url = f"{BINANCE_TRADE_URL}{endpoint}"
     method_up = method.upper()
@@ -1217,16 +1756,19 @@ def binance_signed_request(
 
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
+            record_binance_weight(getattr(resp, "headers", None))
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        record_binance_weight(getattr(e, "headers", None))
         err_body = e.read().decode("utf-8", errors="ignore")
         try:
             err_json = json.loads(err_body)
-            return {"error": err_json.get("msg", err_body), "code": err_json.get("code", e.code)}
+            msg = sanitize_sensitive_text(err_json.get("msg", err_body))
+            return {"error": msg, "code": err_json.get("code", e.code)}
         except Exception:
-            return {"error": f"HTTP {e.code}: {err_body}", "code": e.code}
+            return {"error": sanitize_sensitive_text(f"HTTP {e.code}: {err_body}"), "code": e.code}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": sanitize_sensitive_text(str(e))}
 
 def get_spot_account_assets(state: Optional[dict] = None) -> Tuple[Dict[str, dict], Optional[str]]:
     """
@@ -1332,8 +1874,9 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
 
         if price is not None:
             val_usdt = tot_qty * price
-            # Скрываем пыль меньше $0.05 если монет микроскопически мало
-            if val_usdt < 0.05 and tot_qty < 0.0001:
+            # Скрываем пыль дешевле 1 USDT (кроме активных сделок и портфеля)
+            is_active = pair in active_trades or pair in portfolio
+            if val_usdt < 1.0 and not is_active:
                 continue
             total_crypto_value += val_usdt
             lock_str = f" <i>(в TP: {fmt_qty(lock_qty)})</i>" if lock_qty > 0.000001 else ""
@@ -1417,6 +1960,162 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
 
     return "\n".join(lines)
 
+
+def balance_inline_kb(state: Optional[dict] = None) -> dict:
+    """Inline-клавиатура для экрана баланса: обновление + очистка пыли."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 Обновить баланс", "callback_data": "balance:refresh"},
+                {"text": "🧹 Очистить пыль", "callback_data": "balance:clean_dust"},
+            ],
+            [
+                {"text": "📊 Сделки и Профит", "callback_data": "port:trades_stats"},
+            ],
+        ]
+    }
+
+
+def get_dust_assets(state: dict, min_usdt: float = 1.0) -> list:
+    """
+    Возвращает список dust-активов: монет, чья стоимость < min_usdt USDT,
+    которые НЕ находятся в active_trades и portfolio (т.е. не активные позиции).
+
+    Каждый элемент: {"asset": str, "qty": float, "val_usdt": float, "symbol": str}
+    """
+    active_trades = state.get("active_trades", {})
+    portfolio = state.get("portfolio", {})
+
+    assets, err = get_spot_account_assets(state)
+    if err or not assets:
+        return []
+
+    non_usdt = {k: v for k, v in assets.items() if k != "USDT" and v["total"] > 0.00000001}
+    symbols_to_fetch = [f"{a}USDT" for a in non_usdt]
+    prices = get_multiple_prices(symbols_to_fetch) if symbols_to_fetch else {}
+
+    dust = []
+    for asset, info in non_usdt.items():
+        pair = f"{asset}USDT"
+        # Пропускаем активные позиции
+        if pair in active_trades or pair in portfolio:
+            continue
+        price = prices.get(pair)
+        if price is None:
+            continue
+        val_usdt = info["total"] * price
+        if val_usdt < min_usdt:
+            dust.append({
+                "asset": asset,
+                "qty": info["total"],
+                "free": info["free"],
+                "val_usdt": val_usdt,
+                "symbol": pair,
+            })
+    return dust
+
+
+def clean_dust_balances(token: str, chat_id: int, state: dict, min_usdt: float = 1.0) -> None:
+    """
+    Находит и продает по MARKET все dust-активы (стоимость < min_usdt USDT),
+    которые не являются активными позициями. Отправляет отчет в Telegram.
+    """
+    dust_list = get_dust_assets(state, min_usdt)
+
+    if not dust_list:
+        send_telegram(token, chat_id,
+                      "✅ <b>Пыль не найдена.</b>\n\n"
+                      f"Все монеты (кроме USDT) стоят ≥ {min_usdt} USDT, "
+                      "или это активные позиции бота.")
+        return
+
+    # Показываем что будет продано
+    lines = [f"🧹 <b>Найдена пыль ({len(dust_list)} монет):</b>\n"]
+    for d in dust_list:
+        lines.append(f"• <b>{d['asset']}</b>: {fmt_qty(d['qty'])} ≈ <code>{d['val_usdt']:.4f} USDT</code>")
+    lines.append("\n⏳ <i>Продаю...</i>")
+    msg_id = send_telegram(token, chat_id, "\n".join(lines))
+
+    sold_ok = []
+    failed = []
+
+    for d in dust_list:
+        symbol = d["symbol"]
+        base = d["asset"]
+        free_qty = d["free"]
+        if free_qty <= 0.00000001:
+            failed.append(f"{base}: нет свободного баланса")
+            continue
+
+        filters = get_symbol_filters(symbol)
+        if not filters:
+            failed.append(f"{base}: фильтры недоступны")
+            continue
+
+        step_size = filters.get("step_size", 0.0001)
+        min_qty = filters.get("min_qty", 0.0)
+        min_notional = filters.get("min_notional", 1.0)
+
+        qty_str = fmt_qty_filter(free_qty, step_size)
+        qty_f = float(qty_str)
+
+        if qty_f <= 0 or qty_f < min_qty:
+            failed.append(f"{base}: кол-во {free_qty} ниже min_qty {min_qty}")
+            continue
+
+        # Проверяем notional (qty * price >= minNotional)
+        price = get_price(symbol)
+        if price and qty_f * price < min_notional:
+            failed.append(f"{base}: слишком мало ({qty_f * price:.5f} USDT < min {min_notional})")
+            continue
+
+        sell_res = binance_signed_request(
+            "POST", "/api/v3/order",
+            {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": qty_str},
+            state=state,
+        )
+        if "error" in sell_res:
+            # Пробуем 99.8% от количества (комиссия)
+            red = fmt_qty_filter(qty_f * 0.998, step_size)
+            if float(red) > 0 and red != qty_str:
+                sell_res = binance_signed_request(
+                    "POST", "/api/v3/order",
+                    {"symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": red},
+                    state=state,
+                )
+
+        if "error" in sell_res:
+            failed.append(f"{base}: {sell_res.get('error', 'ошибка')}")
+        else:
+            cum = float(sell_res.get("cummulativeQuoteQty", 0.0))
+            sold_ok.append(f"✅ {base}: продано за <code>{cum:.4f} USDT</code>")
+            log_trade_event(
+                event_type="DUST_CLEANED",
+                symbol=symbol,
+                order_id=sell_res.get("orderId"),
+                price=price or 0.0,
+                qty=float(sell_res.get("executedQty", qty_f)),
+                quote_amount=cum,
+            )
+
+    result_lines = ["🧹 <b>Очистка пыли завершена!</b>\n"]
+    if sold_ok:
+        result_lines.append("<b>Продано:</b>")
+        result_lines.extend(sold_ok)
+    if failed:
+        result_lines.append("\n<b>Не удалось продать:</b>")
+        for f in failed:
+            result_lines.append(f"⚠️ {f}")
+    if not sold_ok and not failed:
+        result_lines.append("Ничего не продано.")
+
+    result_text = "\n".join(result_lines)
+    if msg_id:
+        edit_message(token, chat_id, msg_id, result_text, reply_markup=balance_inline_kb(state))
+    else:
+        send_telegram(token, chat_id, result_text, reply_markup=balance_inline_kb(state))
+
+
 _symbol_filters_cache: Dict[str, dict] = {}
 _symbol_filters_cache_at: Dict[str, float] = {}
 
@@ -1445,6 +2144,7 @@ def get_symbol_filters(symbol: str) -> dict:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
+            record_binance_weight(getattr(resp, "headers", None))
             data = json.loads(resp.read().decode("utf-8"))
             symbols = data.get("symbols", [])
             if not symbols:
@@ -1545,7 +2245,11 @@ def execute_pump_auto_trade(
     skip_portfolio_notice = False
     with STATE_LOCK:
         error = None
-        if sig.symbol in pending_entries:
+        cooldown_until = is_symbol_in_sl_cooldown(state, sig.symbol)
+        if cooldown_until:
+            cooldown_left = max(1, int(cooldown_until - time.time()))
+            error = f"Монета {sig.symbol} в кулдауне после Stop-Loss (осталось {cooldown_left}с)"
+        elif sig.symbol in pending_entries:
             error = f"По монете {sig.symbol} уже выставлен лимитный ордер на вход"
         elif sig.symbol in active_trades:
             error = f"По монете {sig.symbol} уже есть открытая позиция"
@@ -1704,6 +2408,17 @@ def execute_pump_auto_trade(
         state.setdefault("pending_entries", {})[sig.symbol] = entry_record
         save_state(state, sync_git=True)
 
+        log_trade_event(
+            event_type="BUY_LIMIT_PLACED",
+            symbol=sig.symbol,
+            order_id=buy_order_id,
+            price=float(limit_buy_price_str),
+            qty=float(qty_str),
+            quote_amount=float(qty_str) * float(limit_buy_price_str),
+            reason=f"pullback_{entry_pullback_pct:.1f}%",
+            meta={"best_score": sig.best_score, "grade": sig.grade},
+        )
+
         entry_alert = (
             f"🎯 <b>ВЫСТАВЛЕН ЛИМИТНЫЙ ОРДЕР НА ОТКАТ (-{entry_pullback_pct:.1f}%)!</b>\n\n"
             f"⏳ Ждём микро-отката для покупки <b>{sig.base}/USDT</b> без переплаты на хаях:\n"
@@ -1855,6 +2570,36 @@ def execute_pump_auto_trade(
     state.setdefault("pending_entries", {}).pop(sig.symbol, None)
     portfolio_add(state, sig.symbol, exec_qty, avg_buy_price)
     save_state(state, sync_git=True)
+
+    log_trade_event(
+        event_type="BUY_MARKET_FILLED",
+        symbol=sig.symbol,
+        order_id=buy_order_id,
+        price=avg_buy_price,
+        qty=exec_qty,
+        quote_amount=cum_quote,
+        reason="market_entry",
+        meta={"best_score": sig.best_score, "grade": sig.grade},
+    )
+    if oco:
+        log_trade_event(
+            event_type="OCO_PLACED",
+            symbol=sig.symbol,
+            order_id=oco.get("order_list_id"),
+            price=float(tp_price_str),
+            qty=exec_qty,
+            reason=f"tp={tp_pct:.1f}%, sl={sl_pct:.1f}%",
+            meta={"tp_order_id": oco.get("tp_order_id"), "sl_order_id": oco.get("sl_order_id")},
+        )
+    elif tp_success:
+        log_trade_event(
+            event_type="TP_LIMIT_PLACED",
+            symbol=sig.symbol,
+            order_id=tp_order_id,
+            price=float(tp_price_str),
+            qty=exec_qty,
+            reason=f"tp={tp_pct:.1f}%",
+        )
 
     # 5. Уведомление в Telegram
     expected_gain = (float(sell_params["quantity"]) * float(tp_price_str)) - cum_quote
@@ -2060,6 +2805,36 @@ def _check_pending_entries(token: str, chat_id: Union[str, int], state: dict) ->
             state.setdefault("active_trades", {})[symbol] = trade_rec
             portfolio_add(state, symbol, exec_qty, avg_buy_price)
 
+            log_trade_event(
+                event_type="BUY_LIMIT_FILLED",
+                symbol=symbol,
+                order_id=order_id,
+                price=avg_buy_price,
+                qty=exec_qty,
+                quote_amount=cum_quote,
+                reason="pullback_limit_fill",
+                meta={"best_score": entry.get("best_score", 70.0)},
+            )
+            if oco:
+                log_trade_event(
+                    event_type="OCO_PLACED",
+                    symbol=symbol,
+                    order_id=oco.get("order_list_id"),
+                    price=float(tp_price_str),
+                    qty=exec_qty,
+                    reason=f"tp={tp_pct:.1f}%, sl={sl_pct:.1f}%",
+                    meta={"tp_order_id": oco.get("tp_order_id"), "sl_order_id": oco.get("sl_order_id")},
+                )
+            elif tp_success:
+                log_trade_event(
+                    event_type="TP_LIMIT_PLACED",
+                    symbol=symbol,
+                    order_id=tp_order_id,
+                    price=float(tp_price_str),
+                    qty=exec_qty,
+                    reason=f"tp={tp_pct:.1f}%",
+                )
+
             base = entry.get("base", base_asset(symbol))
             atr_lbl = " <i>(динамический ATR)</i>" if atr_calculated else ""
             tp_note = (
@@ -2103,6 +2878,14 @@ def _check_pending_entries(token: str, chat_id: Union[str, int], state: dict) ->
             updated = True
             base = entry.get("base", base_asset(symbol))
             print(f"[Timeout Pullback Order {symbol}]: отменён по истечению таймаута")
+            log_trade_event(
+                event_type="BUY_LIMIT_CANCELLED",
+                symbol=symbol,
+                order_id=order_id,
+                price=float(entry.get("target_price", 0.0)),
+                qty=float(entry.get("qty", 0.0)),
+                reason="timeout_expired",
+            )
             timeout_msg = (
                 f"⏱️ <b>Лимитный ордер на откат {base}/USDT отменён.</b>\n"
                 f"За 5 минут цена не скорректировалась к <code>{fmt_price(entry.get('target_price', 0))} $</code>. Позиция не открыта во избежание покупки на хаях."
@@ -2180,6 +2963,18 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
                 if len(history) > 100:
                     history.pop(0)
                 portfolio_remove(state, symbol)
+                set_symbol_sl_cooldown(state, symbol, reason="oco_stop_loss")
+                log_trade_event(
+                    event_type="SL_OCO_FILLED",
+                    symbol=symbol,
+                    order_id=sl_order_id,
+                    price=sell_price,
+                    qty=filled_qty,
+                    quote_amount=cum_quote,
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
+                    reason="oco_stop_loss",
+                )
                 print(f"[OCO {symbol}]: стоп-плечо исполнено биржей по {sell_price}")
 
                 if chat_id:
@@ -2247,6 +3042,17 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
 
                     # Удаляем из отслеживания портфеля
                     portfolio_remove(state, symbol)
+                    log_trade_event(
+                        event_type="TP_FILLED",
+                        symbol=symbol,
+                        order_id=tp_order_id,
+                        price=closed_rec["sell_price"],
+                        qty=float(res.get("executedQty", 0.0) or trade.get("qty", 0.0)),
+                        quote_amount=cum_quote,
+                        pnl=pnl,
+                        pnl_pct=pnl_pct,
+                        reason="take_profit",
+                    )
 
                     base = trade.get("base", base_asset(symbol))
                     win_msg = (
@@ -2350,6 +3156,18 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
 
                 symbols_to_remove.append(symbol)
                 updated = True
+                if not is_trailing:
+                    set_symbol_sl_cooldown(state, symbol, reason="market_stop_loss")
+                log_trade_event(
+                    event_type="TRAILING_STOP_FILLED" if is_trailing else "SL_MARKET_FILLED",
+                    symbol=symbol,
+                    price=cur_p,
+                    qty=float(trade.get("qty", 0.0)),
+                    quote_amount=float(sell_res.get("cummulativeQuoteQty", 0.0) or (cur_p * float(trade.get("qty", 0.0)))),
+                    pnl=(cur_p - buy_p) * float(trade.get("qty", 0.0)),
+                    pnl_pct=((cur_p - buy_p) / buy_p * 100.0) if buy_p > 0 else 0.0,
+                    reason="trailing_stop" if is_trailing else "stop_loss",
+                )
 
                 # Оповещение о стопе
                 stop_type = "🛡 <b>СРАБОТАЛ ТРЕЙЛИНГ-СТОП (ПРИБЫЛЬ ЗАФИКСИРОВАНА)</b>" if is_trailing else "🛑 <b>СРАБОТАЛ STOP-LOSS (ЗАЩИТА ДЕПОЗИТА)</b>"
@@ -2701,6 +3519,18 @@ def execute_emergency_market_sell(
     active_trades.pop(symbol, None)
     portfolio_remove(state, symbol)
     save_state(state, sync_git=True)
+
+    log_trade_event(
+        event_type="MANUAL_MARKET_SOLD",
+        symbol=symbol,
+        order_id=sell_res.get("orderId"),
+        price=sell_price,
+        qty=exec_qty,
+        quote_amount=cum_quote,
+        pnl=pnl,
+        pnl_pct=pnl_pct,
+        reason="manual_or_emergency_market_sell",
+    )
 
     sign = "🟢" if pnl >= 0 else "🔴"
     result_msg = (
@@ -3438,30 +4268,41 @@ def format_portfolio(state: dict) -> str:
     return "\n".join(lines)
 
 def format_trades_and_profit_stats(state: dict) -> str:
-    # 1. Синхронизируем открытые позиции и историю реальных сделок с Binance
-    sync_trades_and_active_positions(state)
-
+    """
+    Компактный журнал сделок по дням (сегодня / вчера).
+    НЕ вызывает sync — работает только с данными state + один batch-запрос цен для открытых позиций.
+    """
     active_trades = state.get("active_trades", {})
-    portfolio = state.get("portfolio", {})
-    history = state.get("trade_history", [])
-    settings = state.get("settings", {})
+    portfolio     = state.get("portfolio", {})
+    history       = state.get("trade_history", [])
+    settings      = state.get("settings", {})
+
     trade_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
-    tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
-    auto_trade_status = "🟢 Включена" if settings.get("auto_trade", False) else "🔴 Выключена"
+    tp_pct    = float(settings.get("take_profit_pct",   DEFAULT_TAKE_PROFIT))
+    auto_on   = settings.get("auto_trade", False)
+    auto_icon = "🟢" if auto_on else "🔴"
 
     api_key, api_secret = get_api_credentials(state)
-    has_api = bool(api_key and api_secret)
+    has_api   = bool(api_key and api_secret)
     free_usdt = get_free_usdt_balance(state) if has_api else 0.0
 
-    lines = [
-        "📊 <b>СТАТИСТИКА АВТОТОРГОВЛИ И РЕАЛИЗОВАННЫЙ ПРОФИТ</b>\n",
-        f"• <b>Автоторговля:</b> {auto_trade_status} (ставка: <code>{trade_amt:.0f} $</code>, TP: <code>+{tp_pct:.1f}%</code>)",
-        f"• <b>Свободный баланс:</b> <code>{free_usdt:,.2f} USDT</code>\n",
-        "─────────────────────"
-    ]
+    # ── Определяем границы «сегодня» и «вчера» ─────────────────────────
+    now_ts   = time.time()
+    tz_off   = time.timezone if (time.localtime().tm_isdst == 0) else time.altzone
+    now_loc  = now_ts - tz_off
+    day_sec  = 86400
+    today_start    = int(now_loc // day_sec) * day_sec + tz_off
+    yesterday_start = today_start - day_sec
 
-    # 2. ОТКРЫТЫЕ СДЕЛКИ И СПОТОВЫЕ АКТИВЫ
-    open_items = {}
+    def day_label(ts: float) -> str:
+        if ts >= today_start:
+            return "today"
+        if ts >= yesterday_start:
+            return "yesterday"
+        return "older"
+
+    # ── Открытые позиции: один batch-запрос цен ─────────────────────────
+    open_items: dict = {}
     for sym, tr in active_trades.items():
         open_items[sym] = dict(tr)
     for sym, pos in portfolio.items():
@@ -3469,159 +4310,306 @@ def format_trades_and_profit_stats(state: dict) -> str:
             open_items[sym] = {
                 "symbol": sym,
                 "base": base_asset(sym),
-                "buy_price": float(pos.get("avg_price", 0.0)),
-                "qty": float(pos.get("qty", 0.0)),
-                "cost_usdt": float(pos.get("qty", 0.0)) * float(pos.get("avg_price", 0.0)),
-                "tp_price": float(pos.get("avg_price", 0.0)) * (1.0 + tp_pct / 100.0),
-                "tp_pct": tp_pct,
-                "opened_at": pos.get("added_at", int(time.time())),
+                "buy_price":  float(pos.get("avg_price", 0.0)),
+                "qty":        float(pos.get("qty", 0.0)),
+                "cost_usdt":  float(pos.get("qty", 0.0)) * float(pos.get("avg_price", 0.0)),
+                "tp_price":   float(pos.get("avg_price", 0.0)) * (1.0 + tp_pct / 100.0),
+                "tp_pct":     tp_pct,
+                "opened_at":  pos.get("added_at", int(now_ts)),
             }
 
+    cur_prices: dict = {}
     if open_items:
-        symbols = list(open_items.keys())
-        prices = get_multiple_prices(symbols) if symbols else {}
+        cur_prices = get_multiple_prices(list(open_items.keys())) or {}
 
-        total_cost = 0.0
-        total_val = 0.0
-        total_exp_gain = 0.0
+    # ── Собираем строки журнала по дням ──────────────────────────────────
+    # Ключ → список строк записей (one-liner)
+    buckets: dict = {"today": [], "yesterday": [], "older": []}
 
-        lines.append("⚡ <b>ОТКРЫТЫЕ СДЕЛКИ (BINANCE SPOT):</b>\n")
-        for sym, tr in open_items.items():
-            base = tr.get("base", base_asset(sym))
-            bp = float(tr.get("buy_price", 0.0))
-            tp = float(tr.get("tp_price", 0.0))
-            qty = float(tr.get("qty", 0.0))
-            cost = float(tr.get("cost_usdt", qty * bp))
-            tp_order_id = tr.get("tp_order_id")
-            opened_at = tr.get("opened_at", 0)
-            date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(opened_at)) if opened_at else "В процессе"
+    DAY_NAMES = {"today": "Сегодня", "yesterday": "Вчера", "older": "Ранее"}
 
-            cur_price = prices.get(sym)
-            if cur_price is not None:
-                cur_val = qty * cur_price
-                trade_pnl = cur_val - cost
-                trade_pnl_pct = (trade_pnl / cost * 100.0) if cost > 0 else 0.0
-                total_val += cur_val
-            else:
-                cur_val = cost
-                trade_pnl = 0.0
-                trade_pnl_pct = 0.0
-                total_val += cost
+    # Закрытые сделки (history)
+    closed_total_pnl = 0.0
+    closed_today_pnl = 0.0
+    closed_yday_pnl  = 0.0
+    win_today = 0; total_today = 0
+    win_yday  = 0; total_yday  = 0
 
-            total_cost += cost
-            exp_gain = (qty * tp) - cost if tp > 0 else 0.0
-            total_exp_gain += exp_gain
-            sign = "🟢" if trade_pnl >= 0 else "🔴"
+    for h in reversed(history):           # от новых к старым
+        ts      = float(h.get("closed_at", 0))
+        base    = h.get("base", base_asset(h.get("symbol", "?")))
+        pnl     = float(h.get("pnl", 0.0))
+        pnl_pct = float(h.get("pnl_pct", 0.0))
+        reason  = h.get("status", "")
+        closed_total_pnl += pnl
 
-            tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{sym}"
-            binance_url = f"https://www.binance.com/en/trade/{base}_USDT?type=spot"
+        t_str = time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
+        sign  = "🟢" if pnl >= 0 else "🔴"
+        # причина закрытия (коротко)
+        if "tp" in reason.lower() or "take" in reason.lower():
+            tag = "TP"
+        elif "sl" in reason.lower() or "stop" in reason.lower():
+            tag = "SL"
+        elif "trail" in reason.lower():
+            tag = "TSL"
+        elif "manual" in reason.lower():
+            tag = "MNL"
+        else:
+            tag = "—"
 
-            tp_str = f"<code>{fmt_price(tp)} $</code> (+{tr.get('tp_pct', tp_pct):.1f}%)" if tp > 0 else "не задан"
-            tp_order_str = f" [Ордер #{tp_order_id}]" if tp_order_id else ""
-            exp_gain_str = f"+{exp_gain:.2f} USDT" if exp_gain > 0 else "—"
+        row = f"{t_str}  <b>{base:<6}</b>  {sign} <b>{pnl:+.2f} USDT</b>  ({pnl_pct:+.1f}%)  [{tag}]"
 
-            lines.append(
-                f"📅 <b>{date_str}</b>\n"
-                f"• <b>Актив:</b> {sign} <b>{base}/USDT</b>\n"
-                f"• <b>Цена:</b> вход <code>{fmt_price(bp)} $</code> → рынок <code>{fmt_price(cur_price) if cur_price else '—'} $</code>\n"
-                f"• <b>Куплено:</b> <code>{fmt_qty(qty)} {base}</code> (Потрачено: <code>{cost:,.2f} USDT</code>)\n"
-                f"• <b>Текущий PnL:</b> {sign} <b>{trade_pnl:+.2f} USDT ({fmt_pct(trade_pnl_pct)})</b> (Оценка: <code>{cur_val:,.2f} $</code>)\n"
-                f"• <b>Тейк-профит (TP):</b> {tp_str}{tp_order_str}\n"
-                f"• 💰 <b>Заработок при TP:</b> <b>{exp_gain_str}</b>\n"
-                f"└ 🔗 <a href=\"{tv_url}\">📈 TradingView</a> • <a href=\"{binance_url}\">📊 Binance Spot</a>\n"
-            )
+        bucket = day_label(ts)
+        buckets[bucket].append(row)
+        if bucket == "today":
+            closed_today_pnl += pnl; total_today += 1
+            if pnl > 0: win_today += 1
+        elif bucket == "yesterday":
+            closed_yday_pnl += pnl; total_yday += 1
+            if pnl > 0: win_yday += 1
 
-        tot_pnl = total_val - total_cost
-        tot_pct = (tot_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
-        t_sign = "🟢" if tot_pnl >= 0 else "🔴"
+    # Открытые позиции → в сегодняшний bucket (или вчерашний)
+    open_float_pnl  = 0.0
+    open_today_pnl  = 0.0
+    open_yday_pnl   = 0.0
+    for sym, tr in open_items.items():
+        ts   = float(tr.get("opened_at", now_ts))
+        base = tr.get("base", base_asset(sym))
+        bp   = float(tr.get("buy_price", 0.0))
+        qty  = float(tr.get("qty", 0.0))
+        cost = float(tr.get("cost_usdt", qty * bp))
 
-        lines.append("📌 <b>ИТОГО В ОТКРЫТЫХ ПОЗИЦИЯХ:</b>")
-        lines.append(f"• <b>Позиций:</b> <code>{len(open_items)} шт</code>")
-        lines.append(f"• <b>Всего инвестировано:</b> <code>{total_cost:,.2f} USDT</code>")
-        lines.append(f"• <b>Текущая стоимость:</b> <code>{total_val:,.2f} USDT</code>")
-        lines.append(f"• <b>Плавающий PnL:</b> {t_sign} <b>{tot_pnl:+.2f} USDT ({fmt_pct(tot_pct)})</b>")
-        lines.append(f"• <b>Ожидаемый профит при закрытии всех TP:</b> 🟢 <b>+{total_exp_gain:.2f} USDT</b>")
-        lines.append("─────────────────────\n")
-    else:
-        lines.append("⚡ <b>ОТКРЫТЫЕ СДЕЛКИ:</b> <i>Сейчас открытых позиций нет.</i>\n─────────────────────\n")
+        cur_p = cur_prices.get(sym)
+        if cur_p and qty > 0:
+            cur_val   = qty * cur_p
+            float_pnl = cur_val - cost
+            float_pct = (float_pnl / cost * 100.0) if cost > 0 else 0.0
+        else:
+            float_pnl = 0.0
+            float_pct = 0.0
 
-    # 3. РЕАЛИЗОВАННАЯ ПРИБЫЛЬ И ИСТОРИЯ ЗАКРЫТЫХ СДЕЛОК
+        open_float_pnl += float_pnl
+        t_str = time.strftime("%H:%M", time.localtime(ts)) if ts else "--:--"
+        sign  = "🟢" if float_pnl >= 0 else "🔴"
+        cur_str = f"<code>{fmt_price(cur_p)} $</code>" if cur_p else "—"
+        row = (
+            f"{t_str}  <b>{base:<6}</b>  {sign} — ⏳ <i>в позиции</i>  "
+            f"{float_pnl:+.2f} USDT ({float_pct:+.1f}%)  [вход: <code>{fmt_price(bp)} $</code>  сейчас: {cur_str}]"
+        )
+        bucket = day_label(ts)
+        buckets[bucket].insert(0, row)   # открытые — первыми в своём дне
+        if bucket == "today":   open_today_pnl += float_pnl
+        elif bucket == "yesterday": open_yday_pnl += float_pnl
+
+    # ── Формируем вывод ──────────────────────────────────────────────────
+    lines: list = []
+
+    # Шапка
+    auto_lbl = "🟢 Вкл" if auto_on else "🔴 Выкл"
+    lines.append(
+        f"📊 <b>Сделки и Профит</b>\n"
+        f"⚡ Авто: {auto_lbl}  |  Ставка: <code>{trade_amt:.0f}$</code>  |  TP: <code>+{tp_pct:.1f}%</code>"
+    )
+
+    # Дни
+    for key in ("today", "yesterday", "older"):
+        rows = buckets[key]
+        if not rows:
+            continue
+        # Дата-заголовок
+        if key == "today":
+            day_date = time.strftime("%d.%m", time.localtime(today_start))
+            pnl_closed = closed_today_pnl
+            pnl_open   = open_today_pnl
+            wr = f"{win_today}/{total_today}" if total_today else "—"
+        elif key == "yesterday":
+            day_date = time.strftime("%d.%m", time.localtime(yesterday_start))
+            pnl_closed = closed_yday_pnl
+            pnl_open   = open_yday_pnl
+            wr = f"{win_yday}/{total_yday}" if total_yday else "—"
+        else:
+            day_date = "..."
+            pnl_closed = 0.0
+            pnl_open   = 0.0
+            wr = "—"
+
+        day_pnl = pnl_closed + pnl_open
+        day_sign = "🟢" if day_pnl >= 0 else "🔴"
+        lines.append(
+            f"\n🗓 <b>{DAY_NAMES[key]} ({day_date})</b>  "
+            f"{day_sign} <b>{day_pnl:+.2f} USDT</b>  W/L: {wr}\n"
+            "──────────────────────"
+        )
+        lines.extend(rows)
+
+
+    # ── Сводка последних 5 дней ──────────────────────────────────────────
+    five_day_lines = []
+    for d_offset in range(4, -1, -1):   # 4 дня назад → сегодня
+        d_start = today_start - d_offset * day_sec
+        d_end   = d_start + day_sec
+        d_label = time.strftime("%d.%m", time.localtime(d_start))
+        if d_offset == 0:
+            d_label += " сег."
+        elif d_offset == 1:
+            d_label += " вчер."
+
+        d_trades = [h for h in history
+                    if d_start <= float(h.get("closed_at", 0)) < d_end]
+        d_pnl   = sum(float(h.get("pnl", 0.0)) for h in d_trades)
+        d_wins  = sum(1 for h in d_trades if float(h.get("pnl", 0.0)) > 0)
+        d_cnt   = len(d_trades)
+
+        # открытые считаем только в сегодняшнем дне
+        if d_offset == 0 and open_items:
+            d_pnl += open_float_pnl
+            open_tag = f"+{len(open_items)}⏳" if open_items else ""
+        else:
+            open_tag = ""
+
+        if d_cnt == 0 and d_offset != 0 and not open_items:
+            bar = "·"
+            pnl_str = "нет сделок"
+        else:
+            sign = "🟢" if d_pnl >= 0 else "🔴"
+            wr_str = f" {d_wins}/{d_cnt}" if d_cnt else ""
+            pnl_str = f"{sign} <b>{d_pnl:+.2f}$</b>{wr_str}{' ' + open_tag if open_tag else ''}"
+            # мини-прогресс-бар: ▓ за каждую прибыльную, ░ за убыточную
+            bar_chars = "".join("▓" if float(h.get("pnl", 0.0)) > 0 else "░" for h in d_trades)
+            bar = bar_chars[:8] if bar_chars else "·"
+
+        five_day_lines.append(f"<code>{d_label:<10}</code> {bar:<8} {pnl_str}")
+
+    if five_day_lines:
+        lines.append("\n📅 <b>Последние 5 дней:</b>")
+        lines.extend(five_day_lines)
+
+    # Итого (2 дня)
+    two_day_pnl = closed_today_pnl + closed_yday_pnl + open_today_pnl + open_yday_pnl
+    total_closed = total_today + total_yday
+    total_wins   = win_today + win_yday
+    wr_total = f"{total_wins}/{total_closed}" if total_closed else "—"
+    wr_pct   = f"  ({total_wins/total_closed*100:.0f}%)" if total_closed else ""
+
+    t_sign = "🟢" if two_day_pnl >= 0 else "🔴"
+
+    lines.append(
+        f"\n📌 <b>Итого (2 дня):</b>\n"
+        f"• Закрыто: <b>{total_closed} сделки</b>  |  W/L: {wr_total}{wr_pct}\n"
+        f"• Реализованный P&L: {t_sign} <b>{(closed_today_pnl+closed_yday_pnl):+.2f} USDT</b>"
+    )
+
+    if open_items:
+        f_sign = "🟢" if open_float_pnl >= 0 else "🔴"
+        lines.append(
+            f"• Открытых позиций: <b>{len(open_items)}</b>  "
+            f"|  Плав. P&L: {f_sign} <b>{open_float_pnl:+.2f} USDT</b>"
+        )
+
+    # Всего за всё время
     if history:
-        closed_pnl_sum = sum(float(h.get("pnl", 0.0)) for h in history)
-        closed_cost_sum = sum(float(h.get("cost_usdt", 0.0)) for h in history)
-        win_count = sum(1 for h in history if float(h.get("pnl", 0.0)) > 0)
-        win_rate = (win_count / len(history) * 100.0) if history else 0.0
-        h_sign = "🟢" if closed_pnl_sum >= 0 else "🔴"
+        win_all  = sum(1 for h in history if float(h.get("pnl", 0.0)) > 0)
+        wr_all   = f"{win_all}/{len(history)} ({win_all/len(history)*100:.0f}%)"
+        all_sign = "🟢" if closed_total_pnl >= 0 else "🔴"
+        lines.append(
+            f"\n🏆 <b>За всё время:</b>  "
+            f"{all_sign} <b>{closed_total_pnl:+.2f} USDT</b>  |  W/L: {wr_all}"
+        )
 
-        lines.append("🏆 <b>РЕАЛИЗОВАННЫЙ ПРОФИТ (ЗАКРЫТЫЕ СДЕЛКИ):</b>")
-        lines.append(f"• <b>Закрыто сделок:</b> <code>{len(history)} шт</code> (Винрейт: <code>{win_rate:.0f}%</code>)")
-        lines.append(f"• <b>Суммарный оборот:</b> <code>{closed_cost_sum:,.2f} USDT</code>")
-        lines.append(f"• 💰 <b>ЧИСТЫЙ РЕАЛИЗОВАННЫЙ ДОХОД:</b> {h_sign} <b>{closed_pnl_sum:+.2f} USDT</b>\n")
-
-        lines.append("📜 <b>ИСТОРИЯ ЗАКРЫТЫХ СДЕЛОК:</b>\n")
-        for h in reversed(history[-10:]):
-            base = h.get("base", base_asset(h.get("symbol", "")))
-            pnl = float(h.get("pnl", 0.0))
-            pnl_pct = float(h.get("pnl_pct", 0.0))
-            closed_at = h.get("closed_at", 0)
-            date_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(closed_at)) if closed_at else "—"
-            bp = float(h.get("buy_price", 0.0))
-            sp = float(h.get("sell_price", 0.0))
-            qty = float(h.get("qty", 0.0))
-            cost = float(h.get("cost_usdt", 0.0))
-            revenue = cost + pnl
-            bal_end = float(h.get("ending_balance", 0.0))
-            bal_end_str = f"<code>{bal_end:,.2f} USDT</code>" if bal_end > 0 else f"<code>{free_usdt:,.2f} USDT</code>"
-            p_sign = "🟢" if pnl >= 0 else "🔴"
-
-            lines.append(
-                f"📅 <b>{date_str}</b>\n"
-                f"• <b>Актив:</b> {p_sign} <b>{base}/USDT</b>\n"
-                f"• <b>Цена:</b> вход <code>{fmt_price(bp)} $</code> → продажа <code>{fmt_price(sp)} $</code>\n"
-                f"• <b>Куплено:</b> <code>{fmt_qty(qty)} {base}</code> (Потрачено: <code>{cost:,.2f} USDT</code>)\n"
-                f"• <b>Продано на сумму:</b> <code>{revenue:,.2f} USDT</code>\n"
-                f"• 💰 <b>Заработано:</b> {p_sign} <b>{pnl:+.2f} USDT ({fmt_pct(pnl_pct)})</b>\n"
-                f"• 💵 <b>Баланс на конец:</b> {bal_end_str}\n"
-                f"─────────────────────"
-            )
-    else:
-        lines.append("🏆 <b>РЕАЛИЗОВАННАЯ ПРИБЫЛЬ:</b> <i>История закрытых сделок пока пуста.</i>\n─────────────────────")
-
-    # 4. ОБЩИЙ БАЛАНС И КАПИТАЛ
-    lines.append(f"\n💵 <b>Свободный баланс:</b> <code>{free_usdt:,.2f} USDT</code>")
-    if open_items:
-        total_open = sum(float(tr.get("cost_usdt", 0.0)) for tr in open_items.values())
-        lines.append(f"⚡ <b>В открытых позициях:</b> <code>{total_open:,.2f} USDT</code>")
-        lines.append(f"📊 <b>Общий капитал:</b> <code>{(free_usdt + total_open):,.2f} USDT</code>")
-
+    lines.append(f"\n💵 Свободно: <code>{free_usdt:,.2f} USDT</code>")
     return "\n".join(lines)
+
+def format_system_status(state: dict) -> str:
+    """Формирует расширенный отчёт о системном здоровье, аптайме, задержках и расходе лимитов."""
+    uptime_sec = int(time.time() - BOT_START_TIME)
+    uptime_h = uptime_sec // 3600
+    uptime_m = (uptime_sec % 3600) // 60
+    uptime_s = uptime_sec % 60
+    uptime_str = f"{uptime_h}ч {uptime_m}м {uptime_s}с" if uptime_h > 0 else f"{uptime_m}м {uptime_s}с"
+
+    # Проверка пинга до Binance REST API
+    t0 = time.time()
+    try:
+        http_get_json(f"{BINANCE_BASE}/api/v3/ping", timeout=4)
+        ping_ms = int((time.time() - t0) * 1000)
+        binance_status = f"🟢 Доступен ({ping_ms} мс)"
+    except Exception as e:
+        binance_status = f"🔴 Сбой ({e})"
+
+    # Расход лимитов веса
+    weight_str = f"{API_WEIGHT_USED_1M} / 1200"
+    if API_WEIGHT_USED_1M >= 1000:
+        weight_badge = "🔴 Высокий"
+    elif API_WEIGHT_USED_1M >= 600:
+        weight_badge = "🟡 Средний"
+    else:
+        weight_badge = "🟢 Низкий (Норма)"
+
+    # Активные сделки и очереди
+    active_count = len(state.get("active_trades", {}))
+    pending_count = len(state.get("pending_entries", {}))
+    history_count = len(state.get("trade_history", []))
+    portfolio_count = len(state.get("portfolio", {}))
+
+    # Размер файла состояния
+    state_size_kb = 0.0
+    if os.path.exists(STATE_FILE):
+        state_size_kb = os.path.getsize(STATE_FILE) / 1024.0
+
+    threads_count = threading.active_count()
+    api_key, api_secret = get_api_credentials(state)
+    keys_status = "🟢 Настроены (Live Spot)" if (api_key and api_secret) else "⚪ Не заданы (Режим наблюдателя)"
+    free_usdt = get_free_usdt_balance(state) if (api_key and api_secret) else 0.0
+
+    settings = state.get("settings", {})
+    strategy = settings.get("strategy", "pump")
+    strategy_label = "🚀 Памп-сканер (Score 8F)" if strategy == "pump" else "📊 RSI + SAR + Фракталы"
+    auto_trade_status = "🟢 Включена" if settings.get("auto_trade", False) else "🔴 Выключена"
+
+    return (
+        "<b>🩺 Системная диагностика и статус Pump Pulse Bot</b>\n\n"
+        f"⏱ <b>Аптайм процесса:</b> <code>{uptime_str}</code>\n"
+        f"🌐 <b>Binance Spot API:</b> {binance_status}\n"
+        f"⚡ <b>Расход веса (1 мин):</b> <code>{weight_str}</code> — {weight_badge}\n"
+        f"🔑 <b>API-ключи Binance:</b> {keys_status}\n"
+        f"💵 <b>Свободный баланс:</b> <code>{free_usdt:,.2f} USDT</code>\n\n"
+        "<b>📈 Торговый контур:</b>\n"
+        f"• <b>Стратегия:</b> {strategy_label}\n"
+        f"• <b>Автоторговля:</b> {auto_trade_status}\n"
+        f"• <b>Активных позиций:</b> <code>{active_count}/3</code>\n"
+        f"• <b>Лимитных входов на откате:</b> <code>{pending_count}</code>\n"
+        f"• <b>Активов в портфеле:</b> <code>{portfolio_count}</code>\n"
+        f"• <b>Закрытых сделок в истории:</b> <code>{history_count}</code>\n\n"
+        "<b>⚙️ Системные ресурсы:</b>\n"
+        f"• <b>Фоновых потоков:</b> <code>{threads_count}</code>\n"
+        f"• <b>Файл bot_state.json:</b> <code>{state_size_kb:.1f} KB</code>\n"
+        f"• <b>Ревизия сборки:</b> <code>2.1 Production (Verified)</code>"
+    )
 
 # ───────────────────────── Клавиатуры ─────────────────────────
 
 def main_keyboard() -> dict:
-    # Компактная клавиатура: добавление/удаление активов доступно
-    # через меню «💼 Портфель» (inline-кнопки ➕/🗑) — дублирование убрано.
+    # Компактная клавиатура: раздел «Портфель» убран,
+    # управление позициями — через «💳 Баланс Binance» и «📊 Сделки и Профит».
     return {
         "keyboard": [
-            [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
-            [{"text": "💼 Портфель"}, {"text": "📊 Сделки и Профит"}],
+            [{"text": "🔍 Скан сейчас"}, {"text": "📊 Сделки и Профит"}],
             [{"text": "💳 Баланс Binance"}, {"text": "⚙️ Настройки"}],
             [{"text": "🙈 Скрыть клавиатуру"}],
         ],
         "resize_keyboard": True,
-        "is_persistent": False,
+        "is_persistent": True,
     }
 
 def cancel_keyboard() -> dict:
     return {
         "keyboard": [
             [{"text": "❌ Отмена"}],
-            [{"text": "🔍 Скан сейчас"}, {"text": "🐋 Скан китов"}],
-            [{"text": "💼 Портфель"}, {"text": "⚙️ Настройки"}],
+            [{"text": "🔍 Скан сейчас"}, {"text": "⚙️ Настройки"}],
             [{"text": "🙈 Скрыть клавиатуру"}],
         ],
         "resize_keyboard": True,
-        "is_persistent": False,
+        "is_persistent": True,
     }
 
 def portfolio_inline_kb(state: Optional[dict] = None) -> dict:
@@ -3710,7 +4698,7 @@ def settings_text(state: dict) -> str:
     filt_label = "🔥 Только Strong" if s.get("filter_level") == "strong_only" else "⚡ Strong + Watch"
     strat_label = STRATEGY_LABELS.get(s.get("strategy", DEFAULT_STRATEGY), DEFAULT_STRATEGY)
     if s.get("strategy", DEFAULT_STRATEGY) == "indicators":
-        strat_label += f" (RSI > {DEFAULT_RSI_MIN:.0f}, %K > {DEFAULT_STOCH_MIN:.0f}, %K > %D)"
+        strat_label += f" (RSI > {DEFAULT_RSI_MIN:.0f}, SAR под ценой, пробит up-фрактал)"
     auto_scan_label = "🟢 Включён" if s.get("autoscan", True) else "🔴 Выключен"
     tp_pct = s.get("take_profit_pct", DEFAULT_TAKE_PROFIT)
     sl_pct = s.get("stop_loss_pct", DEFAULT_STOP_LOSS)
@@ -3835,7 +4823,11 @@ def settings_inline_kb(state: dict) -> dict:
             # --- Режим стратегии: выбирается ПЕРЕД торговлей ---
             [
                 _strategy_btn("pump", "📈 Памп-скор"),
-                _strategy_btn("indicators", "📊 RSI+Стох"),
+                _strategy_btn("indicators", "📊 RSI+SAR+Фр"),
+            ],
+            [
+                _strategy_btn("volume", "📊 Объём + свеча"),
+                _strategy_btn("dump", "📉 Дамп → отскок"),
             ],
             # --- Stop Loss ---
             [
@@ -4208,6 +5200,7 @@ def set_bot_commands(token: str) -> None:
         {"command": "add", "description": "Добавить монету в портфель"},
         {"command": "del", "description": "Удалить монету из портфеля"},
         {"command": "settings", "description": "Настройки"},
+        {"command": "status", "description": "🩺 Статус и диагностика системы"},
         {"command": "api", "description": "Указать API ключи Binance"},
         {"command": "help", "description": "Инструкция"},
     ]
@@ -4649,9 +5642,19 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
     user_fsm: Dict[Union[str, int], dict] = {}
 
     def is_authorized(user_id: Union[str, int]) -> bool:
-        if not state.get("allowed_chats"):
+        uid_str = str(user_id).strip()
+        primary_cid = str(chat_id).strip()
+        if primary_cid and uid_str == primary_cid:
             return True
-        return str(user_id) in [str(c) for c in state["allowed_chats"]]
+        allowed = [str(c).strip() for c in state.get("allowed_chats", []) if str(c).strip()]
+        env_allowed = [x.strip() for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()]
+        if env_allowed and uid_str in env_allowed:
+            return True
+        if allowed and uid_str in allowed:
+            return True
+        if not primary_cid and not allowed and not env_allowed:
+            return True
+        return False
 
     def begin_add_symbol(chat_id_local: Union[str, int], raw_symbol: str) -> None:
         """
@@ -4675,7 +5678,8 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                           f"Попробуйте другой тикер:", reply_markup=cancel_keyboard())
             return
         user_fsm[chat_id_local] = {"state": "waiting_qty",
-                                   "data": {"symbol": symbol, "price": price}}
+                                   "data": {"symbol": symbol, "price": price},
+                                   "created_at": time.time()}
         send_telegram(token, chat_id_local,
                       f"✅ Монета: <b>{base_asset(symbol)}/USDT</b>\n"
                       f"Текущая цена: <code>{fmt_price(price)} USDT</code>\n\n"
@@ -4697,16 +5701,18 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
             if not text or not chat_id_local:
                 return
-            if not is_authorized(user_id):
-                print(f"⛔ Игнорирую сообщение от несанкционированного user_id={user_id}")
-                return
-
-            if chat_id_local not in [str(c) for c in state.get("allowed_chats", [])] and str(chat_id_local) != str(chat_id):
-                state["allowed_chats"].append(str(chat_id_local))
-                save_state(state)
-                print(f"🔓 Добавлен новый чат: {chat_id_local}")
 
             text_lower = text.lower()
+
+            if text_lower in ("/whoami", "whoami", "/id", "id"):
+                send_telegram(token, chat_id_local, f"👤 <b>Информация об аккаунте:</b>\n• User ID: <code>{user_id}</code>\n• Chat ID: <code>{chat_id_local}</code>")
+                return
+
+            if not is_authorized(user_id):
+                print(f"⛔ Игнорирую сообщение от несанкционированного user_id={user_id}")
+                send_telegram(token, chat_id_local, f"⛔ <b>Доступ ограничен.</b>\nВаш User ID: <code>{user_id}</code>\nДля доступа добавьте его в секрет <code>TELEGRAM_CHAT_ID</code> или <code>ALLOWED_USER_IDS</code> в GitHub.")
+                return
+
             if text_lower in ("/start", "start", "старт", "меню", "/menu", "/kb", "kb", "меню", "клавиатура"):
                 print(f"-> Показ главного меню для {chat_id_local}")
                 send_telegram(token, chat_id_local, "<b>📋 Главное меню Pump Pulse</b>\n\nКлавиатура открыта:", reply_markup=main_keyboard())
@@ -4733,6 +5739,14 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
             # ── FSM: пошаговый ввод ──
             if chat_id_local in user_fsm:
                 st = user_fsm[chat_id_local]
+                # Проверка таймаута состояния (TTL): если прошло больше FSM_TTL_SEC — сбрасываем
+                st_time = float(st.get("created_at", 0.0))
+                if st_time > 0 and (time.time() - st_time > FSM_TTL_SEC):
+                    user_fsm.pop(chat_id_local, None)
+                    print(f"⌛ [FSM] Сессия {st.get('state')} для {chat_id_local} истекла по таймауту ({FSM_TTL_SEC}с)")
+                    send_telegram(token, chat_id_local, "⌛ <b>Время ожидания ввода истекло.</b> Возврат в главное меню.", reply_markup=main_keyboard())
+                    return
+
                 cur_st = st.get("state")
 
                 if cur_st == "waiting_symbol":
@@ -4774,14 +5788,11 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
                 if cur_st == "waiting_api_keys":
                     user_fsm.pop(chat_id_local, None)
-                    parts = text.split()
-                    if len(parts) >= 2:
-                        state["settings"]["binance_api_key"] = sanitize_api_key(parts[0])
-                        state["settings"]["binance_api_secret"] = sanitize_api_key(parts[1])
-                        save_state(state)
-                        send_telegram(token, chat_id_local, "✅ <b>API-ключи Binance сохранены!</b>\n\nТеперь доступны: баланс спота и автоторговля.", reply_markup=main_keyboard())
-                    else:
-                        send_telegram(token, chat_id_local, "❌ Нужно ввести два значения через пробел:\n<code>/api ВАШ_КЛЮЧ ВАШ_СЕКРЕТ</code>", reply_markup=cancel_keyboard())
+                    send_telegram(
+                        token, chat_id_local,
+                        "🛡 <b>Безопасность:</b> В режиме GitHub Actions задавайте <code>BINANCE_API_KEY</code> и <code>BINANCE_API_SECRET</code> в <b>GitHub Secrets</b> репозитория, чтобы исключить утечку ключей.",
+                        reply_markup=main_keyboard(),
+                    )
                     return
 
                 if cur_st == "waiting_quick_add_qty":
@@ -4902,6 +5913,11 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 print(f"-> Настройки для {chat_id_local}")
                 send_telegram(token, chat_id_local, settings_text(state), reply_markup=settings_inline_kb(state))
 
+            elif cmd in ("status", "статус", "diag", "диагностика", "здоровье") or (is_menu_action and text_lower in ("status", "статус", "диагностика")):
+                print(f"-> Диагностика/статус для {chat_id_local}")
+                status_text = format_system_status(state)
+                send_telegram(token, chat_id_local, status_text, reply_markup=main_keyboard())
+
             # Ветка китов ОБЯЗАНА стоять до ветки «скан»: правило
             # «скан» в text_lower иначе перехватывает «🐋 Скан китов»
             # и вместо китового скана запускает обычный.
@@ -4989,7 +6005,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     begin_add_symbol(chat_id_local, args[0])
                     return
                 print(f"-> Добавление актива для {chat_id_local}")
-                user_fsm[chat_id_local] = {"state": "waiting_symbol", "data": {}}
+                user_fsm[chat_id_local] = {"state": "waiting_symbol", "data": {}, "created_at": time.time()}
                 send_telegram(
                     token, chat_id_local,
                     "➕ <b>Добавление актива в портфель</b>\n\nВведите тикер монеты (например, <code>SOL</code>, <code>BTC</code> или <code>PEPE</code>):",
@@ -5056,32 +6072,28 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     set_custom_target_sell(token, chat_id_local, state, symbol, target_val)
 
             elif cmd in ("api", "ключ"):
-                args = clean_text.split()[1:]
-                if len(args) >= 2:
-                    state["settings"]["binance_api_key"] = sanitize_api_key(args[0])
-                    state["settings"]["binance_api_secret"] = sanitize_api_key(args[1])
-                    save_state(state)
-                    send_telegram(token, chat_id_local, "✅ <b>API-ключи Binance сохранены!</b>", reply_markup=main_keyboard())
-                else:
-                    print(f"-> Ожидание API ключей для {chat_id_local}")
-                    user_fsm[chat_id_local] = {"state": "waiting_api_keys", "data": {}}
-                    send_telegram(
-                        token, chat_id_local,
-                        "🔑 <b>Привязка API ключей Binance</b>\n\n"
-                        "Отправьте в одном сообщении через пробел:\n"
-                        "<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
-                        "⚠️ <i>Рекомендуется создать ключ с разрешением «Торговля» только на споте, без вывода средств!</i>",
-                        reply_markup=cancel_keyboard(),
-                    )
+                api_k, api_s = get_api_credentials(state)
+                status_str = "🟢 <b>Подключены через GitHub Secrets</b>" if (api_k and api_s) else "🔴 <b>Не настроены</b>"
+                send_telegram(
+                    token, chat_id_local,
+                    f"🔑 <b>API-ключи Binance Spot</b>\n\n"
+                    f"• Текущий статус: {status_str}\n\n"
+                    f"🛡 <b>Безопасность репозитория GitHub:</b>\n"
+                    f"Бот работает в режиме GitHub Actions. Чтобы ваши ключи никогда не попали в открытый код или git-историю, добавьте их в <b>GitHub Secrets</b> репозитория:\n"
+                    f"• <code>BINANCE_API_KEY</code>\n"
+                    f"• <code>BINANCE_API_SECRET</code>\n\n"
+                    f"<i>(В настройках репозитория: Settings → Secrets and variables → Actions)</i>",
+                    reply_markup=main_keyboard(),
+                )
 
             elif "баланс" in text_lower or "balance" in text_lower or cmd in ("balance", "баланс"):
                 print(f"-> Детальный баланс для {chat_id_local}")
                 msg_id = send_telegram(token, chat_id_local, "⏳ <i>Запрашиваю детальный баланс Binance...</i>")
                 bal_text = format_binance_balance_detailed(state)
                 if msg_id:
-                    edit_message(token, chat_id_local, msg_id, bal_text, reply_markup=portfolio_inline_kb(state))
+                    edit_message(token, chat_id_local, msg_id, bal_text, reply_markup=balance_inline_kb(state))
                 else:
-                    send_telegram(token, chat_id_local, bal_text, reply_markup=portfolio_inline_kb(state))
+                    send_telegram(token, chat_id_local, bal_text, reply_markup=balance_inline_kb(state))
 
             elif (
                 "сделк" in text_lower
@@ -5160,7 +6172,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
             elif cb_data == "port:add":
                 answer_callback(token, cb_id)
-                user_fsm[cb_chat] = {"state": "waiting_symbol", "data": {}}
+                user_fsm[cb_chat] = {"state": "waiting_symbol", "data": {}, "created_at": time.time()}
                 send_telegram(token, cb_chat, "➕ Введите тикер монеты (например, <code>SOL</code>):", reply_markup=cancel_keyboard())
 
             elif cb_data == "port:del":
@@ -5251,7 +6263,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 sym = cb_data.split(":", 1)[1]
                 answer_callback(token, cb_id)
                 cur_p = get_price(sym) or 0.0
-                user_fsm[cb_chat] = {"state": "waiting_target_price", "data": {"symbol": sym}}
+                user_fsm[cb_chat] = {"state": "waiting_target_price", "data": {"symbol": sym}, "created_at": time.time()}
                 prompt = (
                     f"🎯 <b>Ручной ввод целевой цены для {base_asset(sym)}/USDT</b>\n\n"
                     f"Текущая рыночная цена: <code>{fmt_price(cur_p)} $</code>\n\n"
@@ -5348,8 +6360,8 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                         f"Сейчас установлен: <code>{cur}</code>\n\n"
                         f"• <b>📈 Памп-скор</b> — 8 факторов: всплеск объёма, агрессия покупок, "
                         f"сжатие волатильности, пробой флэта.\n"
-                        f"• <b>📊 RSI + Стохастик</b> — классика по индикаторам: "
-                        f"RSI &gt; {DEFAULT_RSI_MIN:.0f}, %K &gt; {DEFAULT_STOCH_MIN:.0f} и %K &gt; %D.\n\n"
+                        f"• <b>📊 RSI + SAR + Фрактал</b> — классика по индикаторам: "
+                        f"RSI &gt; {DEFAULT_RSI_MIN:.0f}, Parabolic SAR под ценой и пробит up-фрактал.\n\n"
                         f"<i>От выбора зависит, какие сигналы будут открывать сделки.</i>",
                         reply_markup=settings_inline_kb(state),
                     )
@@ -5411,9 +6423,21 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 answer_callback(token, cb_id, "Запрашиваю детальный баланс...")
                 bal_text = format_binance_balance_detailed(state)
                 if msg_id:
-                    edit_message(token, cb_chat, msg_id, bal_text, reply_markup=portfolio_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, bal_text, reply_markup=balance_inline_kb(state))
                 else:
-                    send_telegram(token, cb_chat, bal_text, reply_markup=portfolio_inline_kb(state))
+                    send_telegram(token, cb_chat, bal_text, reply_markup=balance_inline_kb(state))
+
+            elif cb_data == "balance:refresh":
+                answer_callback(token, cb_id, "Обновляю баланс...")
+                bal_text = format_binance_balance_detailed(state)
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, bal_text, reply_markup=balance_inline_kb(state))
+                else:
+                    send_telegram(token, cb_chat, bal_text, reply_markup=balance_inline_kb(state))
+
+            elif cb_data == "balance:clean_dust":
+                answer_callback(token, cb_id, "Ищу пыль на балансе...")
+                clean_dust_balances(token, cb_chat, state)
 
             elif cb_data.startswith("trade_buy:"):
                 sym = cb_data.split(":", 1)[1]
@@ -5504,7 +6528,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 filters = get_symbol_filters(sym)
                 min_notional = float(filters.get("min_notional", 5.0))
                 answer_callback(token, cb_id, "Введите сумму вручную")
-                user_fsm[cb_chat] = {"state": "waiting_buy_amount", "data": {"symbol": sym}}
+                user_fsm[cb_chat] = {"state": "waiting_buy_amount", "data": {"symbol": sym}, "created_at": time.time()}
                 free_usdt = get_free_usdt_balance(state)
                 send_telegram(
                     token, cb_chat,
@@ -5529,7 +6553,7 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     f"Введите <b>количество</b> монет, которое у вас есть (например, 10):",
                     reply_markup=cancel_keyboard(),
                 )
-                user_fsm[cb_chat] = {"state": "waiting_quick_add_qty", "data": {"symbol": symbol, "price": price}}
+                user_fsm[cb_chat] = {"state": "waiting_quick_add_qty", "data": {"symbol": symbol, "price": price}, "created_at": time.time()}
 
             elif cb_data.startswith("chart:"):
                 # График 15m с индикаторами по запросу. Картинка отправляется

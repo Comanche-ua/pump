@@ -1,0 +1,13 @@
+coverage
+pytest
+pytest-asyncio
+pytest-cov
+pytest-xdist
+pytest-rerunfailures
+pytest-timeout
+requests-mock
+tox
+setuptools
+aioresponses
+pre-commit
+orjson
