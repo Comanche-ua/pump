@@ -1570,20 +1570,11 @@ def save_state(state: dict, sync_git: bool = False) -> None:
         for k in [k for k, ts in cooldown.items() if ts <= cutoff]:
             cooldown.pop(k, None)
 
-        # Создаем безопасную копию для записи на диск (без API-ключей и секретов)
-        st_to_save = dict(state)
-        if "settings" in st_to_save and isinstance(st_to_save["settings"], dict):
-            st_settings = dict(st_to_save["settings"])
-            st_settings.pop("binance_api_key", None)
-            st_settings.pop("binance_api_secret", None)
-            st_settings.pop("worker_auth_token", None)
-            st_to_save["settings"] = st_settings
-
         tmp = STATE_FILE + ".tmp"
         for attempt in range(3):
             try:
                 with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(st_to_save, f, ensure_ascii=False, indent=2)
+                    json.dump(state, f, ensure_ascii=False, indent=2)
                 os.replace(tmp, STATE_FILE)
                 break
             except RuntimeError as e:
@@ -1597,6 +1588,7 @@ def save_state(state: dict, sync_git: bool = False) -> None:
 
         if sync_git and os.environ.get("GITHUB_ACTIONS") == "true":
             threading.Thread(target=_git_sync_state, daemon=True).start()
+
 
 def normalize_symbol(raw: str) -> str:
     s = raw.strip().upper().replace(" ", "").replace("/", "")
@@ -1931,11 +1923,14 @@ def process_and_test_api_keys(
     state["settings"]["binance_api_key"] = key
     state["settings"]["binance_api_secret"] = secret
 
+    # Сохраняем в bot_state.json и git, чтобы ключи пережили перезапуск бота
+    save_state(state, sync_git=True)
     # Сохраняем в локальный .env (который в .gitignore) для персистентности между рестартами
     save_local_env_var("BINANCE_API_KEY", key)
     save_local_env_var("BINANCE_API_SECRET", secret)
 
     msg_id = send_telegram(token, chat_id_local, "⏳ <i>Проверяю ключи на сервере Binance Spot (/api/v3/account)...</i>")
+
 
     # Живой защищенный запрос к Binance
     assets, err = get_spot_account_assets(state)
