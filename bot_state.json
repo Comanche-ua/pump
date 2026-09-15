@@ -1,0 +1,33 @@
+{
+  "portfolio": {},
+  "settings": {
+    "min_score": 58.0,
+    "min_quote_volume": 1200000.0,
+    "autoscan": true,
+    "scan_interval_sec": 300,
+    "filter_level": "strong_and_watch",
+    "auto_trade": false,
+    "trade_mode": "all",
+    "trade_amount_usdt": 5.0,
+    "take_profit_pct": 0.7,
+    "stop_loss_pct": 3.0,
+    "entry_pullback_pct": 1.0,
+    "dynamic_tp": true,
+    "trailing_activation_pct": 1.2,
+    "trailing_distance_pct": 0.4,
+    "use_oco": true,
+    "strategy": "pump",
+    "strategy_confirmed": false,
+    "max_open_trades": 3,
+    "trade_min_score": 70.0
+  },
+  "active_trades": {},
+  "trade_history": [],
+  "sent_alerts": {},
+  "pending_entries": {},
+  "symbol_alert_cooldown": {},
+  "allowed_chats": [
+    "1920596593"
+  ],
+  "scan_cursor": 0
+}
