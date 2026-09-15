@@ -1466,7 +1466,7 @@ def default_state() -> dict:
             "scan_interval_sec": DEFAULT_SCAN_INTERVAL,
             "filter_level": "strong_and_watch",  # "strong_only" или "strong_and_watch"
             "auto_trade": DEFAULT_AUTO_TRADE,
-            "trade_mode": "fixed",                # "fixed" | "all" | "pct:N"
+            "trade_mode": "all",                 # "fixed" | "all" | "pct:N"
             "trade_amount_usdt": DEFAULT_TRADE_AMOUNT,
             "take_profit_pct": DEFAULT_TAKE_PROFIT,
             "stop_loss_pct": DEFAULT_STOP_LOSS,
@@ -1513,6 +1513,10 @@ def load_state() -> dict:
                       f"{DEFAULT_TAKE_PROFIT}%, SL → {DEFAULT_STOP_LOSS}%, "
                       f"активация трейлинга → {DEFAULT_TRAILING_ACTIVATION}% (дефолты из бэктеста)")
             d["settings"]["trade_defaults_migrated"] = True
+        # Миграция trade_mode: "fixed" с дефолтной суммой → "all" (весь баланс)
+        if d["settings"].get("trade_mode") == "fixed":
+            d["settings"]["trade_mode"] = "all"
+
         d["active_trades"].update(data.get("active_trades", {}))
         d["trade_history"] = data.get("trade_history", [])[-50:]
         sent = data.get("sent_alerts", {})
