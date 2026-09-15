@@ -107,16 +107,12 @@ DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "5.0"))
 #   1.2% → +0.084%   1.5% → +0.110%   2.0% → +0.106%
 # То есть цель 0.5% (в любой трактовке — брутто или нетто) не окупается:
 # на 0.5% брутто издержки съедают больше, чем даёт точность попадания.
-DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "1.0"))
+DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "0.7"))
 DEFAULT_STOP_LOSS = float(os.environ.get("STOP_LOSS_PCT", "3.0"))
-DEFAULT_ENTRY_PULLBACK = float(os.environ.get("ENTRY_PULLBACK_PCT", "0.4"))  # Вход на микро-откате (-0.4% по умолчанию)
-DEFAULT_ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_TIMEOUT_SEC", "300"))   # Таймаут жизни лимитного ордера на вход (5 мин)
-# Активация трейлинга ВЫШЕ цели — иначе трейлинг перебивает лимитный TP:
-# при активации +1% и дистанции 0.8% стоп встаёт на high-0.8%, то есть раньше
-# TP. Теперь фиксированный TP решает исход, а трейлинг остаётся страховкой
-# на случай, если лимитный TP снят или не выставлен.
-DEFAULT_TRAILING_ACTIVATION = float(os.environ.get("TRAILING_ACTIVATION_PCT", "2.5"))
-DEFAULT_TRAILING_DISTANCE = float(os.environ.get("TRAILING_DISTANCE_PCT", "0.8"))
+DEFAULT_ENTRY_PULLBACK = float(os.environ.get("ENTRY_PULLBACK_PCT", "1.0"))  # Вход на откате (-1.0% по результатам глубокого бэктеста)
+DEFAULT_ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_TIMEOUT_SEC", "600"))   # Таймаут жизни лимитного ордера на вход (10 мин = 2 бара)
+DEFAULT_TRAILING_ACTIVATION = float(os.environ.get("TRAILING_ACTIVATION_PCT", "1.2"))
+DEFAULT_TRAILING_DISTANCE = float(os.environ.get("TRAILING_DISTANCE_PCT", "0.4"))
 DEFAULT_SL_COOLDOWN_SECONDS = int(os.environ.get("SL_COOLDOWN_SECONDS", "3600"))
 TRADES_LOG_FILE = os.environ.get("TRADES_LOG_FILE", "trades_log.csv")
 _TRADES_LOG_LOCK = threading.Lock()
@@ -1682,20 +1678,43 @@ def sync_binance_time(force: bool = False) -> int:
         print(f"[Binance Time Sync Warning]: {e}", file=sys.stderr)
     return _binance_time_offset_ms
 
+def save_local_env_var(key: str, value: str) -> None:
+    """Сохраняет переменную в локальный файл .env (защищен от git-коммитов через .gitignore)."""
+    try:
+        env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        lines = []
+        found = False
+        if os.path.exists(env_file):
+            with open(env_file, "r", encoding="utf-8") as f:
+                for l in f:
+                    stripped = l.strip()
+                    if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
+                        lines.append(f"{key}={value}\n")
+                        found = True
+                    else:
+                        lines.append(l)
+        if not found:
+            lines.append(f"{key}={value}\n")
+        with open(env_file, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        print(f"[Warn] Не удалось обновить локальный .env: {e}", file=sys.stderr)
+
 def sanitize_api_key(val: str) -> str:
     """Очищает API-ключ от лишних кавычек, пробелов и префиксов."""
     if not val:
         return ""
-    cleaned = val.strip().strip("'\"`")
+    cleaned = val.strip().strip("'\"`\r\n\t")
     if "=" in cleaned:
-        cleaned = cleaned.split("=", 1)[1].strip().strip("'\"`")
+        cleaned = cleaned.split("=", 1)[1].strip().strip("'\"`\r\n\t")
     return cleaned
 
 def get_api_credentials(state: Optional[dict] = None) -> Tuple[str, str]:
     """
     Возвращает (api_key, api_secret).
-    Приоритет: переменные окружения GitHub Secrets (BINANCE_API_KEY, BINANCE_API_SECRET),
-    затем настройки бота.
+    Считывает из:
+    1. Переменных окружения (GitHub Secrets / .env)
+    2. Настроек сессии бота (state["settings"])
     """
     key = sanitize_api_key(os.environ.get("BINANCE_API_KEY", ""))
     secret = sanitize_api_key(os.environ.get("BINANCE_API_SECRET", ""))
@@ -1713,19 +1732,26 @@ def binance_signed_request(
 ) -> dict:
     """
     Выполняет защищенный HMAC-SHA256 запрос к торговому API Binance (/api/v3/*).
+    Включает:
+    - Широкое окно recvWindow = 60000 для стабильности на нестабильной сети
+    - Автоматическую ресинхронизацию времени при ошибке -1021
+    - Резервные хосты (api1.binance.com, api2.binance.com, api3.binance.com) при сетевых сбоях
     """
     api_key, api_secret = get_api_credentials(state)
     if not api_key or not api_secret:
         return {"error": "API-ключи Binance не настроены (BINANCE_API_KEY / BINANCE_API_SECRET)"}
 
-    offset = sync_binance_time()
-    p = dict(params or {})
-    p["timestamp"] = int(time.time() * 1000) + offset
-    p["recvWindow"] = 5000
-
-    query_str = urllib.parse.urlencode(p)
-    sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
-    signed_query = f"{query_str}&signature={sig}"
+    # Список хостов для надёжного соединения
+    base_urls = [BINANCE_TRADE_URL]
+    if "api.binance.com" in BINANCE_TRADE_URL:
+        base_urls.extend(["https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"])
+    # Убираем дубликаты
+    seen_urls = set()
+    candidate_urls = []
+    for u in base_urls:
+        if u not in seen_urls:
+            candidate_urls.append(u)
+            seen_urls.add(u)
 
     headers = {
         "X-MBX-APIKEY": api_key,
@@ -1739,36 +1765,62 @@ def binance_signed_request(
     if worker_auth:
         headers["X-Worker-Auth"] = worker_auth
 
-    url = f"{BINANCE_TRADE_URL}{endpoint}"
     method_up = method.upper()
 
-    if method_up in ("GET", "DELETE"):
-        full_url = f"{url}?{signed_query}"
-        req = urllib.request.Request(full_url, headers=headers, method=method_up)
-    else:  # POST, PUT
-        req = urllib.request.Request(
-            url,
-            data=signed_query.encode("utf-8"),
-            headers=headers,
-            method=method_up,
-        )
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    for attempt in range(2):
+        offset = sync_binance_time(force=(attempt > 0))
+        p = dict(params or {})
+        p["timestamp"] = int(time.time() * 1000) + offset
+        p["recvWindow"] = 60000  # Максимальное окно допуска для исключения -1021
 
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            record_binance_weight(getattr(resp, "headers", None))
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        record_binance_weight(getattr(e, "headers", None))
-        err_body = e.read().decode("utf-8", errors="ignore")
-        try:
-            err_json = json.loads(err_body)
-            msg = sanitize_sensitive_text(err_json.get("msg", err_body))
-            return {"error": msg, "code": err_json.get("code", e.code)}
-        except Exception:
-            return {"error": sanitize_sensitive_text(f"HTTP {e.code}: {err_body}"), "code": e.code}
-    except Exception as e:
-        return {"error": sanitize_sensitive_text(str(e))}
+        query_str = urllib.parse.urlencode(p)
+        sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+        signed_query = f"{query_str}&signature={sig}"
+
+        last_error = None
+        for base_url in candidate_urls:
+            url = f"{base_url}{endpoint}"
+            if method_up in ("GET", "DELETE"):
+                full_url = f"{url}?{signed_query}"
+                req = urllib.request.Request(full_url, headers=headers, method=method_up)
+            else:  # POST, PUT
+                req = urllib.request.Request(
+                    url,
+                    data=signed_query.encode("utf-8"),
+                    headers=headers,
+                    method=method_up,
+                )
+                req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    record_binance_weight(getattr(resp, "headers", None))
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                record_binance_weight(getattr(e, "headers", None))
+                err_body = e.read().decode("utf-8", errors="ignore")
+                try:
+                    err_json = json.loads(err_body)
+                    code = err_json.get("code", e.code)
+                    msg = sanitize_sensitive_text(err_json.get("msg", err_body))
+                    # Если рассинхрон времени (-1021) — пробуем второй такт с принудительной синхронизацией
+                    if code == -1021 and attempt == 0:
+                        last_error = {"error": msg, "code": code}
+                        break
+                    return {"error": msg, "code": code}
+                except Exception:
+                    return {"error": sanitize_sensitive_text(f"HTTP {e.code}: {err_body}"), "code": e.code}
+            except Exception as e:
+                last_error = {"error": sanitize_sensitive_text(str(e))}
+                continue  # Пробуем следующий резервный хост
+
+        if last_error and last_error.get("code") == -1021 and attempt == 0:
+            time.sleep(0.3)
+            continue
+        if last_error:
+            return last_error
+
+    return {"error": "Не удалось подключиться к Binance API (все резервные хосты недоступны)"}
 
 def get_spot_account_assets(state: Optional[dict] = None) -> Tuple[Dict[str, dict], Optional[str]]:
     """
@@ -1799,6 +1851,83 @@ def get_free_usdt_balance(state: Optional[dict] = None) -> float:
     """Возвращает свободный баланс USDT на спотовом кошельке Binance."""
     balances, _ = get_spot_balances(state=state)
     return balances.get("USDT", 0.0)
+
+def process_and_test_api_keys(
+    token: str,
+    chat_id_local: Union[str, int],
+    state: dict,
+    raw_key: str,
+    raw_secret: str,
+) -> None:
+    """
+    Валидирует, сохраняет локально и немедленно проверяет боевой запрос к Binance.
+    """
+    key = sanitize_api_key(raw_key)
+    secret = sanitize_api_key(raw_secret)
+    if not key or not secret or len(key) < 16 or len(secret) < 16:
+        send_telegram(
+            token, chat_id_local,
+            "❌ <b>Некорректный формат ключей Binance.</b>\n\n"
+            "Отправьте в одном сообщении через пробел:\n"
+            "<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+
+    # Сохраняем в память и переменные процесса
+    os.environ["BINANCE_API_KEY"] = key
+    os.environ["BINANCE_API_SECRET"] = secret
+    if "settings" not in state:
+        state["settings"] = {}
+    state["settings"]["binance_api_key"] = key
+    state["settings"]["binance_api_secret"] = secret
+
+    # Сохраняем в локальный .env (который в .gitignore) для персистентности между рестартами
+    save_local_env_var("BINANCE_API_KEY", key)
+    save_local_env_var("BINANCE_API_SECRET", secret)
+
+    msg_id = send_telegram(token, chat_id_local, "⏳ <i>Проверяю ключи на сервере Binance Spot (/api/v3/account)...</i>")
+
+    # Живой защищенный запрос к Binance
+    assets, err = get_spot_account_assets(state)
+    if err:
+        err_lower = str(err).lower()
+        hint = ""
+        if "ip" in err_lower or "-2015" in err_lower:
+            hint = "\n\n💡 <b>Причина:</b> Ограничение по IP. В кабинете Binance API включите <i>«Неограниченный IP»</i> (Unrestricted IP) или добавьте IP вашего бота."
+        elif "signature" in err_lower or "-1022" in err_lower:
+            hint = "\n\n💡 <b>Причина:</b> Ошибка в <b>Secret Key</b>. Проверьте правильность копирования секретного ключа (нет ли лишних символов)."
+        elif "api-key format" in err_lower or "-2014" in err_lower:
+            hint = "\n\n💡 <b>Причина:</b> Ошибка в <b>API Key</b>. Проверьте правильность публичного ключа."
+        elif "timestamp" in err_lower or "-1021" in err_lower:
+            hint = "\n\n💡 <b>Причина:</b> Рассинхрон системного времени с сервером Binance."
+
+        resp_msg = (
+            f"⚠️ <b>Ключи сохранены, но Binance отклонил запрос:</b>\n"
+            f"<code>{err}</code>{hint}\n\n"
+            f"<i>Убедитесь, что в Binance API Management включены разрешения: «Включить чтение» (Enable Reading) и «Включить спотовую торговлю» (Enable Spot & Margin Trading).</i>"
+        )
+        if msg_id:
+            edit_message(token, chat_id_local, msg_id, resp_msg, reply_markup=main_keyboard())
+        else:
+            send_telegram(token, chat_id_local, resp_msg, reply_markup=main_keyboard())
+    else:
+        usdt_info = assets.get("USDT", {"free": 0.0, "locked": 0.0, "total": 0.0})
+        free_usdt = usdt_info.get("free", 0.0)
+        total_usdt = usdt_info.get("total", 0.0)
+        coin_count = sum(1 for k, v in assets.items() if k != "USDT" and float(v.get("total", 0.0)) > 0.0001)
+
+        success_msg = (
+            f"✅ <b>API-ключи Binance успешно подключены и проверены!</b>\n\n"
+            f"• Свободно USDT: <code>{free_usdt:,.2f} USDT</code>\n"
+            f"• Всего на балансе: <code>{total_usdt:,.2f} USDT</code>\n"
+            f"• Монет на споте: <b>{coin_count}</b> шт.\n\n"
+            f"⚡ Теперь доступны баланс, автоторговля и ручные ордера."
+        )
+        if msg_id:
+            edit_message(token, chat_id_local, msg_id, success_msg, reply_markup=main_keyboard())
+        else:
+            send_telegram(token, chat_id_local, success_msg, reply_markup=main_keyboard())
 
 def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
     """
@@ -5788,11 +5917,15 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
                 if cur_st == "waiting_api_keys":
                     user_fsm.pop(chat_id_local, None)
-                    send_telegram(
-                        token, chat_id_local,
-                        "🛡 <b>Безопасность:</b> В режиме GitHub Actions задавайте <code>BINANCE_API_KEY</code> и <code>BINANCE_API_SECRET</code> в <b>GitHub Secrets</b> репозитория, чтобы исключить утечку ключей.",
-                        reply_markup=main_keyboard(),
-                    )
+                    parts = text.split()
+                    if len(parts) >= 2:
+                        process_and_test_api_keys(token, chat_id_local, state, parts[0], parts[1])
+                    else:
+                        send_telegram(
+                            token, chat_id_local,
+                            "❌ <b>Нужно отправить два ключа через пробел:</b>\n<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>",
+                            reply_markup=cancel_keyboard()
+                        )
                     return
 
                 if cur_st == "waiting_quick_add_qty":
@@ -6071,20 +6204,30 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     target_val = args[1]
                     set_custom_target_sell(token, chat_id_local, state, symbol, target_val)
 
-            elif cmd in ("api", "ключ"):
-                api_k, api_s = get_api_credentials(state)
-                status_str = "🟢 <b>Подключены через GitHub Secrets</b>" if (api_k and api_s) else "🔴 <b>Не настроены</b>"
-                send_telegram(
-                    token, chat_id_local,
-                    f"🔑 <b>API-ключи Binance Spot</b>\n\n"
-                    f"• Текущий статус: {status_str}\n\n"
-                    f"🛡 <b>Безопасность репозитория GitHub:</b>\n"
-                    f"Бот работает в режиме GitHub Actions. Чтобы ваши ключи никогда не попали в открытый код или git-историю, добавьте их в <b>GitHub Secrets</b> репозитория:\n"
-                    f"• <code>BINANCE_API_KEY</code>\n"
-                    f"• <code>BINANCE_API_SECRET</code>\n\n"
-                    f"<i>(В настройках репозитория: Settings → Secrets and variables → Actions)</i>",
-                    reply_markup=main_keyboard(),
-                )
+            elif cmd in ("api", "ключ", "check_api", "test_api"):
+                args = clean_text.split()[1:]
+                if len(args) >= 2:
+                    process_and_test_api_keys(token, chat_id_local, state, args[0], args[1])
+                else:
+                    api_k, api_s = get_api_credentials(state)
+                    if api_k and api_s and cmd in ("check_api", "test_api"):
+                        process_and_test_api_keys(token, chat_id_local, state, api_k, api_s)
+                    else:
+                        status_str = "🟢 <b>Подключены и активны</b>" if (api_k and api_s) else "🔴 <b>Не настроены</b>"
+                        user_fsm[chat_id_local] = {"state": "waiting_api_keys", "data": {}, "created_at": time.time()}
+                        send_telegram(
+                            token, chat_id_local,
+                            f"🔑 <b>Привязка API ключей Binance Spot</b>\n\n"
+                            f"• Текущий статус: {status_str}\n\n"
+                            "Отправьте ключи в одном сообщении через пробел:\n"
+                            "<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
+                            "🔒 <i>Ключи сохраняются локально и проверяются запросом к Binance.\n"
+                            "Необходимые разрешения в API Management:\n"
+                            "1. «Включить чтение» (Enable Reading)\n"
+                            "2. «Включить спотовую торговлю» (Enable Spot & Margin Trading)\n"
+                            "3. Без права вывода средств!</i>",
+                            reply_markup=cancel_keyboard(),
+                        )
 
             elif "баланс" in text_lower or "balance" in text_lower or cmd in ("balance", "баланс"):
                 print(f"-> Детальный баланс для {chat_id_local}")
