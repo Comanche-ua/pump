@@ -1763,30 +1763,16 @@ def sync_binance_time(force: bool = False) -> int:
             continue
     return _binance_time_offset_ms
 
-def save_local_env_var(key: str, value: str) -> None:
-    """Сохраняет переменную в локальный файл .env (защищен от git-коммитов через .gitignore)."""
-    try:
-        env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-        lines = []
-        found = False
-        if os.path.exists(env_file):
-            with open(env_file, "r", encoding="utf-8") as f:
-                for l in f:
-                    stripped = l.strip()
-                    if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
-                        lines.append(f"{key}={value}\n")
-                        found = True
-                    else:
-                        lines.append(l)
-        if not found:
-            lines.append(f"{key}={value}\n")
-        with open(env_file, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-    except Exception as e:
-        print(f"[Warn] Не удалось обновить локальный .env: {e}", file=sys.stderr)
-
 def sanitize_api_key(val: str) -> str:
-    """Очищает API-ключ от лишних кавычек, пробелов и префиксов."""
+    """
+    Очищает API-ключ от мусора копипаста: кавычек, пробелов, префиксов
+    вида 'API_KEY=' и невидимых символов.
+
+    Невидимые символы (zero-width space, неразрывный пробел, мягкий перенос)
+    глазом не видны и переживают обычный strip() — но они попадают в HMAC,
+    и Binance отвечает -1022 «Signature for this request is not valid»
+    на ключ, который вы скопировали правильно.
+    """
     if not val:
         return ""
     cleaned = val.strip().strip("'\"`\r\n\t")
@@ -1797,6 +1783,11 @@ def sanitize_api_key(val: str) -> str:
             break
     if ":" in cleaned and any(cleaned.lower().startswith(x) for x in ("api key:", "api secret:", "key:", "secret:")):
         cleaned = cleaned.split(":", 1)[1].strip().strip("'\"`\r\n\t")
+    # Ключ и секрет Binance состоят строго из латиницы и цифр. Всё остальное —
+    # мусор. Зачистку применяем только если она не превращает значение в кашу.
+    strict = re.sub(r"[^A-Za-z0-9]", "", cleaned)
+    if len(strict) >= 32:
+        cleaned = strict
     return cleaned
 
 def extract_api_keys_from_text(raw_text: str) -> Tuple[str, str]:
@@ -1846,79 +1837,49 @@ def extract_api_keys_from_text(raw_text: str) -> Tuple[str, str]:
 def get_api_credentials(state: Optional[dict] = None) -> Tuple[str, str]:
     """
     Возвращает (api_key, api_secret).
-    Приоритет:
-    1. Полная пара из переменных окружения (GitHub Secrets / .env).
-    2. Если её нет — сохранённая пара из state["settings"].
 
-    Это важно для GitHub Actions: ``bot_state.json`` переживает перезапуски и
-    может содержать ранее введённую или уже отозванную пару. Secrets workflow
-    всегда являются актуальной конфигурацией деплоя.
-    Ключ и секрет всегда разрешаются как единая согласованная пара.
+    Единственный источник ключей — переменные окружения (GitHub Secrets,
+    либо локальный .env). Из state["settings"] ключи сознательно НЕ читаются,
+    чтобы ни в репозитории, ни в bot_state.json не оставалось копий ключей.
+
+    Пара разрешается целиком или никак: key из одного места плюс secret из
+    другого дают Binance -1022 (invalid signature).
     """
-    env_k = sanitize_api_key(os.environ.get("BINANCE_API_KEY", ""))
-    env_s = sanitize_api_key(os.environ.get("BINANCE_API_SECRET", ""))
-    if env_k and env_s:
-        return env_k, env_s
+    return (
+        sanitize_api_key(os.environ.get("BINANCE_API_KEY", "")),
+        sanitize_api_key(os.environ.get("BINANCE_API_SECRET", "")),
+    )
 
-    if state:
-        st_k = sanitize_api_key(state.get("settings", {}).get("binance_api_key", ""))
-        st_s = sanitize_api_key(state.get("settings", {}).get("binance_api_secret", ""))
-        if st_k and st_s:
-            return st_k, st_s
-
-    # Нельзя «дособирать» пару из разных источников: например, Key из
-    # GitHub Secret и Secret из старого bot_state.json дают Binance -1022
-    # (invalid signature). Если полной пары нет, лучше честно сообщить о
-    # неполной конфигурации выше, чем подписывать запрос чужим Secret.
-    return "", ""
-
-# Коды Binance, означающие «эта пара key/secret не подходит»:
+# Коды Binance, означающие «проблема с парой key/secret»:
 #   -1022 signature for this request is not valid
 #   -2015 invalid API-key, IP, or permissions for action
 #   -2014 API-key format invalid
 #   -2008 invalid api key id
 BINANCE_AUTH_ERROR_CODES = {-1022, -2015, -2014, -2008}
 
-# Источник пары, которой Binance ответил на последний запрос ("env" | "state").
-# Нужен, чтобы было видно: сработал основной источник или откат на резервный.
-_active_api_cred_source: str = ""
-
-def get_active_api_cred_source() -> str:
-    """Источник пары ключей, которой Binance успешно ответил в последний раз."""
-    return _active_api_cred_source
-
-def get_api_credential_candidates(state: Optional[dict] = None) -> List[Tuple[str, str, str]]:
+def describe_api_cred_problem(code: int) -> str:
     """
-    Возвращает список полных пар (api_key, api_secret, источник) в порядке приоритета:
-    сначала env (GitHub Secrets / .env), затем state["settings"] (bot_state.json).
-
-    Нужен для самовосстановления: если Binance отверг пару из env ошибкой -1022,
-    запрос автоматически повторяется парой из bot_state.json, вместо того чтобы
-    падать с «Signature for this request is not valid».
-    Пары никогда не смешиваются — каждый кандидат цельный и из одного источника.
+    Расшифровка кода ошибки Binance: что именно править в GitHub Secrets.
+    Показывается прямо в чате, чтобы не гадать над сухим «Signature is not valid».
     """
-    candidates: List[Tuple[str, str, str]] = []
-
-    env_k = sanitize_api_key(os.environ.get("BINANCE_API_KEY", ""))
-    env_s = sanitize_api_key(os.environ.get("BINANCE_API_SECRET", ""))
-    if env_k and env_s:
-        candidates.append((env_k, env_s, "env"))
-
-    if state:
-        st_k = sanitize_api_key(state.get("settings", {}).get("binance_api_key", ""))
-        st_s = sanitize_api_key(state.get("settings", {}).get("binance_api_secret", ""))
-        if st_k and st_s:
-            candidates.append((st_k, st_s, "state"))
-
-    # Одинаковый key из разных источников — не повод слать запрос дважды
-    unique: List[Tuple[str, str, str]] = []
-    seen_keys: Set[str] = set()
-    for k, s, src in candidates:
-        if k in seen_keys:
-            continue
-        seen_keys.add(k)
-        unique.append((k, s, src))
-    return unique
+    if code == -1022:
+        return (
+            "BINANCE_API_SECRET не подходит к BINANCE_API_KEY — секрет взят от другого "
+            "API-ключа либо скопирован с невидимым символом (пробел, перенос строки). "
+            "Надёжнее всего перевыпустить секрет в кабинете Binance и вставить оба "
+            "значения в Secrets заново, целиком"
+        )
+    if code == -2015:
+        return (
+            "ключ не найден либо ему запрещено действие: проверьте BINANCE_API_KEY, "
+            "права (Enable Reading / Enable Spot & Margin Trading) и IP-ограничение "
+            "в кабинете Binance"
+        )
+    if code == -2014:
+        return "неверный формат BINANCE_API_KEY — в значение попал мусор или оно обрезано"
+    if code == -2008:
+        return "Binance не знает такой API-ключ — он удалён или отозван"
+    return ""
 
 def binance_signed_request(
     method: str,
@@ -1932,12 +1893,10 @@ def binance_signed_request(
     - Окно recvWindow = 10000 для надежной синхронизации
     - Автоматическую ресинхронизацию времени при ошибке -1021
     - Резервные хосты (api1.binance.com, api2.binance.com, api3.binance.com) при сетевых сбоях
-    - Откат на резервную пару ключей, если Binance отверг основную (-1022/-2015)
+    - Расшифровку кодов -1022/-2015 прямо в тексте ошибки
     """
-    global _active_api_cred_source
-
-    cred_pairs = get_api_credential_candidates(state)
-    if not cred_pairs:
+    api_key, api_secret = get_api_credentials(state)
+    if not api_key or not api_secret:
         return {"error": "API-ключи Binance не настроены (BINANCE_API_KEY / BINANCE_API_SECRET)"}
 
     # Список хостов для надёжного соединения
@@ -1952,105 +1911,81 @@ def binance_signed_request(
             candidate_urls.append(u)
             seen_urls.add(u)
 
+    headers = {
+        "X-MBX-APIKEY": api_key,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PumpPulseBot/2.1",
+    }
     worker_auth = ""
     if state:
         worker_auth = str(state.get("settings", {}).get("worker_auth_token", "")).strip()
     if not worker_auth:
         worker_auth = BINANCE_WORKER_AUTH
+    if worker_auth:
+        headers["X-Worker-Auth"] = worker_auth
 
     method_up = method.upper()
-    rejected: Optional[dict] = None
 
-    for pair_index, (api_key, api_secret, cred_source) in enumerate(cred_pairs):
-        headers = {
-            "X-MBX-APIKEY": api_key,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PumpPulseBot/2.1",
-        }
-        if worker_auth:
-            headers["X-Worker-Auth"] = worker_auth
+    for attempt in range(2):
+        offset = sync_binance_time(force=(attempt > 0))
+        p = dict(params or {})
+        p["timestamp"] = int(time.time() * 1000) + offset
+        p["recvWindow"] = 10000
 
-        # Есть ли куда откатываться, если биржа отвергнет именно эту пару
-        has_fallback_pair = pair_index + 1 < len(cred_pairs)
-        switch_to_next_pair = False
+        query_str = urllib.parse.urlencode(p)
+        sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
+        signed_query = f"{query_str}&signature={sig}"
 
-        for attempt in range(2):
-            offset = sync_binance_time(force=(attempt > 0))
-            p = dict(params or {})
-            p["timestamp"] = int(time.time() * 1000) + offset
-            p["recvWindow"] = 10000
+        last_error = None
+        for base_url in candidate_urls:
+            url = f"{base_url}{endpoint}"
+            if method_up in ("GET", "DELETE"):
+                full_url = f"{url}?{signed_query}"
+                req = urllib.request.Request(full_url, headers=headers, method=method_up)
+            else:  # POST, PUT
+                req = urllib.request.Request(
+                    url,
+                    data=signed_query.encode("utf-8"),
+                    headers=headers,
+                    method=method_up,
+                )
+                req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
-            query_str = urllib.parse.urlencode(p)
-            sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
-            signed_query = f"{query_str}&signature={sig}"
-
-            last_error = None
-            for base_url in candidate_urls:
-                url = f"{base_url}{endpoint}"
-                if method_up in ("GET", "DELETE"):
-                    full_url = f"{url}?{signed_query}"
-                    req = urllib.request.Request(full_url, headers=headers, method=method_up)
-                else:  # POST, PUT
-                    req = urllib.request.Request(
-                        url,
-                        data=signed_query.encode("utf-8"),
-                        headers=headers,
-                        method=method_up,
-                    )
-                    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    record_binance_weight(getattr(resp, "headers", None))
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                record_binance_weight(getattr(e, "headers", None))
+                err_body = e.read().decode("utf-8", errors="ignore")
                 try:
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        record_binance_weight(getattr(resp, "headers", None))
-                        result = json.loads(resp.read().decode("utf-8"))
-                        _active_api_cred_source = cred_source
-                        return result
-                except urllib.error.HTTPError as e:
-                    record_binance_weight(getattr(e, "headers", None))
-                    err_body = e.read().decode("utf-8", errors="ignore")
-                    try:
-                        err_json = json.loads(err_body)
-                        code = err_json.get("code", e.code)
-                        msg = sanitize_sensitive_text(err_json.get("msg", err_body))
-                    except Exception:
-                        return {"error": sanitize_sensitive_text(f"HTTP {e.code}: {err_body}"), "code": e.code}
+                    err_json = json.loads(err_body)
+                    code = err_json.get("code", e.code)
+                    msg = sanitize_sensitive_text(err_json.get("msg", err_body))
+                except Exception:
+                    return {"error": sanitize_sensitive_text(f"HTTP {e.code}: {err_body}"), "code": e.code}
 
-                    # Пара key/secret отвергнута биржей → пробуем пару из другого источника
-                    if code in BINANCE_AUTH_ERROR_CODES:
-                        rejected = {"error": msg, "code": code}
-                        if has_fallback_pair:
-                            print(
-                                f"[Binance] Пара ключей из '{cred_source}' отвергнута "
-                                f"(code={code}: {msg}) — пробую следующий источник.",
-                                file=sys.stderr,
-                            )
-                            switch_to_next_pair = True
-                            break
-                        return rejected
-
-                    # Если рассинхрон времени (-1021) — пробуем второй такт с принудительной синхронизацией
-                    if code == -1021 and attempt == 0:
-                        last_error = {"error": msg, "code": code}
-                        break
+                # Проблема с ключами — дописываем расшифровку прямо в текст ошибки
+                if code in BINANCE_AUTH_ERROR_CODES:
+                    hint = describe_api_cred_problem(code)
+                    if hint:
+                        msg = f"{msg} — {hint}"
                     return {"error": msg, "code": code}
-                except Exception as e:
-                    last_error = {"error": sanitize_sensitive_text(str(e))}
-                    continue  # Пробуем следующий резервный хост
 
-            if switch_to_next_pair:
-                break
-            if last_error and last_error.get("code") == -1021 and attempt == 0:
-                time.sleep(0.3)
-                continue
-            if last_error:
-                return last_error
+                # Если рассинхрон времени (-1021) — пробуем второй такт с принудительной синхронизацией
+                if code == -1021 and attempt == 0:
+                    last_error = {"error": msg, "code": code}
+                    break
+                return {"error": msg, "code": code}
+            except Exception as e:
+                last_error = {"error": sanitize_sensitive_text(str(e))}
+                continue  # Пробуем следующий резервный хост
 
-        if switch_to_next_pair:
+        if last_error and last_error.get("code") == -1021 and attempt == 0:
+            time.sleep(0.3)
             continue
-        # Пара отработала без явного ответа — других кандидатов пробовать нечего
-        break
+        if last_error:
+            return last_error
 
-    if rejected:
-        return rejected
     return {"error": "Не удалось подключиться к Binance API (все резервные хосты недоступны)"}
 
 def get_spot_account_assets(state: Optional[dict] = None) -> Tuple[Dict[str, dict], Optional[str]]:
@@ -2105,19 +2040,11 @@ def process_and_test_api_keys(
         )
         return
 
-    # Сохраняем в память и переменные процесса
+    # Ключи НЕ сохраняются ни в bot_state.json, ни в .env — единственное
+    # хранилище это GitHub Secrets. Здесь пара только подставляется в текущий
+    # процесс и проверяется живым запросом к бирже.
     os.environ["BINANCE_API_KEY"] = key
     os.environ["BINANCE_API_SECRET"] = secret
-    if "settings" not in state:
-        state["settings"] = {}
-    state["settings"]["binance_api_key"] = key
-    state["settings"]["binance_api_secret"] = secret
-
-    # Сохраняем в bot_state.json и git, чтобы ключи пережили перезапуск бота
-    save_state(state, sync_git=True)
-    # Сохраняем в локальный .env (который в .gitignore) для персистентности между рестартами
-    save_local_env_var("BINANCE_API_KEY", key)
-    save_local_env_var("BINANCE_API_SECRET", secret)
 
     msg_id = send_telegram(token, chat_id_local, "⏳ <i>Проверяю ключи на сервере Binance Spot (/api/v3/account)...</i>")
 
@@ -2137,7 +2064,7 @@ def process_and_test_api_keys(
             hint = "\n\n💡 <b>Причина:</b> Рассинхрон системного времени с сервером Binance."
 
         resp_msg = (
-            f"⚠️ <b>Ключи сохранены, но Binance отклонил запрос:</b>\n"
+            f"⚠️ <b>Ключи проверены, но Binance отклонил запрос:</b>\n"
             f"<code>{err}</code>{hint}\n\n"
             f"<i>Убедитесь, что в Binance API Management включены разрешения: «Включить чтение» (Enable Reading) и «Включить спотовую торговлю» (Enable Spot & Margin Trading).</i>"
         )
@@ -2152,11 +2079,14 @@ def process_and_test_api_keys(
         coin_count = sum(1 for k, v in assets.items() if k != "USDT" and float(v.get("total", 0.0)) > 0.0001)
 
         success_msg = (
-            f"✅ <b>API-ключи Binance успешно подключены и проверены!</b>\n\n"
+            f"✅ <b>API-ключи Binance рабочие — проверено живым запросом.</b>\n\n"
             f"• Свободно USDT: <code>{free_usdt:,.2f} USDT</code>\n"
             f"• Всего на балансе: <code>{total_usdt:,.2f} USDT</code>\n"
             f"• Монет на споте: <b>{coin_count}</b> шт.\n\n"
-            f"⚡ Теперь доступны баланс, автоторговля и ручные ордера."
+            f"⚡ Доступны баланс, автоторговля и ручные ордера.\n\n"
+            f"🔒 <i>Локально ключи не сохраняются. Чтобы пара пережила рестарт, внесите её "
+            f"в GitHub → Settings → Secrets and variables → Actions: "
+            f"<code>BINANCE_API_KEY</code> и <code>BINANCE_API_SECRET</code>.</i>"
         )
         if msg_id:
             edit_message(token, chat_id_local, msg_id, success_msg, reply_markup=main_keyboard())
@@ -2207,16 +2137,6 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
     ticker_map = {t["symbol"]: float(t.get("priceChangePercent", 0.0)) for t in tickers if "symbol" in t}
 
     lines = ["💳 <b>Баланс и активы на Binance Spot</b>\n"]
-
-    # Если Binance отверг пару из env и запрос уехал на резервную из bot_state.json —
-    # говорим об этом прямо, иначе «всё работает» молча скрывает сломанные секреты.
-    if get_active_api_cred_source() == "state" and len(get_api_credential_candidates(state)) > 1:
-        lines.append(
-            "⚠️ <b>Ключи из переменных окружения (GitHub Secrets / .env) отвергнуты биржей.</b>\n"
-            "<i>Работаю на резервной паре из <code>bot_state.json</code>. "
-            "Поправьте секреты <code>BINANCE_API_KEY</code> и <code>BINANCE_API_SECRET</code> — "
-            "иначе на чистом деплое без state-файла баланс снова отвалится.</i>\n"
-        )
 
     # Блок USDT
     lines.append("💵 <b>Стейблкоин баланс (USDT):</b>")
