@@ -1343,8 +1343,32 @@ class TradeSafetyTest(unittest.TestCase):
                 except Exception:
                     pass
 
+    def test_extract_api_keys(self):
+        """Проверка извлечения API ключей в различных форматах (команда /api, две строки, env-формат)."""
+        # Формат 1: /api KEY SECRET
+        k, s = pb.extract_api_keys_from_text("/api 1234567890abcdef1234 9876543210fedcba9876")
+        self.assertEqual(k, "1234567890abcdef1234")
+        self.assertEqual(s, "9876543210fedcba9876")
+
+        # Формат 2: построчно
+        raw = "API_KEY: my_test_key_123456789\nAPI_SECRET: my_test_secret_987654321"
+        k, s = pb.extract_api_keys_from_text(raw)
+        self.assertEqual(k, "my_test_key_123456789")
+        self.assertEqual(s, "my_test_secret_987654321")
+
+        # Формат 3: просто два ключа через пробел или перевод строки
+        k, s = pb.extract_api_keys_from_text("key1234567890abcdef secret9876543210fedcba")
+        self.assertEqual(k, "key1234567890abcdef")
+        self.assertEqual(s, "secret9876543210fedcba")
+
+        # Формат 4: секрет с символами '='
+        k, s = pb.extract_api_keys_from_text("my_key_1234567890123456 my_secret_with_equals====")
+        self.assertEqual(k, "my_key_1234567890123456")
+        self.assertEqual(s, "my_secret_with_equals====")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 

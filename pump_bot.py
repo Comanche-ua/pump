@@ -1705,9 +1705,58 @@ def sanitize_api_key(val: str) -> str:
     if not val:
         return ""
     cleaned = val.strip().strip("'\"`\r\n\t")
-    if "=" in cleaned:
-        cleaned = cleaned.split("=", 1)[1].strip().strip("'\"`\r\n\t")
+    # Удаляем имена переменных, если они попали в значение
+    for prefix in ("BINANCE_API_KEY=", "BINANCE_API_SECRET=", "API_KEY=", "API_SECRET=", "KEY=", "SECRET="):
+        if cleaned.upper().startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip().strip("'\"`\r\n\t")
+            break
+    if ":" in cleaned and any(cleaned.lower().startswith(x) for x in ("api key:", "api secret:", "key:", "secret:")):
+        cleaned = cleaned.split(":", 1)[1].strip().strip("'\"`\r\n\t")
     return cleaned
+
+def extract_api_keys_from_text(raw_text: str) -> Tuple[str, str]:
+    """
+    Интеллектуально извлекает (api_key, api_secret) из любого формата ввода пользователя:
+    1. '/api KEY SECRET'
+    2. 'KEY SECRET'
+    3. Две строки (KEY на 1-й строке, SECRET на 2-й)
+    4. 'BINANCE_API_KEY=xxx\nBINANCE_API_SECRET=yyy'
+    5. 'API Key: xxx, Secret Key: yyy'
+    """
+    text = raw_text.strip()
+    # Убираем префикс команды /api или /ключ
+    if text.startswith("/api") or text.startswith("/ключ") or text.startswith("api ") or text.startswith("ключ "):
+        parts = text.split(None, 1)
+        text = parts[1].strip() if len(parts) > 1 else ""
+
+    if not text:
+        return "", ""
+
+    # Проверяем явные имена переменных
+    lines = [l.strip() for l in text.replace(",", " ").replace(";", " ").splitlines() if l.strip()]
+    k_val = ""
+    s_val = ""
+
+    for l in lines:
+        l_low = l.lower()
+        if "secret" in l_low:
+            s_val = l.split(":", 1)[-1].split("=", 1)[-1].strip().strip("'\"`\r\n\t")
+        elif "key" in l_low and not k_val:
+            k_val = l.split(":", 1)[-1].split("=", 1)[-1].strip().strip("'\"`\r\n\t")
+
+    if k_val and s_val:
+        return sanitize_api_key(k_val), sanitize_api_key(s_val)
+
+    # Иначе разбиваем по пробельным символам
+    tokens = text.split()
+    tokens = [t.strip().strip("'\"`,;:\r\n\t") for t in tokens if t.strip().strip("'\"`,;:\r\n\t")]
+    # Убираем служебные слова если попали
+    tokens = [t for t in tokens if t.lower() not in ("/api", "api", "ключ", "/ключ", "key", "secret", "api_key", "api_secret", "secret_key")]
+
+    if len(tokens) >= 2:
+        return sanitize_api_key(tokens[0]), sanitize_api_key(tokens[1])
+
+    return "", ""
 
 def get_api_credentials(state: Optional[dict] = None) -> Tuple[str, str]:
     """
@@ -5917,13 +5966,17 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
                 if cur_st == "waiting_api_keys":
                     user_fsm.pop(chat_id_local, None)
-                    parts = text.split()
-                    if len(parts) >= 2:
-                        process_and_test_api_keys(token, chat_id_local, state, parts[0], parts[1])
+                    k, s = extract_api_keys_from_text(text)
+                    if k and s:
+                        process_and_test_api_keys(token, chat_id_local, state, k, s)
                     else:
                         send_telegram(
                             token, chat_id_local,
-                            "❌ <b>Нужно отправить два ключа через пробел:</b>\n<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>",
+                            "❌ <b>Не удалось распознать API-ключи.</b>\n\n"
+                            "Отправьте ключи через пробел или построчно:\n"
+                            "<code>/api ВАШ_API_KEY ВАШ_API_SECRET</code>\n\n"
+                            "Или:\n"
+                            "<code>API_KEY: ваш_ключ\nAPI_SECRET: ваш_секрет</code>",
                             reply_markup=cancel_keyboard()
                         )
                     return
@@ -6205,9 +6258,9 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     set_custom_target_sell(token, chat_id_local, state, symbol, target_val)
 
             elif cmd in ("api", "ключ", "check_api", "test_api"):
-                args = clean_text.split()[1:]
-                if len(args) >= 2:
-                    process_and_test_api_keys(token, chat_id_local, state, args[0], args[1])
+                k, s = extract_api_keys_from_text(clean_text)
+                if k and s:
+                    process_and_test_api_keys(token, chat_id_local, state, k, s)
                 else:
                     api_k, api_s = get_api_credentials(state)
                     if api_k and api_s and cmd in ("check_api", "test_api"):
