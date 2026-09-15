@@ -44,17 +44,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Проверяем, изменился ли файл состояния
           if [ -f bot_state.json ]; then
             git add bot_state.json
-            
-            # Проверяем, есть ли что коммитить, чтобы избежать пустых ошибок
-            if ! git diff --staged --quiet; then
-              git commit -m "Auto-save bot state [skip ci]"
-              
-              # Извлекаем имя текущей ветки (например, main или master)
-              BRANCH_NAME=${GITHUB_REF#refs/heads/}
-              git push origin HEAD:$BRANCH_NAME
-            fi
+            git diff --staged --quiet || (git commit -m "Auto-save bot state [skip ci]" && git push)
           fi
