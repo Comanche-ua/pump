@@ -2040,13 +2040,12 @@ def process_and_test_api_keys(
         )
         return
 
+    # Ключи НЕ сохраняются ни в bot_state.json, ни в .env — единственное
+    # хранилище это GitHub Secrets. Здесь пара только подставляется в текущий
+    # процесс и проверяется живым запросом к бирже.
     os.environ["BINANCE_API_KEY"] = key
     os.environ["BINANCE_API_SECRET"] = secret
-    if "settings" not in state:
-        state["settings"] = {}
-    state["settings"]["binance_api_key"] = key
-    state["settings"]["binance_api_secret"] = secret
-    save_state(state, sync_git=True)
+
 
     msg_id = send_telegram(token, chat_id_local, "⏳ <i>Проверяю ключи на сервере Binance Spot (/api/v3/account)...</i>")
 
@@ -2086,7 +2085,10 @@ def process_and_test_api_keys(
             f"• Всего на балансе: <code>{total_usdt:,.2f} USDT</code>\n"
             f"• Монет на споте: <b>{coin_count}</b> шт.\n\n"
             f"⚡ Доступны баланс, автоторговля и ручные ордера.\n\n"
-            f"🔒 <i>Ключи сохранены в состоянии бота и переменных сессии.</i>"
+            f"🔒 <i>Локально ключи не сохраняются. Чтобы пара пережила рестарт, внесите её "
+            f"в GitHub → Settings → Secrets and variables → Actions: "
+            f"<code>BINANCE_API_KEY</code> и <code>BINANCE_API_SECRET</code>.</i>"
+
         )
         if msg_id:
             edit_message(token, chat_id_local, msg_id, success_msg, reply_markup=main_keyboard())
