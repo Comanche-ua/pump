@@ -1693,6 +1693,21 @@ def load_state() -> dict:
         if "trade_profile" not in d["settings"]:
             d["settings"]["trade_profile"] = DEFAULT_TRADE_PROFILE
 
+        # Сохранение активного автотрейда и профиля при рестартах (включая CI / 24-7)
+        if os.environ.get("AUTO_TRADE") is not None:
+            d["settings"]["auto_trade"] = os.environ.get("AUTO_TRADE", "").strip().lower() in ("true", "1")
+        elif DEFAULT_AUTO_TRADE:
+            d["settings"]["auto_trade"] = True
+
+        if os.environ.get("TRADE_PROFILE"):
+            d["settings"]["trade_profile"] = os.environ.get("TRADE_PROFILE").strip().lower()
+
+        if os.environ.get("TRADE_MODE"):
+            d["settings"]["trade_mode"] = os.environ.get("TRADE_MODE").strip().lower()
+
+        if d["settings"].get("auto_trade"):
+            d["settings"]["strategy_confirmed"] = True
+
         d["active_trades"].update(data.get("active_trades", {}))
         d["trade_history"] = data.get("trade_history", [])[-100:]
         if "all_time_stats" in data and isinstance(data["all_time_stats"], dict):
