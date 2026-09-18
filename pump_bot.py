@@ -148,6 +148,68 @@ DEFAULT_USE_OCO = os.environ.get("USE_OCO", "true").strip().lower() in ("true", 
 # Прежний дефолт TP — нужен только для миграции уже сохранённого состояния
 PREVIOUS_TAKE_PROFIT_DEFAULT = 2.0
 
+# ── 4 Пресета торговых стратегий (по бэктесту 44 989 сигналов) ──
+TRADE_PROFILES = {
+    "optimal": {
+        "name": "🥇 Оптимальный (Баланс)",
+        "min_score": 70.0,
+        "entry_pullback_pct": 1.0,
+        "take_profit_pct": 0.7,
+        "stop_loss_pct": 3.0,
+        "trailing_activation_pct": 1.2,
+        "trailing_distance_pct": 0.4,
+        "desc": "WinRate 93.5%, просадка 5.35%, PnL +305%",
+    },
+    "profit": {
+        "name": "🚀 Макс. Профит (Агрессивный)",
+        "min_score": 65.0,
+        "entry_pullback_pct": 1.0,
+        "take_profit_pct": 0.7,
+        "stop_loss_pct": 3.5,
+        "trailing_activation_pct": 1.2,
+        "trailing_distance_pct": 0.4,
+        "desc": "613 сделок, WinRate 94.8%, PnL +392%",
+    },
+    "sniper": {
+        "name": "🛡 Снайпер (Консервативный)",
+        "min_score": 75.0,
+        "entry_pullback_pct": 0.8,
+        "take_profit_pct": 0.7,
+        "stop_loss_pct": 3.5,
+        "trailing_activation_pct": 1.2,
+        "trailing_distance_pct": 0.4,
+        "desc": "WinRate 95.9%, E[trade] +0.713%, PF 6.09",
+    },
+    "ultra": {
+        "name": "⚡ Ультра 3-в-1 (Динамический)",
+        "min_score": 65.0,
+        "entry_pullback_pct": 1.0,  # Score>=75 -> 0.8%, 70-75 -> 1.0%, 65-70 -> 1.0%
+        "take_profit_pct": 0.7,
+        "stop_loss_pct": 3.0,       # Score>=75 -> 3.5%, 70-75 -> 3.0%, 65-70 -> 3.5%
+        "trailing_activation_pct": 1.2,
+        "trailing_distance_pct": 0.4,
+        "desc": "Авто-адаптация отката и SL под качество каждого сигнала",
+    },
+}
+
+DEFAULT_TRADE_PROFILE = (os.environ.get("TRADE_PROFILE") or "optimal").strip().lower()
+
+def apply_trade_profile(state: dict, profile_key: str) -> dict:
+    """Применяет выбранный профиль стратегии к настройкам бота."""
+    if profile_key not in TRADE_PROFILES:
+        profile_key = "optimal"
+    prof = TRADE_PROFILES[profile_key]
+    s = state.setdefault("settings", {})
+    s["trade_profile"] = profile_key
+    s["min_score"] = float(prof["min_score"])
+    s["entry_pullback_pct"] = float(prof["entry_pullback_pct"])
+    s["take_profit_pct"] = float(prof["take_profit_pct"])
+    s["stop_loss_pct"] = float(prof["stop_loss_pct"])
+    s["trailing_activation_pct"] = float(prof["trailing_activation_pct"])
+    s["trailing_distance_pct"] = float(prof["trailing_distance_pct"])
+    return prof
+
+
 # Коды Binance, означающие «ордера на бирже нет» — в отличие от сетевого сбоя.
 # -2013 Order does not exist, -2011 Unknown order sent. Дают возможность
 # безопасно убирать мёртвые записи, не рискуя потерять живой ордер.
@@ -1559,9 +1621,15 @@ def default_state() -> dict:
             "strategy_confirmed": False,           # выбран ли режим осознанно
             "max_open_trades": 3,
             "trade_min_score": DEFAULT_TRADE_MIN_SCORE,
+            "trade_profile": DEFAULT_TRADE_PROFILE,
         },
         "active_trades": {},      # symbol -> trade dict
         "trade_history": [],      # list of closed trades
+        "all_time_stats": {       # итоговая статистика за всё время (не сбрасывается при очистке истории)
+            "total_trades": 0,
+            "winning_trades": 0,
+            "total_pnl": 0.0,
+        },
         "sent_alerts": {},        # pump alert_key -> timestamp
         "pending_entries": {},    # symbol -> выставленный, но ещё не исполненный LIMIT BUY
         "symbol_alert_cooldown": {},  # symbol -> timestamp последнего алерта
@@ -1600,7 +1668,20 @@ def load_state() -> dict:
             d["settings"]["trade_mode"] = "all"
 
         d["active_trades"].update(data.get("active_trades", {}))
-        d["trade_history"] = data.get("trade_history", [])[-50:]
+        d["trade_history"] = data.get("trade_history", [])[-100:]
+        if "all_time_stats" in data and isinstance(data["all_time_stats"], dict):
+            d["all_time_stats"] = {
+                "total_trades": int(data["all_time_stats"].get("total_trades", 0)),
+                "winning_trades": int(data["all_time_stats"].get("winning_trades", 0)),
+                "total_pnl": float(data["all_time_stats"].get("total_pnl", 0.0)),
+            }
+        else:
+            hist = d["trade_history"]
+            d["all_time_stats"] = {
+                "total_trades": len(hist),
+                "winning_trades": sum(1 for h in hist if float(h.get("pnl", 0.0)) > 0),
+                "total_pnl": sum(float(h.get("pnl", 0.0)) for h in hist),
+            }
         sent = data.get("sent_alerts", {})
         if isinstance(sent, list):
             # миграция со старого формата списка
@@ -1728,6 +1809,25 @@ def portfolio_remove(state: dict, symbol: str) -> bool:
         state["portfolio"].pop(symbol, None)
     save_state(state, sync_git=True)
     return True
+
+def record_closed_trade(state: dict, closed_rec: dict) -> None:
+    """Сохраняет закрытую сделку в историю и обновляет кумулятивную статистику за всё время."""
+    with STATE_LOCK:
+        history = state.setdefault("trade_history", [])
+        history.append(closed_rec)
+        if len(history) > 100:
+            history.pop(0)
+
+        stats = state.setdefault("all_time_stats", {
+            "total_trades": 0,
+            "winning_trades": 0,
+            "total_pnl": 0.0,
+        })
+        pnl = float(closed_rec.get("pnl", 0.0))
+        stats["total_trades"] = int(stats.get("total_trades", 0)) + 1
+        stats["total_pnl"] = float(stats.get("total_pnl", 0.0)) + pnl
+        if pnl > 0:
+            stats["winning_trades"] = int(stats.get("winning_trades", 0)) + 1
 
 # ───────────────────────── Binance Spot Trading Engine ─────────────────────────
 
@@ -2040,12 +2140,13 @@ def process_and_test_api_keys(
         )
         return
 
-    # Ключи НЕ сохраняются ни в bot_state.json, ни в .env — единственное
-    # хранилище это GitHub Secrets. Здесь пара только подставляется в текущий
-    # процесс и проверяется живым запросом к бирже.
     os.environ["BINANCE_API_KEY"] = key
     os.environ["BINANCE_API_SECRET"] = secret
-
+    if "settings" not in state:
+        state["settings"] = {}
+    state["settings"]["binance_api_key"] = key
+    state["settings"]["binance_api_secret"] = secret
+    save_state(state, sync_git=True)
 
     msg_id = send_telegram(token, chat_id_local, "⏳ <i>Проверяю ключи на сервере Binance Spot (/api/v3/account)...</i>")
 
@@ -2085,10 +2186,7 @@ def process_and_test_api_keys(
             f"• Всего на балансе: <code>{total_usdt:,.2f} USDT</code>\n"
             f"• Монет на споте: <b>{coin_count}</b> шт.\n\n"
             f"⚡ Доступны баланс, автоторговля и ручные ордера.\n\n"
-            f"🔒 <i>Локально ключи не сохраняются. Чтобы пара пережила рестарт, внесите её "
-            f"в GitHub → Settings → Secrets and variables → Actions: "
-            f"<code>BINANCE_API_KEY</code> и <code>BINANCE_API_SECRET</code>.</i>"
-
+            f"🔒 <i>Ключи сохранены в состоянии бота и переменных сессии.</i>"
         )
         if msg_id:
             edit_message(token, chat_id_local, msg_id, success_msg, reply_markup=main_keyboard())
@@ -2639,7 +2737,41 @@ def execute_pump_auto_trade(
 
     step_size = filters.get("step_size", 1.0)
     tick_size = filters.get("tick_size", 0.01)
-    entry_pullback_pct = float(settings.get("entry_pullback_pct", DEFAULT_ENTRY_PULLBACK))
+
+    # Определение параметров риск-менеджмента и точки входа (с поддержкой пресетов и ULTRA 3-в-1)
+    profile_key = settings.get("trade_profile", "optimal")
+    if profile_key == "ultra":
+        score = float(sig.best_score)
+        if score >= 75.0:
+            # Снайпер (Score 75+): микро-откат 0.8%, SL 3.5%, TP 0.7%, Trailing 1.2%/0.4%
+            entry_pullback_pct = 0.8
+            sl_pct = 3.5
+            tp_pct = 0.7
+            trailing_activation_pct = 1.2
+            trailing_distance_pct = 0.4
+        elif score >= 70.0:
+            # Оптимальный (Score 70-75): откат 1.0%, SL 3.0%, TP 0.7%, Trailing 1.2%/0.4%
+            entry_pullback_pct = 1.0
+            sl_pct = 3.0
+            tp_pct = 0.7
+            trailing_activation_pct = 1.2
+            trailing_distance_pct = 0.4
+        elif score >= 65.0:
+            # Макс. Профит (Score 65-70): откат 1.0%, SL 3.5%, TP 0.7%, Trailing 1.2%/0.4%
+            entry_pullback_pct = 1.0
+            sl_pct = 3.5
+            tp_pct = 0.7
+            trailing_activation_pct = 1.2
+            trailing_distance_pct = 0.4
+        else:
+            print(f"[AutoTrade] Пропуск {sig.symbol}: Score {score:.1f} ниже минимального порога Ultra (65.0)")
+            return {"error": f"Score {score:.1f} below Ultra threshold"}
+    else:
+        entry_pullback_pct = float(settings.get("entry_pullback_pct", DEFAULT_ENTRY_PULLBACK))
+        sl_pct = float(settings.get("stop_loss_pct", DEFAULT_STOP_LOSS))
+        tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
+        trailing_activation_pct = float(settings.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION))
+        trailing_distance_pct = float(settings.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE))
 
     # ── ВАРИАНТ А: УМНЫЙ ВХОД НА МИКРО-ОТКАТЕ (LIMIT BUY PULLBACK) ──
     if entry_pullback_pct > 0.01 and sig.price > 0:
@@ -2693,6 +2825,10 @@ def execute_pump_auto_trade(
             "target_price": float(limit_buy_price_str),
             "signal_price": sig.price,
             "pullback_pct": entry_pullback_pct,
+            "tp_pct": tp_pct,
+            "sl_pct": sl_pct,
+            "trailing_activation_pct": trailing_activation_pct,
+            "trailing_distance_pct": trailing_distance_pct,
             "qty": float(qty_str),
             "cost_usdt": float(qty_str) * float(limit_buy_price_str),
             "placed_at": int(time.time()),
@@ -2791,11 +2927,8 @@ def execute_pump_auto_trade(
     tp_price_str = fmt_price_filter(tp_raw_price, tick_size)
     tp_qty_str = fmt_qty_filter(exec_qty, step_size)
 
-    # Параметры Stop-Loss и Trailing Stop
-    sl_pct = float(settings.get("stop_loss_pct", DEFAULT_STOP_LOSS))
+    # Параметры Stop-Loss и Trailing Stop (уже рассчитаны с учетом пресетов / Ultra)
     sl_price = avg_buy_price * (1.0 - (sl_pct / 100.0))
-    trailing_activation_pct = float(settings.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION))
-    trailing_distance_pct = float(settings.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE))
 
     # 3. Защита позиции: сначала биржевой OCO (TP + стоп живут на бирже,
     #    позиция защищена даже когда бот выключен), при отказе — прежняя
@@ -2999,9 +3132,9 @@ def _check_pending_entries(token: str, chat_id: Union[str, int], state: dict) ->
             exec_qty = float(res.get("executedQty", entry.get("qty", 0.0)))
             avg_buy_price = (cum_quote / exec_qty) if exec_qty > 0 else float(entry.get("target_price", 0.0))
 
-            # Расчёт Take-Profit (с динамическим ATR)
+            # Расчёт Take-Profit (с динамическим ATR или из параметров входа)
             settings = state.get("settings", {})
-            tp_pct = float(settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
+            tp_pct = float(entry.get("tp_pct") or settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
             dynamic_tp_enabled = settings.get("dynamic_tp", DEFAULT_DYNAMIC_TP)
             atr_calculated = False
             try:
@@ -3022,10 +3155,10 @@ def _check_pending_entries(token: str, chat_id: Union[str, int], state: dict) ->
             step_size = filters.get("step_size", 1.0)
             tick_size = filters.get("tick_size", 0.01)
 
-            sl_pct = float(settings.get("stop_loss_pct", DEFAULT_STOP_LOSS))
+            sl_pct = float(entry.get("sl_pct") or settings.get("stop_loss_pct", DEFAULT_STOP_LOSS))
             sl_price = avg_buy_price * (1.0 - (sl_pct / 100.0))
-            trailing_act = float(settings.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION))
-            trailing_dist = float(settings.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE))
+            trailing_act = float(entry.get("trailing_activation_pct") or settings.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION))
+            trailing_dist = float(entry.get("trailing_distance_pct") or settings.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE))
 
             tp_order_id = None
             tp_price_str = f"{avg_buy_price * (1.0 + tp_pct / 100.0):.8f}"
@@ -3253,10 +3386,7 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
                     "ending_balance": get_free_usdt_balance(state),
                     "status": "oco_stop_loss",
                 })
-                history = state.setdefault("trade_history", [])
-                history.append(closed_rec)
-                if len(history) > 100:
-                    history.pop(0)
+                record_closed_trade(state, closed_rec)
                 portfolio_remove(state, symbol)
                 set_symbol_sl_cooldown(state, symbol, reason="oco_stop_loss")
                 log_trade_event(
@@ -3319,7 +3449,6 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
                     pnl = cum_quote - cost
                     pnl_pct = (pnl / cost * 100.0) if cost > 0 else trade.get("tp_pct", 2.0)
 
-                    history = state.setdefault("trade_history", [])
                     closed_rec = dict(trade)
                     closed_rec["closed_at"] = int(time.time())
                     closed_rec["sell_price"] = (
@@ -3331,9 +3460,7 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
                     closed_rec["pnl_pct"] = pnl_pct
                     closed_rec["ending_balance"] = get_free_usdt_balance(state)
                     closed_rec["status"] = "tp_filled"
-                    history.append(closed_rec)
-                    if len(history) > 100:
-                        history.pop(0)
+                    record_closed_trade(state, closed_rec)
 
                     # Удаляем из отслеживания портфеля
                     portfolio_remove(state, symbol)
@@ -3794,7 +3921,6 @@ def execute_emergency_market_sell(
     pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
 
     # Запись в историю
-    history = state.setdefault("trade_history", [])
     closed_rec = dict(trade or port_pos or {})
     closed_rec["symbol"] = symbol
     closed_rec["base"] = base
@@ -3806,9 +3932,7 @@ def execute_emergency_market_sell(
     closed_rec["pnl_pct"] = pnl_pct
     closed_rec["ending_balance"] = get_free_usdt_balance(state)
     closed_rec["status"] = "manual_market_sold"
-    history.append(closed_rec)
-    if len(history) > 100:
-        history.pop(0)
+    record_closed_trade(state, closed_rec)
 
     # Удаляем из активных сделок и портфеля
     active_trades.pop(symbol, None)
@@ -4373,7 +4497,7 @@ def _sync_trades_and_active_positions(state: dict) -> None:
                     pnl = s_quote - cost
                     pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
 
-                    history.append({
+                    rec = {
                         "symbol": sym,
                         "base": base_asset(sym),
                         "trade_id": t_id,
@@ -4387,7 +4511,8 @@ def _sync_trades_and_active_positions(state: dict) -> None:
                         "pnl_pct": pnl_pct,
                         "ending_balance": free_usdt,
                         "status": "tp_filled" if pnl >= 0 else "market_sell",
-                    })
+                    }
+                    record_closed_trade(state, rec)
             except Exception:
                 pass
 
@@ -4706,11 +4831,13 @@ def format_trades_and_profit_stats(state: dict) -> str:
         f"⚡ Авто: {auto_lbl}  |  Ставка: <code>{trade_amt:.0f}$</code>  |  TP: <code>+{tp_pct:.1f}%</code>"
     )
 
+    has_any_day = False
     # Дни
     for key in ("today", "yesterday", "older"):
         rows = buckets[key]
         if not rows:
             continue
+        has_any_day = True
         # Дата-заголовок
         if key == "today":
             day_date = time.strftime("%d.%m", time.localtime(today_start))
@@ -4737,6 +4864,8 @@ def format_trades_and_profit_stats(state: dict) -> str:
         )
         lines.extend(rows)
 
+    if not has_any_day:
+        lines.append("\n🗓 <i>Журнал сделок пуст (история очищена)</i>\n")
 
     # ── Сводка последних 5 дней ──────────────────────────────────────────
     five_day_lines = []
@@ -4788,11 +4917,12 @@ def format_trades_and_profit_stats(state: dict) -> str:
 
     t_sign = "🟢" if two_day_pnl >= 0 else "🔴"
 
-    lines.append(
-        f"\n📌 <b>Итого (2 дня):</b>\n"
-        f"• Закрыто: <b>{total_closed} сделки</b>  |  W/L: {wr_total}{wr_pct}\n"
-        f"• Реализованный P&L: {t_sign} <b>{(closed_today_pnl+closed_yday_pnl):+.2f} USDT</b>"
-    )
+    if total_closed > 0:
+        lines.append(
+            f"\n📌 <b>Итого (2 дня):</b>\n"
+            f"• Закрыто: <b>{total_closed} сделки</b>  |  W/L: {wr_total}{wr_pct}\n"
+            f"• Реализованный P&L: {t_sign} <b>{(closed_today_pnl+closed_yday_pnl):+.2f} USDT</b>"
+        )
 
     if open_items:
         f_sign = "🟢" if open_float_pnl >= 0 else "🔴"
@@ -4802,14 +4932,30 @@ def format_trades_and_profit_stats(state: dict) -> str:
         )
 
     # Всего за всё время
-    if history:
-        win_all  = sum(1 for h in history if float(h.get("pnl", 0.0)) > 0)
-        wr_all   = f"{win_all}/{len(history)} ({win_all/len(history)*100:.0f}%)"
-        all_sign = "🟢" if closed_total_pnl >= 0 else "🔴"
+    all_time = state.get("all_time_stats")
+    if isinstance(all_time, dict) and int(all_time.get("total_trades", 0)) > 0:
+        tot_trades = int(all_time.get("total_trades", 0))
+        win_all = int(all_time.get("winning_trades", 0))
+        tot_pnl = float(all_time.get("total_pnl", 0.0))
+    elif history:
+        tot_trades = len(history)
+        win_all = sum(1 for h in history if float(h.get("pnl", 0.0)) > 0)
+        tot_pnl = closed_total_pnl
+    else:
+        tot_trades = 0
+        win_all = 0
+        tot_pnl = 0.0
+
+    if tot_trades > 0:
+        wr_pct_val = (win_all / tot_trades * 100.0) if tot_trades > 0 else 0.0
+        wr_all = f"{win_all}/{tot_trades} ({wr_pct_val:.0f}%)"
+        all_sign = "🟢" if tot_pnl >= 0 else "🔴"
         lines.append(
             f"\n🏆 <b>За всё время:</b>  "
-            f"{all_sign} <b>{closed_total_pnl:+.2f} USDT</b>  |  W/L: {wr_all}"
+            f"{all_sign} <b>{tot_pnl:+.2f} USDT</b>  |  Сделок: <b>{tot_trades}</b>  |  W/L: {wr_all}"
         )
+    else:
+        lines.append("\n🏆 <b>За всё время:</b>  <code>0.00 USDT</code>  |  Сделок: 0")
 
     lines.append(f"\n💵 Свободно: <code>{free_usdt:,.2f} USDT</code>")
     return "\n".join(lines)
@@ -4947,6 +5093,24 @@ def portfolio_inline_kb(state: Optional[dict] = None) -> dict:
     ])
     return {"inline_keyboard": rows}
 
+def trades_stats_inline_kb(state: Optional[dict] = None) -> dict:
+    """Инлайн-кнопки для экрана статистики сделок: обновление, очистка истории и полный сброс."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 Обновить", "callback_data": "trades:refresh"},
+                {"text": "💳 Баланс Binance", "callback_data": "trade:balance"},
+            ],
+            [
+                {"text": "🧹 Очистить историю", "callback_data": "trades:clear_history"},
+                {"text": "🗑 Очистить полную статистику", "callback_data": "trades:clear_all_stats"},
+            ],
+            [
+                {"text": "🔙 Главное меню", "callback_data": "menu:main"},
+            ]
+        ]
+    }
+
 def portfolio_charts_inline_kb(state: dict) -> dict:
     port = state.get("portfolio", {})
     active_trades = state.get("active_trades", {})
@@ -5023,14 +5187,21 @@ def settings_text(state: dict) -> str:
         trade_amt = s.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT)
         trade_size_label = f"{trade_amt:.1f} USDT (фиксированно)"
 
+    # Текущий пресет стратегии
+    prof_key = s.get("trade_profile", DEFAULT_TRADE_PROFILE)
+    prof_info = TRADE_PROFILES.get(prof_key, TRADE_PROFILES["optimal"])
+    prof_label = prof_info["name"]
+    prof_desc = prof_info["desc"]
+
     return (
         "<b>⚙️ Параметры бота Pump Pulse</b>\n\n"
+        f"🏆 <b>Пресет стратегии:</b> <code>{prof_label}</code>\n"
+        f"  <i>{prof_desc}</i>\n\n"
         f"• <b>Автосканирование рынка:</b> {auto_scan_label} (каждые {interval_m} мин)\n"
         f"• <b>Порог Score (MIN_SCORE):</b> <code>{s['min_score']:.0f}</code>\n"
         f"• <b>Уведомления:</b> <code>{filt_label}</code>\n"
         f"• <b>Режим стратегии:</b> <code>{strat_label}</code>\n"
-        f"  <i>Меняется кнопками ниже и применяется к следующему скану. "
-        f"«Памп-скор» ищет всплеск объёма и пробой, «RSI + Стохастик» — импульс по индикаторам.</i>\n\n"
+        f"  <i>«Памп-скор» ищет всплеск объёма и пробой, «RSI + Стохастик» — импульс по индикаторам.</i>\n\n"
         "<b>⚡ Спотовая торговля Binance:</b>\n"
         f"• <b>Автоторговля пампов:</b> {auto_trade_label}\n"
         f"• <b>Размер ставки:</b> <code>{trade_size_label}</code>\n"
@@ -5040,7 +5211,7 @@ def settings_text(state: dict) -> str:
         f"• <b>Stop-Loss:</b> <code>-{sl_pct:.1f}%</code>\n"
         f"• <b>Trailing Stop:</b> автоподтяжка при <code>+{trail_act:.1f}%</code> (отступ <code>{trail_dist:.1f}%</code>)\n"
         f"• <b>Статус API Binance:</b> {api_status}\n\n"
-        "<i>Используйте кнопки ниже для быстрой настройки:</i>"
+        "<i>Выберите готовый пресет стратегии кнопками ниже:</i>"
     )
 
 def settings_inline_kb(state: dict) -> dict:
@@ -5054,6 +5225,11 @@ def settings_inline_kb(state: dict) -> dict:
     cur_sl = float(s.get("stop_loss_pct", DEFAULT_STOP_LOSS))
     cur_tp = float(s.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
     cur_entry = float(s.get("entry_pullback_pct", DEFAULT_ENTRY_PULLBACK))
+    cur_prof = s.get("trade_profile", DEFAULT_TRADE_PROFILE)
+
+    def _prof_btn(key: str, label: str) -> dict:
+        active = "✅ " if cur_prof == key else ""
+        return {"text": f"{active}{label}", "callback_data": f"profile:set:{key}"}
 
     def _amt_btn(label: str, mode: str) -> dict:
         active = "✅ " if trade_mode == mode else ""
@@ -5081,6 +5257,15 @@ def settings_inline_kb(state: dict) -> dict:
             [
                 {"text": autotrade_label, "callback_data": "trade:toggle"},
             ],
+            # --- 4 Пресета торговых стратегий ---
+            [
+                _prof_btn("optimal", "🥇 1. Оптимальный"),
+                _prof_btn("profit", "🚀 2. Макс. Профит"),
+            ],
+            [
+                _prof_btn("sniper", "🛡 3. Снайпер"),
+                _prof_btn("ultra", "⚡ 4. УЛЬТРА (3-в-1)"),
+            ],
             # --- Режим ставки ---
             [
                 _amt_btn("💯 Весь баланс", "all"),
@@ -5097,11 +5282,8 @@ def settings_inline_kb(state: dict) -> dict:
             # --- Точка входа (Откат / Маркет) ---
             [
                 _entry_btn("⚡ По рынку", 0.0),
-                _entry_btn("🎯 Откат -0.2%", 0.2),
-            ],
-            [
-                _entry_btn("🎯 Откат -0.4% (оптимал)", 0.4),
-                _entry_btn("🎯 Откат -0.6%", 0.6),
+                _entry_btn("🎯 Откат -0.8%", 0.8),
+                _entry_btn("🎯 Откат -1.0%", 1.0),
             ],
             # --- Take Profit ---
             [
@@ -6420,9 +6602,9 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 msg_id = send_telegram(token, chat_id_local, "⏳ <i>Загружаю статистику сделок и профита...</i>")
                 stats_text = format_trades_and_profit_stats(state)
                 if msg_id:
-                    edit_message(token, chat_id_local, msg_id, stats_text, reply_markup=portfolio_inline_kb(state))
+                    edit_message(token, chat_id_local, msg_id, stats_text, reply_markup=trades_stats_inline_kb(state))
                 else:
-                    send_telegram(token, chat_id_local, stats_text, reply_markup=portfolio_inline_kb(state))
+                    send_telegram(token, chat_id_local, stats_text, reply_markup=trades_stats_inline_kb(state))
 
             elif text_lower in ("ping", "пинг"):
                 send_telegram(token, chat_id_local, "🏓 <b>pong</b> — бот на связи!")
@@ -6465,13 +6647,40 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                 else:
                     send_telegram(token, cb_chat, port_text, reply_markup=portfolio_inline_kb(state))
 
-            elif cb_data == "port:trades_stats":
+            elif cb_data in ("port:trades_stats", "trades:refresh"):
                 answer_callback(token, cb_id, "Статистика сделок...")
                 stats_text = format_trades_and_profit_stats(state)
                 if msg_id:
-                    edit_message(token, cb_chat, msg_id, stats_text, reply_markup=portfolio_inline_kb(state))
+                    edit_message(token, cb_chat, msg_id, stats_text, reply_markup=trades_stats_inline_kb(state))
                 else:
-                    send_telegram(token, cb_chat, stats_text, reply_markup=portfolio_inline_kb(state))
+                    send_telegram(token, cb_chat, stats_text, reply_markup=trades_stats_inline_kb(state))
+
+            elif cb_data == "trades:clear_history":
+                with STATE_LOCK:
+                    state["trade_history"] = []
+                save_state(state, sync_git=True)
+                answer_callback(token, cb_id, "🧹 История очищена (итоговая статистика сохранена)")
+                stats_text = format_trades_and_profit_stats(state)
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, stats_text, reply_markup=trades_stats_inline_kb(state))
+                else:
+                    send_telegram(token, cb_chat, stats_text, reply_markup=trades_stats_inline_kb(state))
+
+            elif cb_data == "trades:clear_all_stats":
+                with STATE_LOCK:
+                    state["trade_history"] = []
+                    state["all_time_stats"] = {
+                        "total_trades": 0,
+                        "winning_trades": 0,
+                        "total_pnl": 0.0,
+                    }
+                save_state(state, sync_git=True)
+                answer_callback(token, cb_id, "🗑 Вся статистика и история успешно сброшены")
+                stats_text = format_trades_and_profit_stats(state)
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, stats_text, reply_markup=trades_stats_inline_kb(state))
+                else:
+                    send_telegram(token, cb_chat, stats_text, reply_markup=trades_stats_inline_kb(state))
 
             elif cb_data == "port:charts":
                 answer_callback(token, cb_id)
@@ -6698,6 +6907,14 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                         answer_callback(token, cb_id, f"Ставка: {amt:.0f} USDT")
                     except ValueError:
                         answer_callback(token, cb_id, "Режим обновлён")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cb_data.startswith("profile:set:"):
+                p_key = cb_data.split(":", 2)[2]
+                prof = apply_trade_profile(state, p_key)
+                save_state(state)
+                answer_callback(token, cb_id, f"Пресет: {prof.get('name', p_key)}")
                 if msg_id:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 

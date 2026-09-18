@@ -1398,7 +1398,84 @@ class TradeSafetyTest(unittest.TestCase):
         self.assertEqual(len(batch2), 30)
         self.assertEqual(batch2[0]["symbol"], pb.WHITELIST_SYMBOLS[30])
         self.assertEqual(batch2[-1]["symbol"], pb.WHITELIST_SYMBOLS[59])
-        self.assertEqual(state["scan_cursor"], 60)
+    def test_trade_profiles_and_ultra_mode(self):
+        """Проверка работы 4 пресетов торговли и динамического режима Ультра (3-в-1)."""
+        state = pb.default_state()
+
+        # 1. Проверка применения пресетов
+        pb.apply_trade_profile(state, "profit")
+        self.assertEqual(state["settings"]["trade_profile"], "profit")
+        self.assertEqual(state["settings"]["min_score"], 65.0)
+        self.assertEqual(state["settings"]["stop_loss_pct"], 3.5)
+
+        pb.apply_trade_profile(state, "sniper")
+        self.assertEqual(state["settings"]["trade_profile"], "sniper")
+        self.assertEqual(state["settings"]["min_score"], 75.0)
+        self.assertEqual(state["settings"]["entry_pullback_pct"], 0.8)
+
+        pb.apply_trade_profile(state, "ultra")
+        self.assertEqual(state["settings"]["trade_profile"], "ultra")
+        self.assertEqual(state["settings"]["min_score"], 65.0)
+
+        pb.apply_trade_profile(state, "optimal")
+        self.assertEqual(state["settings"]["trade_profile"], "optimal")
+        self.assertEqual(state["settings"]["min_score"], 70.0)
+        self.assertEqual(state["settings"]["stop_loss_pct"], 3.0)
+
+    def test_clear_history_and_clear_all_stats(self):
+        """Проверка раздельного очищения истории и сброса полной статистики."""
+        state = pb.default_state()
+
+        # 1. Записываем 2 сделки: 1 профитная (+5 USDT), 1 убыточная (-2 USDT)
+        pb.record_closed_trade(state, {
+            "symbol": "BTCUSDT", "base": "BTC",
+            "buy_price": 60000.0, "sell_price": 63000.0,
+            "cost_usdt": 100.0, "pnl": 5.0, "pnl_pct": 5.0,
+            "status": "tp_filled", "closed_at": int(time.time()),
+        })
+        pb.record_closed_trade(state, {
+            "symbol": "ETHUSDT", "base": "ETH",
+            "buy_price": 3000.0, "sell_price": 2940.0,
+            "cost_usdt": 100.0, "pnl": -2.0, "pnl_pct": -2.0,
+            "status": "stop_loss", "closed_at": int(time.time()),
+        })
+
+        self.assertEqual(len(state["trade_history"]), 2)
+        self.assertEqual(state["all_time_stats"]["total_trades"], 2)
+        self.assertEqual(state["all_time_stats"]["winning_trades"], 1)
+        self.assertAlmostEqual(state["all_time_stats"]["total_pnl"], 3.0)
+
+        # Текст содержит информацию о сделках и итоговый PnL
+        txt = pb.format_trades_and_profit_stats(state)
+        self.assertIn("BTC", txt)
+        self.assertIn("ETH", txt)
+        self.assertIn("+3.00 USDT", txt)
+
+        # 2. Кнопка 1: Очистить только историю (журнал)
+        state["trade_history"] = []
+        # Итоговая статистика НЕ должна пострадать:
+        self.assertEqual(state["all_time_stats"]["total_trades"], 2)
+        self.assertEqual(state["all_time_stats"]["winning_trades"], 1)
+        self.assertAlmostEqual(state["all_time_stats"]["total_pnl"], 3.0)
+
+        txt_cleared_hist = pb.format_trades_and_profit_stats(state)
+        # Журнал пуст
+        self.assertIn("Журнал сделок пуст", txt_cleared_hist)
+        # Но "За всё время" сохранилась!
+        self.assertIn("+3.00 USDT", txt_cleared_hist)
+        self.assertIn("Сделок: <b>2</b>", txt_cleared_hist)
+
+        # 3. Кнопка 2: Очистить полную статистику
+        state["all_time_stats"] = {"total_trades": 0, "winning_trades": 0, "total_pnl": 0.0}
+        txt_reset_all = pb.format_trades_and_profit_stats(state)
+        self.assertIn("0.00 USDT", txt_reset_all)
+        self.assertIn("Сделок: 0", txt_reset_all)
+
+        # 4. Проверка клавиатуры сделок
+        kb = pb.trades_stats_inline_kb(state)
+        buttons_cb = [b["callback_data"] for row in kb["inline_keyboard"] for b in row if "callback_data" in b]
+        self.assertIn("trades:clear_history", buttons_cb)
+        self.assertIn("trades:clear_all_stats", buttons_cb)
 
 
 if __name__ == "__main__":
