@@ -2296,6 +2296,10 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
             tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{pair}"
             binance_url = f"https://www.binance.com/en/trade/{asset}_USDT?type=spot"
 
+            # Авто-регистрация позиции в portfolio, если ее там еще нет и val_usdt >= 1.0
+            if state is not None and val_usdt >= 1.0 and pair not in active_trades and pair not in portfolio:
+                portfolio_add(state, pair, tot_qty, price)
+
             # Определяем цену входа из активных сделок бота или портфеля
             trade_rec = active_trades.get(pair)
             port_rec = portfolio.get(pair)
@@ -2316,11 +2320,41 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
                 total_tracked_cost += cost
                 total_tracked_val += val_usdt
 
-                if trade_rec and float(trade_rec.get("tp_price", 0.0)) > 0:
-                    tp_p = float(trade_rec["tp_price"])
-                    tp_id = trade_rec.get("tp_order_id")
-                    tp_order_tag = f" [Ордер #{tp_id}]" if tp_id else ""
-                    pnl_block.append(f"   ├ 🎯 <b>Тейк-профит:</b> <code>{fmt_price(tp_p)} $</code> (+{((tp_p - buy_price)/buy_price*100):.1f}%){tp_order_tag}")
+            # Расчет и отображение целевой цены продажи (Take-Profit) и Stop-Loss
+            tp_p = 0.0
+            tp_id = None
+            if trade_rec and float(trade_rec.get("tp_price", 0.0)) > 0:
+                tp_p = float(trade_rec["tp_price"])
+                tp_id = trade_rec.get("tp_order_id")
+            elif port_rec and float(port_rec.get("tp_price", 0.0)) > 0:
+                tp_p = float(port_rec["tp_price"])
+                tp_id = port_rec.get("tp_order_id")
+            elif buy_price > 0:
+                tp_p = buy_price * (1.0 + DEFAULT_TAKE_PROFIT / 100.0)
+            elif price > 0:
+                tp_p = price * (1.0 + DEFAULT_TAKE_PROFIT / 100.0)
+
+            if tp_p > 0:
+                tp_order_tag = f" [Ордер #{tp_id}]" if tp_id else (" [В TP-ордере]" if lock_qty > 0.000001 else "")
+                ref_base_p = buy_price if buy_price > 0 else price
+                tp_gain_pct = ((tp_p - ref_base_p) / ref_base_p * 100.0) if ref_base_p > 0 else 0.0
+                dist_to_tp = ((tp_p - price) / price * 100.0) if price > 0 else 0.0
+                dist_str = f" (до цели: {dist_to_tp:+.1f}%)" if abs(dist_to_tp) > 0.01 else ""
+                pnl_block.append(f"   ├ 🎯 <b>Цена продажи (TP):</b> <code>{fmt_price(tp_p)} $</code> ({tp_gain_pct:+.1f}%){tp_order_tag}{dist_str}")
+
+            sl_p = 0.0
+            if trade_rec and float(trade_rec.get("sl_price", 0.0)) > 0:
+                sl_p = float(trade_rec["sl_price"])
+            elif port_rec and float(port_rec.get("sl_price", 0.0)) > 0:
+                sl_p = float(port_rec["sl_price"])
+            elif buy_price > 0:
+                sl_p = buy_price * (1.0 - DEFAULT_STOP_LOSS / 100.0)
+
+            if sl_p > 0:
+                ref_base_p = buy_price if buy_price > 0 else price
+                sl_loss_pct = ((sl_p - ref_base_p) / ref_base_p * 100.0) if ref_base_p > 0 else 0.0
+                dist_to_sl = ((sl_p - price) / price * 100.0) if price > 0 else 0.0
+                pnl_block.append(f"   ├ 🛡️ <b>Стоп-лосс (SL):</b> <code>{fmt_price(sl_p)} $</code> ({sl_loss_pct:+.1f}%) (до стопа: {dist_to_sl:+.1f}%)")
 
             pnl_str = ("\n" + "\n".join(pnl_block)) if pnl_block else ""
 
@@ -2359,18 +2393,32 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
 
 
 def balance_inline_kb(state: Optional[dict] = None) -> dict:
-    """Inline-клавиатура для экрана баланса: обновление + очистка пыли."""
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🔄 Обновить баланс", "callback_data": "balance:refresh"},
-                {"text": "🧹 Очистить пыль", "callback_data": "balance:clean_dust"},
-            ],
-            [
-                {"text": "📊 Сделки и Профит", "callback_data": "port:trades_stats"},
-            ],
+    """Inline-клавиатура для экрана баланса: обновление, быстрые продажи и меню."""
+    kb_rows = [
+        [
+            {"text": "🔄 Обновить баланс", "callback_data": "balance:refresh"},
+            {"text": "🧹 Очистить пыль", "callback_data": "balance:clean_dust"},
         ]
-    }
+    ]
+
+    if state:
+        active_trades = state.get("active_trades", {})
+        portfolio = state.get("portfolio", {})
+        held_symbols = sorted(set(list(active_trades.keys()) + list(portfolio.keys())))
+        sell_buttons = []
+        for sym in held_symbols:
+            base = base_asset(sym)
+            sell_buttons.append({"text": f"🔴 Продать {base} (рынок)", "callback_data": f"sell_prompt:{sym}"})
+
+        for i in range(0, len(sell_buttons), 2):
+            kb_rows.append(sell_buttons[i:i+2])
+
+    kb_rows.append([
+        {"text": "🎯 Выставить TP цель", "callback_data": "port:targetsell_menu"},
+        {"text": "📊 Сделки и Профит", "callback_data": "port:trades_stats"},
+    ])
+
+    return {"inline_keyboard": kb_rows}
 
 
 def get_dust_assets(state: dict, min_usdt: float = 1.0) -> list:

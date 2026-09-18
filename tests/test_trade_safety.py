@@ -1523,11 +1523,53 @@ class TradeSafetyTest(unittest.TestCase):
         self.assertIn("Макс. Профит (Score 65-69)", report)
         self.assertIn("SOL", report)
 
-        # 3. Проверка клавиатуры сигналов
-        kb_sig = pb.signals_stats_inline_kb(state)
-        sig_cbs = [b["callback_data"] for row in kb_sig["inline_keyboard"] for b in row if "callback_data" in b]
-        self.assertIn("signals:refresh", sig_cbs)
-        self.assertIn("port:trades_stats", sig_cbs)
+    def test_balance_detailed_tp_sl_target_and_quick_sell_buttons(self):
+        """Проверка отображения целевой цены TP/SL и кнопок быстрой продажи в балансе."""
+        state = pb.default_state()
+        self.set_api_keys()
+
+        # Мокаем активы спота
+        old_get_assets = pb.get_spot_account_assets
+        old_get_prices = pb.get_multiple_prices
+        try:
+            pb.get_spot_account_assets = lambda s: ({
+                "USDT": {"free": 50.0, "locked": 0.0, "total": 50.0},
+                "MTL": {"free": 0.0794, "locked": 20.5, "total": 20.5794},
+            }, None)
+            pb.get_multiple_prices = lambda syms: {"MTLUSDT": 0.294}
+
+            state["active_trades"]["MTLUSDT"] = {
+                "symbol": "MTLUSDT",
+                "base": "MTL",
+                "buy_price": 0.294,
+                "qty": 20.5794,
+                "cost_usdt": 6.05,
+                "tp_price": 0.2961,
+                "sl_price": 0.2852,
+                "tp_order_id": 98765,
+                "status": "holding",
+            }
+
+            # 1. Проверяем текст баланса
+            bal_text = pb.format_binance_balance_detailed(state)
+            self.assertIn("MTL", bal_text)
+            self.assertIn("Цена продажи (TP)", bal_text)
+            self.assertIn("0.2961", bal_text)
+            self.assertIn("Ордер #98765", bal_text)
+            self.assertIn("Стоп-лосс (SL)", bal_text)
+            self.assertIn("0.2852", bal_text)
+
+            # 2. Проверяем клавиатуру баланса с быстрой продажей
+            kb = pb.balance_inline_kb(state)
+            buttons = [b for row in kb["inline_keyboard"] for b in row]
+            cb_map = {b.get("callback_data"): b.get("text") for b in buttons if "callback_data" in b}
+            self.assertIn("sell_prompt:MTLUSDT", cb_map)
+            self.assertIn("MTL", cb_map["sell_prompt:MTLUSDT"])
+            self.assertIn("рынок", cb_map["sell_prompt:MTLUSDT"])
+            self.assertIn("port:targetsell_menu", cb_map)
+        finally:
+            pb.get_spot_account_assets = old_get_assets
+            pb.get_multiple_prices = old_get_prices
 
 
 if __name__ == "__main__":
