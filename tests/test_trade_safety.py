@@ -1476,6 +1476,58 @@ class TradeSafetyTest(unittest.TestCase):
         buttons_cb = [b["callback_data"] for row in kb["inline_keyboard"] for b in row if "callback_data" in b]
         self.assertIn("trades:clear_history", buttons_cb)
         self.assertIn("trades:clear_all_stats", buttons_cb)
+        self.assertIn("signals:stats", buttons_cb)
+
+    def test_signals_history_and_weekly_stats(self):
+        """Проверка накопления и форматирования статистики сигналов за неделю (7 дней)."""
+        state = pb.default_state()
+
+        # 1. Записываем тестовые сигналы разных уровней
+        sig_sniper = pb.PumpSignal(
+            symbol="BTCUSDT", base="BTC", price=65000.0,
+            change_24h=5.2, quote_volume_24h=10000000.0,
+            high_24h=66000.0, low_24h=64000.0, btc_relative_24h=0.0,
+            best_tf="5m", best_score=78.5, grade="strong",
+            alert_key="BTCUSDT_test_1", by_tf=[],
+        )
+        sig_opt = pb.PumpSignal(
+            symbol="ETHUSDT", base="ETH", price=3200.0,
+            change_24h=3.1, quote_volume_24h=8000000.0,
+            high_24h=3250.0, low_24h=3150.0, btc_relative_24h=1.0,
+            best_tf="5m", best_score=72.0, grade="strong",
+            alert_key="ETHUSDT_test_2", by_tf=[],
+        )
+        sig_prof = pb.PumpSignal(
+            symbol="SOLUSDT", base="SOL", price=150.0,
+            change_24h=8.4, quote_volume_24h=5000000.0,
+            high_24h=152.0, low_24h=140.0, btc_relative_24h=2.5,
+            best_tf="15m", best_score=67.0, grade="watch",
+            alert_key="SOLUSDT_test_3", by_tf=[],
+        )
+
+        pb.record_signal_history(state, sig_sniper)
+        pb.record_signal_history(state, sig_opt)
+        pb.record_signal_history(state, sig_prof)
+
+        self.assertEqual(len(state["signals_history"]), 3)
+        self.assertEqual(state["signals_history"][0]["strategy_tier"], "sniper")
+        self.assertEqual(state["signals_history"][1]["strategy_tier"], "optimal")
+        self.assertEqual(state["signals_history"][2]["strategy_tier"], "profit")
+
+        # 2. Проверка текста отчёта за 7 дней
+        report = pb.format_signals_stats(state, days=7)
+        self.assertIn("Статистика сигналов за последние 7 дней", report)
+        self.assertIn("3 шт.</code>", report)
+        self.assertIn("Снайпер (Score ≥ 75)", report)
+        self.assertIn("Оптимальный (Score 70-74)", report)
+        self.assertIn("Макс. Профит (Score 65-69)", report)
+        self.assertIn("SOL", report)
+
+        # 3. Проверка клавиатуры сигналов
+        kb_sig = pb.signals_stats_inline_kb(state)
+        sig_cbs = [b["callback_data"] for row in kb_sig["inline_keyboard"] for b in row if "callback_data" in b]
+        self.assertIn("signals:refresh", sig_cbs)
+        self.assertIn("port:trades_stats", sig_cbs)
 
 
 if __name__ == "__main__":

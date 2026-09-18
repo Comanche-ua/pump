@@ -1,4 +1,4 @@
-﻿name: Telegram Pump Bot 24/7
+name: Telegram Pump Bot 24/7
 
 on:
   schedule:
@@ -37,6 +37,9 @@ jobs:
           BINANCE_PROXY: ${{ secrets.BINANCE_PROXY }}
           BINANCE_TRADE_URL: ${{ secrets.BINANCE_TRADE_URL }}
           RUN_MODE: bot
+          AUTO_TRADE: "true"
+          TRADE_PROFILE: "ultra"
+          TRADE_MODE: "all"
         run: python pump_bot.py --bot
 
       - name: Save portfolio state
