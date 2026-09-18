@@ -73,6 +73,11 @@ class TradeSafetyTest(unittest.TestCase):
         pb.get_multiple_prices = lambda syms: {s: self.price for s in syms}
         pb._symbol_filters_cache.clear()
         pb._symbol_filters_cache_at.clear()
+        # Ключи Binance бот берёт ТОЛЬКО из окружения (GitHub Secrets):
+        # state["settings"] их больше не задаёт. По умолчанию ключей нет —
+        # тесты, которым они нужны, зовут self.set_api_keys().
+        self._old_env = {k: os.environ.get(k) for k in ("BINANCE_API_KEY", "BINANCE_API_SECRET")}
+        self.clear_api_keys()
 
     def tearDown(self):
         pb.STATE_FILE = self._old_state_file
@@ -82,10 +87,24 @@ class TradeSafetyTest(unittest.TestCase):
         pb.get_symbol_filters = self._old_filters
         pb.fetch_klines = self._old_fetch
         pb.execute_emergency_market_sell = self._old_emergency
+        for _k, _v in self._old_env.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
         if os.path.exists(self.tmp.name):
             os.unlink(self.tmp.name)
         if os.path.exists(self.tmp.name + ".tmp"):
             os.unlink(self.tmp.name + ".tmp")
+
+    def set_api_keys(self, key="TESTAPIKEY", secret="TESTAPISECRET"):
+        """Подставляет пару ключей в окружение — ровно так, как это делают GitHub Secrets."""
+        os.environ["BINANCE_API_KEY"] = key
+        os.environ["BINANCE_API_SECRET"] = secret
+
+    def clear_api_keys(self):
+        os.environ.pop("BINANCE_API_KEY", None)
+        os.environ.pop("BINANCE_API_SECRET", None)
 
     # ── состояние ──────────────────────────────────────────────
 
@@ -180,8 +199,7 @@ class TradeSafetyTest(unittest.TestCase):
         state["settings"]["trade_mode"] = "fixed"
         state["settings"]["trade_amount_usdt"] = 11.0
         state["pending_entries"]["OTHERUSDT"] = {"order_id": 1}
-        state["settings"]["binance_api_key"] = "k"
-        state["settings"]["binance_api_secret"] = "s"
+        self.set_api_keys()
         sig = pb.PumpSignal(
             symbol="NEWUSDT", base="NEW", price=1.0, change_24h=1.0,
             quote_volume_24h=2_000_000.0, high_24h=1.01, low_24h=0.99,
@@ -196,8 +214,7 @@ class TradeSafetyTest(unittest.TestCase):
     def test_reconcile_detects_filled_pending_entry(self):
         """Исполненный во время простоя лимитный вход обязан стать видимым."""
         state = pb.default_state()
-        state["settings"]["binance_api_key"] = "k"
-        state["settings"]["binance_api_secret"] = "s"
+        self.set_api_keys()
         state["pending_entries"]["TESTUSDT"] = {"order_id": 777}
         pb.binance_signed_request = lambda m, p, params, **kw: {"status": "FILLED"}
 
@@ -209,8 +226,7 @@ class TradeSafetyTest(unittest.TestCase):
     def test_reconcile_drops_canceled_pending_entry(self):
         """Отменённый лимитный вход убирается из ожидания."""
         state = pb.default_state()
-        state["settings"]["binance_api_key"] = "k"
-        state["settings"]["binance_api_secret"] = "s"
+        self.set_api_keys()
         state["pending_entries"]["TESTUSDT"] = {"order_id": 777}
         pb.binance_signed_request = lambda m, p, params, **kw: {"status": "CANCELED"}
 
@@ -221,8 +237,7 @@ class TradeSafetyTest(unittest.TestCase):
     def test_reconcile_keeps_pending_entry_on_network_error(self):
         """Ошибка сети не должна удалять запись о живом ордере."""
         state = pb.default_state()
-        state["settings"]["binance_api_key"] = "k"
-        state["settings"]["binance_api_secret"] = "s"
+        self.set_api_keys()
         state["pending_entries"]["TESTUSDT"] = {"order_id": 777}
         pb.binance_signed_request = lambda m, p, params, **kw: {"error": "timeout"}
 
@@ -336,7 +351,7 @@ class TradeSafetyTest(unittest.TestCase):
         параллельный запуск затирал бы свежие данные чужой копией.
         """
         state = pb.default_state()
-        state["settings"].update({"binance_api_key": "k", "binance_api_secret": "s"})
+        self.set_api_keys()
         calls = []
         pb.binance_signed_request = lambda m, e, p, **kw: calls.append(e) or {}
 
@@ -416,7 +431,7 @@ class TradeSafetyTest(unittest.TestCase):
             return {}
 
         pb.binance_signed_request = fake
-        state["settings"].update({"binance_api_key": "k", "binance_api_secret": "s"})
+        self.set_api_keys()
         pb.sync_trades_and_active_positions(state)
 
     def test_sync_keeps_tp_order_id_when_open_orders_fail(self):
@@ -532,7 +547,7 @@ class TradeSafetyTest(unittest.TestCase):
         """
         state = pb.default_state()
         state["pending_entries"]["TESTUSDT"] = self._pending_entry()
-        state["settings"].update({"binance_api_key": "k", "binance_api_secret": "s"})
+        self.set_api_keys()
         pb.get_symbol_filters = lambda sym: {"step_size": 0.001, "tick_size": 0.01,
                                              "min_notional": 5.0, "status": "TRADING"}
         pb.fetch_klines = lambda *a, **kw: []
@@ -568,7 +583,7 @@ class TradeSafetyTest(unittest.TestCase):
         """
         state = pb.default_state()
         state["pending_entries"]["TESTUSDT"] = self._pending_entry()
-        state["settings"].update({"binance_api_key": "k", "binance_api_secret": "s"})
+        self.set_api_keys()
 
         def fake(method, endpoint, params=None, **kw):
             if method == "DELETE":
@@ -1366,9 +1381,29 @@ class TradeSafetyTest(unittest.TestCase):
         self.assertEqual(k, "my_key_1234567890123456")
         self.assertEqual(s, "my_secret_with_equals====")
 
+    def test_whitelist_batch_round_robin(self):
+        """Проверка циклического батчинга по 30 пар из whitelist."""
+        mock_tickers = [{"symbol": s, "quoteVolume": 5000000.0, "priceChangePercent": 1.0} for s in pb.WHITELIST_SYMBOLS[:100]]
+        state = pb.default_state()
+
+        # Батч 1 (первые 30)
+        batch1 = pb.pick_candidates(mock_tickers, batch_size=30, state=state)
+        self.assertEqual(len(batch1), 30)
+        self.assertEqual(batch1[0]["symbol"], pb.WHITELIST_SYMBOLS[0])
+        self.assertEqual(batch1[-1]["symbol"], pb.WHITELIST_SYMBOLS[29])
+        self.assertEqual(state["scan_cursor"], 30)
+
+        # Батч 2 (следующие 30)
+        batch2 = pb.pick_candidates(mock_tickers, batch_size=30, state=state)
+        self.assertEqual(len(batch2), 30)
+        self.assertEqual(batch2[0]["symbol"], pb.WHITELIST_SYMBOLS[30])
+        self.assertEqual(batch2[-1]["symbol"], pb.WHITELIST_SYMBOLS[59])
+        self.assertEqual(state["scan_cursor"], 60)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
 

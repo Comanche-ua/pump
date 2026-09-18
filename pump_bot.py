@@ -86,9 +86,10 @@ TF_MS = {"5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000}
 DEFAULT_MIN_QUOTE_VOLUME = float(os.environ.get("MIN_QUOTE_VOLUME", "1200000"))
 DEFAULT_MIN_SCORE = float(os.environ.get("MIN_SCORE", "58"))
 ALREADY_PUMPED_MAX = float(os.environ.get("ALREADY_PUMPED_MAX", "8.0"))  # Защита от перегретых монет: ищем в зародыше (до +8% за 24ч)
-MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "50"))
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
-KLINES_LIMIT = int(os.environ.get("KLINES_LIMIT", "500"))  # 500 баров 5m → 41 бар 1h (нужно ≥ MIN_BARS)
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "30"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "30"))
+KLINES_LIMIT = int(os.environ.get("KLINES_LIMIT", "500"))  # 500 баров 5m → 41 бар 1h (нужно ≥ MIN_BARS=32)
+SCAN_BATCH_SIZE = int(os.environ.get("SCAN_BATCH_SIZE", "30"))
 
 # Параметры спотовой автоторговли.
 # TP/SL подобраны бэктестом (backtest/backtest.py) и подтверждены на трёх
@@ -620,32 +621,110 @@ def get_24h_tickers() -> List[dict]:
         if is_usdt_spot(d["symbol"])
     ]
 
-def pick_candidates(tickers: List[dict], min_quote_volume: float = DEFAULT_MIN_QUOTE_VOLUME) -> List[dict]:
+# Список отслеживаемых пар пользователя (USDT Spot)
+WHITELIST_SYMBOLS: List[str] = [
+    "0GUSDT", "1000CATUSDT", "1000CHEEMSUSDT", "1000SATSUSDT", "1INCHUSDT", "1MBABYDOGEUSDT", "2ZUSDT", "AUSDT", "AAOIBUSDT", "AAPLBUSDT",
+    "AAVEUSDT", "ACEUSDT", "ACHUSDT", "ACMUSDT", "ACTUSDT", "ADAUSDT", "ADXUSDT", "AEROUSDT", "AEVOUSDT", "AGLDUSDT",
+    "AIUSDT", "AIGENSYNUSDT", "AIXBTUSDT", "ALABBUSDT", "ALGOUSDT", "ALICEUSDT", "ALLOUSDT", "ALPINEUSDT", "ALTUSDT", "AMATBUSDT",
+    "AMDBUSDT", "AMPUSDT", "AMZNBUSDT", "ANIMEUSDT", "ANKRUSDT", "APEUSDT", "API3USDT", "APTUSDT", "ARUSDT", "ARBUSDT",
+    "ARKUSDT", "ARKMUSDT", "ARMBUSDT", "ARPAUSDT", "ASMLBUSDT", "ASRUSDT", "ASTERUSDT", "ASTRUSDT", "ASTSBUSDT", "ATUSDT",
+    "ATMUSDT", "ATOMUSDT", "AUCTIONUSDT", "AUDIOUSDT", "AVAUSDT", "AVAXUSDT", "AVGOBUSDT", "AVNTUSDT", "AWEUSDT", "AXLUSDT",
+    "AXSUSDT", "AXTIBUSDT", "BABABUSDT", "BABYUSDT", "BANANAUSDT", "BANANAS31USDT", "BANDUSDT", "BANKUSDT", "BARUSDT", "BARDUSDT",
+    "BATUSDT", "BBUSDT", "BCHUSDT", "BEAMXUSDT", "BEBUSDT", "BELUSDT", "BERAUSDT", "BFUSDUSDT", "BICOUSDT", "BIGTIMEUSDT",
+    "BIOUSDT", "BLURUSDT", "BMNRBUSDT", "BMTUSDT", "BNBUSDT", "BNCBUSDT", "BNSOLUSDT", "BNTUSDT", "BOMEUSDT", "BONKUSDT",
+    "BREVUSDT", "BROCCOLI714USDT", "BTCUSDT", "BTTCUSDT", "CUSDT", "C98USDT", "CAKEUSDT", "CATIUSDT", "CBRSBUSDT", "CELOUSDT",
+    "CELRUSDT", "CETUSUSDT", "CFGUSDT", "CFXUSDT", "CGPTUSDT", "CHIPUSDT", "CHRUSDT", "CHZUSDT", "CITYUSDT", "CKBUSDT",
+    "COHRBUSDT", "COINBUSDT", "COMPUSDT", "COOKIEUSDT", "COTIUSDT", "COWUSDT", "CRCLBUSDT", "CRDOBUSDT", "CRMBUSDT", "CRVUSDT",
+    "CRWDBUSDT", "CRWVBUSDT", "CTKUSDT", "CTSIUSDT", "CVCUSDT", "CVXUSDT", "CYBERUSDT", "DASHUSDT", "DCRUSDT", "DELLBUSDT",
+    "DEXEUSDT", "DGBUSDT", "DIAUSDT", "DJTBUSDT", "DODOUSDT", "DOGEUSDT", "DOGSUSDT", "DOLOUSDT", "DOTUSDT", "DRAMBUSDT",
+    "DUSKUSDT", "DYDXUSDT", "DYMUSDT", "EDENUSDT", "EDUUSDT", "EGLDUSDT", "EIGENUSDT", "ENAUSDT", "ENJUSDT", "ENSUSDT",
+    "ENSOUSDT", "EPICUSDT", "ERAUSDT", "ESPUSDT", "ETCUSDT", "ETHUSDT", "ETHFIUSDT", "EULUSDT", "EURUSDT", "EURIUSDT",
+    "EWYBUSDT", "FUSDT", "FDUSDUSDT", "FETUSDT", "FFUSDT", "FIDAUSDT", "FILUSDT", "FLNCBUSDT", "FLOKIUSDT", "FLOWUSDT",
+    "FLUXUSDT", "FOGOUSDT", "FORMUSDT", "FRAXUSDT", "FTTUSDT", "GUSDT", "GALAUSDT", "GASUSDT", "GENIUSUSDT", "GIGGLEUSDT",
+    "GLMUSDT", "GLMRUSDT", "GLWBUSDT", "GMEBUSDT", "GMTUSDT", "GMXUSDT", "GNOUSDT", "GNSUSDT", "GOOGLBUSDT", "GPSUSDT",
+    "GRAMUSDT", "GRTUSDT", "GSBUSDT", "GTCUSDT", "GUNUSDT", "HAEDALUSDT", "HBARUSDT", "HEIUSDT", "HEMIUSDT", "HIMSBUSDT",
+    "HIVEUSDT", "HMSTRUSDT", "HOLOUSDT", "HOMEUSDT", "HOODBUSDT", "HOTUSDT", "HUMAUSDT", "HYPERUSDT", "IBMBUSDT", "ICPUSDT",
+    "IDUSDT", "ILVUSDT", "IMXUSDT", "INITUSDT", "INJUSDT", "INTCBUSDT", "INTWBUSDT", "IOUSDT", "IOSTUSDT", "IOTAUSDT",
+    "IOTXUSDT", "IQUSDT", "IRENBUSDT", "JASMYUSDT", "JOEUSDT", "JSTUSDT", "JTOUSDT", "JUPUSDT", "JUVUSDT", "KAIAUSDT",
+    "KAITOUSDT", "KATUSDT", "KAVAUSDT", "KERNELUSDT", "KGSTUSDT", "KITEUSDT", "KMNOUSDT", "KNCUSDT", "KORUBUSDT", "KSMUSDT",
+    "LAUSDT", "LAYERUSDT", "LAZIOUSDT", "LDOUSDT", "LINEAUSDT", "LINKUSDT", "LISTAUSDT", "LITEBUSDT", "LPTUSDT", "LQTYUSDT",
+    "LSKUSDT", "LTCUSDT", "LUMIAUSDT", "LUNAUSDT", "LUNCUSDT", "MAGICUSDT", "MANAUSDT", "MANTAUSDT", "MANTRAUSDT", "MARSCOINUSDT",
+    "MASKUSDT", "MAVUSDT", "MBLUSDT", "MEUSDT", "MEGAUSDT", "MEMEUSDT", "METUSDT", "METABUSDT", "METISUSDT", "MINAUSDT",
+    "MIRAUSDT", "MITOUSDT", "MMTUSDT", "MORPHOUSDT", "MOVEUSDT", "MOVRUSDT", "MRNABUSDT", "MRVLBUSDT", "MSFTBUSDT", "MSTRBUSDT",
+    "MTLUSDT", "MUBUSDT", "MUBARAKUSDT", "MUUBUSDT", "MVLLBUSDT", "NBISBUSDT", "NEARUSDT", "NEIROUSDT", "NEOUSDT", "NEWTUSDT",
+    "NEXOUSDT", "NFLXBUSDT", "NIGHTUSDT", "NILUSDT", "NMRUSDT", "NOKBUSDT", "NOMUSDT", "NOTUSDT", "NVDABUSDT", "NXPCUSDT",
+    "OGUSDT", "OGNUSDT", "ONDOUSDT", "ONEUSDT", "ONGUSDT", "ONTUSDT", "OPUSDT", "OPENUSDT", "OPGUSDT", "OPNUSDT",
+    "ORCAUSDT", "ORCLBUSDT", "ORDIUSDT", "OSMOUSDT", "PARTIUSDT", "PAXGUSDT", "PENDLEUSDT", "PENGUUSDT", "PEOPLEUSDT", "PEPEUSDT",
+    "PHAUSDT", "PIXELUSDT", "PLTRBUSDT", "PLUMEUSDT", "PNUTUSDT", "POLUSDT", "POLYXUSDT", "PORTALUSDT", "PORTOUSDT", "POWRUSDT",
+    "PROMUSDT", "PROVEUSDT", "PSGUSDT", "PUMPUSDT", "PUNDIXUSDT", "PYPLBUSDT", "PYTHUSDT", "QCOMBUSDT", "QIUSDT", "QKCUSDT",
+    "QNTUSDT", "QNTBUSDT", "QQQBUSDT", "QTUMUSDT", "QUICKUSDT", "RADUSDT", "RAREUSDT", "RAYUSDT", "REUSDT", "REDUSDT",
+    "RENDERUSDT", "REQUSDT", "RESOLVUSDT", "REZUSDT", "RIFUSDT", "RKLBBUSDT", "RLCUSDT", "RLUSDUSDT", "ROBOUSDT", "RONINUSDT",
+    "ROSEUSDT", "RPLUSDT", "RSRUSDT", "RUNEUSDT", "RVNUSDT", "SUSDT", "SAGAUSDT", "SAHARAUSDT", "SANDUSDT", "SANTOSUSDT",
+    "SAPIENUSDT", "SCUSDT", "SCRUSDT", "SEIUSDT", "SENTUSDT", "SFPUSDT", "SHELLUSDT", "SHIBUSDT", "SIGNUSDT", "SKHYBUSDT",
+    "SKLUSDT", "SKYUSDT", "SLPUSDT", "SMCIBUSDT", "SMHBUSDT", "SNDKBUSDT", "SNXUSDT", "SNXXBUSDT", "SOLUSDT", "SOLVUSDT",
+    "SOMIUSDT", "SOPHUSDT", "SOXLBUSDT", "SOXSBUSDT", "SPCXBUSDT", "SPELLUSDT", "SPKUSDT", "SPYBUSDT", "SQQQBUSDT", "SSVUSDT",
+    "STEEMUSDT", "STGUSDT", "STOUSDT", "STRAXUSDT", "STRKUSDT", "STXUSDT", "STXBUSDT", "SUIUSDT", "SUNUSDT", "SUPERUSDT",
+    "SUSHIUSDT", "SXTUSDT", "SYNUSDT", "SYRUPUSDT", "TUSDT", "TAOUSDT", "TFUELUSDT", "THEUSDT", "THETAUSDT", "TIAUSDT",
+    "TKOUSDT", "TLMUSDT", "TNSRUSDT", "TOWNSUSDT", "TQQQBUSDT", "TRBUSDT", "TREEUSDT", "TRUMPUSDT", "TRXUSDT", "TSLABUSDT",
+    "TSMBUSDT", "TSTUSDT", "TURBOUSDT", "TURTLEUSDT", "TUSDUSDT", "TUTUSDT", "TWTUSDT", "UUSDT", "UMAUSDT", "UNIUSDT",
+    "USARBUSDT", "USD1USDT", "USDCUSDT", "USDEUSDT", "USDPUSDT", "USDSUSDT", "USTCUSDT", "USUALUSDT", "VANAUSDT", "VELODROMEUSDT",
+    "VETUSDT", "VIRTUALUSDT", "VTHOUSDT", "WUSDT", "WALUSDT", "WAXPUSDT", "WBETHUSDT", "WBTCUSDT", "WCTUSDT", "WDCBUSDT",
+    "WIFUSDT", "WINUSDT", "WLDUSDT", "WLFIUSDT", "WOOUSDT", "XAIUSDT", "XAUTUSDT", "XECUSDT", "XLMUSDT", "XNOUSDT",
+    "XPLUSDT", "XRPUSDT", "XTZUSDT", "XUSDUSDT", "XVGUSDT", "XVSUSDT", "YBUSDT", "YFIUSDT", "YGGUSDT", "ZAMAUSDT",
+    "ZBTUSDT", "ZECUSDT", "ZENUSDT", "ZILUSDT", "ZKUSDT", "ZKCUSDT", "ZKPUSDT", "ZROUSDT", "ZRXUSDT", "币安人生USDT", "牛来USDT",
+]
+
+_scan_cursor_lock = threading.Lock()
+_scan_cursor_index = 0
+
+def pick_candidates(
+    tickers: List[dict],
+    min_quote_volume: float = DEFAULT_MIN_QUOTE_VOLUME,
+    batch_size: int = SCAN_BATCH_SIZE,
+    state: Optional[dict] = None,
+) -> List[dict]:
+    """
+    Выбирает батч из batch_size (по умолчанию 30) монет для скана по циклическому списку (Round-Robin).
+    """
+    global _scan_cursor_index
+    ticker_map = {t["symbol"]: t for t in tickers}
+
+    if WHITELIST_SYMBOLS:
+        available = [s for s in WHITELIST_SYMBOLS if s in ticker_map and s != "BTCUSDT"]
+        if not available:
+            available = [t["symbol"] for t in tickers if t["symbol"] != "BTCUSDT"]
+
+        with _scan_cursor_lock:
+            cursor = 0
+            if state and "scan_cursor" in state:
+                cursor = int(state.get("scan_cursor", 0))
+            else:
+                cursor = _scan_cursor_index
+
+            n = len(available)
+            if n == 0:
+                return []
+            cursor = cursor % n
+
+            if cursor + batch_size <= n:
+                selected_syms = available[cursor : cursor + batch_size]
+            else:
+                selected_syms = available[cursor:] + available[: (cursor + batch_size) % n]
+
+            new_cursor = (cursor + batch_size) % n
+            _scan_cursor_index = new_cursor
+            if state is not None:
+                state["scan_cursor"] = new_cursor
+
+        return [ticker_map[s] for s in selected_syms if s in ticker_map]
+
     liquid = [
         t for t in tickers
         if t["quoteVolume"] >= min_quote_volume
-        and -4.0 <= t["priceChangePercent"] <= ALREADY_PUMPED_MAX  # Отсекаем дампы (<-4%) и уже взлетевшие (>+8%)
+        and -4.0 <= t["priceChangePercent"] <= ALREADY_PUMPED_MAX
     ]
-    # Приоритет 1: Умеренный рост в зародыше (+0.5% .. +4%)
-    by_germ = sorted(
-        liquid,
-        key=lambda t: t["quoteVolume"] if (0.5 <= t["priceChangePercent"] <= 4.5) else 0.0,
-        reverse=True,
-    )
-    # Приоритет 2: Высокая ликвидность в узком флэте (-1.0% .. +2.0%)
-    by_flat = sorted(
-        liquid,
-        key=lambda t: t["quoteVolume"] if (-1.5 <= t["priceChangePercent"] <= 2.5) else 0.0,
-        reverse=True,
-    )
-    # Приоритет 3: Общая активность
     by_vol = sorted(liquid, key=lambda t: t["quoteVolume"], reverse=True)
-
-    picked: Dict[str, dict] = {}
-    for t in by_germ[:24] + by_flat[:20] + by_vol[:16]:
-        picked[t["symbol"]] = t
-    picked.pop("BTCUSDT", None)
-    return list(picked.values())[:MAX_CANDIDATES]
+    return by_vol[:batch_size]
 
 # ───────────────────────── Klines ─────────────────────────
 
@@ -1398,6 +1477,7 @@ def run_scan(
     min_score: Optional[float] = None,
     min_quote_volume: Optional[float] = None,
     strategy: str = DEFAULT_STRATEGY,
+    state: Optional[dict] = None,
 ) -> Tuple[List[PumpSignal], dict, List[dict]]:
     started = time.time()
     score_threshold = min_score if min_score is not None else DEFAULT_MIN_SCORE
@@ -1405,7 +1485,7 @@ def run_scan(
 
     tickers = get_24h_tickers()
     universe = len(tickers)
-    candidates = pick_candidates(tickers, min_quote_volume=volume_threshold)
+    candidates = pick_candidates(tickers, min_quote_volume=volume_threshold, state=state)
 
     btc_raw = fetch_klines("BTCUSDT")
     btc_ticker = next((t for t in tickers if t["symbol"] == "BTCUSDT"), None)
@@ -1486,6 +1566,7 @@ def default_state() -> dict:
         "pending_entries": {},    # symbol -> выставленный, но ещё не исполненный LIMIT BUY
         "symbol_alert_cooldown": {},  # symbol -> timestamp последнего алерта
         "allowed_chats": [],
+        "scan_cursor": 0,
     }
 
 def load_state() -> dict:
@@ -1497,6 +1578,7 @@ def load_state() -> dict:
             data = json.load(f)
         d["portfolio"].update(data.get("portfolio", {}))
         d["settings"].update(data.get("settings", {}))
+        d["scan_cursor"] = int(data.get("scan_cursor", 0))
 
         # Миграция настроек торговли (однократная).
         # Сохранённый TP, равный ПРЕЖНЕМУ дефолту 2.0%, — это не осознанный
@@ -1661,43 +1743,36 @@ def sync_binance_time(force: bool = False) -> int:
     now_mono = time.monotonic()
     if not force and (now_mono - _binance_time_last_sync < 300):
         return _binance_time_offset_ms
-    try:
-        url = f"{BINANCE_TRADE_URL}/api/v3/time"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            server_time = int(data["serverTime"])
-            local_time = int(time.time() * 1000)
-            _binance_time_offset_ms = server_time - local_time
-            _binance_time_last_sync = now_mono
-    except Exception as e:
-        print(f"[Binance Time Sync Warning]: {e}", file=sys.stderr)
+    urls = [
+        f"{BINANCE_BASE}/api/v3/time",
+        f"{BINANCE_TRADE_URL}/api/v3/time",
+        "https://data-api.binance.vision/api/v3/time",
+        "https://api.binance.com/api/v3/time",
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                server_time = int(data["serverTime"])
+                local_time = int(time.time() * 1000)
+                _binance_time_offset_ms = server_time - local_time
+                _binance_time_last_sync = now_mono
+                return _binance_time_offset_ms
+        except Exception:
+            continue
     return _binance_time_offset_ms
 
-def save_local_env_var(key: str, value: str) -> None:
-    """Сохраняет переменную в локальный файл .env (защищен от git-коммитов через .gitignore)."""
-    try:
-        env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-        lines = []
-        found = False
-        if os.path.exists(env_file):
-            with open(env_file, "r", encoding="utf-8") as f:
-                for l in f:
-                    stripped = l.strip()
-                    if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
-                        lines.append(f"{key}={value}\n")
-                        found = True
-                    else:
-                        lines.append(l)
-        if not found:
-            lines.append(f"{key}={value}\n")
-        with open(env_file, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-    except Exception as e:
-        print(f"[Warn] Не удалось обновить локальный .env: {e}", file=sys.stderr)
-
 def sanitize_api_key(val: str) -> str:
-    """Очищает API-ключ от лишних кавычек, пробелов и префиксов."""
+    """
+    Очищает API-ключ от мусора копипаста: кавычек, пробелов, префиксов
+    вида 'API_KEY=' и невидимых символов.
+
+    Невидимые символы (zero-width space, неразрывный пробел, мягкий перенос)
+    глазом не видны и переживают обычный strip() — но они попадают в HMAC,
+    и Binance отвечает -1022 «Signature for this request is not valid»
+    на ключ, который вы скопировали правильно.
+    """
     if not val:
         return ""
     cleaned = val.strip().strip("'\"`\r\n\t")
@@ -1708,6 +1783,11 @@ def sanitize_api_key(val: str) -> str:
             break
     if ":" in cleaned and any(cleaned.lower().startswith(x) for x in ("api key:", "api secret:", "key:", "secret:")):
         cleaned = cleaned.split(":", 1)[1].strip().strip("'\"`\r\n\t")
+    # Ключ и секрет Binance состоят строго из латиницы и цифр. Всё остальное —
+    # мусор. Зачистку применяем только если она не превращает значение в кашу.
+    strict = re.sub(r"[^A-Za-z0-9]", "", cleaned)
+    if len(strict) >= 32:
+        cleaned = strict
     return cleaned
 
 def extract_api_keys_from_text(raw_text: str) -> Tuple[str, str]:
@@ -1757,17 +1837,49 @@ def extract_api_keys_from_text(raw_text: str) -> Tuple[str, str]:
 def get_api_credentials(state: Optional[dict] = None) -> Tuple[str, str]:
     """
     Возвращает (api_key, api_secret).
-    Считывает из:
-    1. Переменных окружения (GitHub Secrets / .env)
-    2. Настроек сессии бота (state["settings"])
+
+    Единственный источник ключей — переменные окружения (GitHub Secrets,
+    либо локальный .env). Из state["settings"] ключи сознательно НЕ читаются,
+    чтобы ни в репозитории, ни в bot_state.json не оставалось копий ключей.
+
+    Пара разрешается целиком или никак: key из одного места плюс secret из
+    другого дают Binance -1022 (invalid signature).
     """
-    key = sanitize_api_key(os.environ.get("BINANCE_API_KEY", ""))
-    secret = sanitize_api_key(os.environ.get("BINANCE_API_SECRET", ""))
-    if not key and state:
-        key = sanitize_api_key(state.get("settings", {}).get("binance_api_key", ""))
-    if not secret and state:
-        secret = sanitize_api_key(state.get("settings", {}).get("binance_api_secret", ""))
-    return key, secret
+    return (
+        sanitize_api_key(os.environ.get("BINANCE_API_KEY", "")),
+        sanitize_api_key(os.environ.get("BINANCE_API_SECRET", "")),
+    )
+
+# Коды Binance, означающие «проблема с парой key/secret»:
+#   -1022 signature for this request is not valid
+#   -2015 invalid API-key, IP, or permissions for action
+#   -2014 API-key format invalid
+#   -2008 invalid api key id
+BINANCE_AUTH_ERROR_CODES = {-1022, -2015, -2014, -2008}
+
+def describe_api_cred_problem(code: int) -> str:
+    """
+    Расшифровка кода ошибки Binance: что именно править в GitHub Secrets.
+    Показывается прямо в чате, чтобы не гадать над сухим «Signature is not valid».
+    """
+    if code == -1022:
+        return (
+            "BINANCE_API_SECRET не подходит к BINANCE_API_KEY — секрет взят от другого "
+            "API-ключа либо скопирован с невидимым символом (пробел, перенос строки). "
+            "Надёжнее всего перевыпустить секрет в кабинете Binance и вставить оба "
+            "значения в Secrets заново, целиком"
+        )
+    if code == -2015:
+        return (
+            "ключ не найден либо ему запрещено действие: проверьте BINANCE_API_KEY, "
+            "права (Enable Reading / Enable Spot & Margin Trading) и IP-ограничение "
+            "в кабинете Binance"
+        )
+    if code == -2014:
+        return "неверный формат BINANCE_API_KEY — в значение попал мусор или оно обрезано"
+    if code == -2008:
+        return "Binance не знает такой API-ключ — он удалён или отозван"
+    return ""
 
 def binance_signed_request(
     method: str,
@@ -1778,9 +1890,10 @@ def binance_signed_request(
     """
     Выполняет защищенный HMAC-SHA256 запрос к торговому API Binance (/api/v3/*).
     Включает:
-    - Широкое окно recvWindow = 60000 для стабильности на нестабильной сети
+    - Окно recvWindow = 10000 для надежной синхронизации
     - Автоматическую ресинхронизацию времени при ошибке -1021
     - Резервные хосты (api1.binance.com, api2.binance.com, api3.binance.com) при сетевых сбоях
+    - Расшифровку кодов -1022/-2015 прямо в тексте ошибки
     """
     api_key, api_secret = get_api_credentials(state)
     if not api_key or not api_secret:
@@ -1816,7 +1929,7 @@ def binance_signed_request(
         offset = sync_binance_time(force=(attempt > 0))
         p = dict(params or {})
         p["timestamp"] = int(time.time() * 1000) + offset
-        p["recvWindow"] = 60000  # Максимальное окно допуска для исключения -1021
+        p["recvWindow"] = 10000
 
         query_str = urllib.parse.urlencode(p)
         sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -1848,13 +1961,21 @@ def binance_signed_request(
                     err_json = json.loads(err_body)
                     code = err_json.get("code", e.code)
                     msg = sanitize_sensitive_text(err_json.get("msg", err_body))
-                    # Если рассинхрон времени (-1021) — пробуем второй такт с принудительной синхронизацией
-                    if code == -1021 and attempt == 0:
-                        last_error = {"error": msg, "code": code}
-                        break
-                    return {"error": msg, "code": code}
                 except Exception:
                     return {"error": sanitize_sensitive_text(f"HTTP {e.code}: {err_body}"), "code": e.code}
+
+                # Проблема с ключами — дописываем расшифровку прямо в текст ошибки
+                if code in BINANCE_AUTH_ERROR_CODES:
+                    hint = describe_api_cred_problem(code)
+                    if hint:
+                        msg = f"{msg} — {hint}"
+                    return {"error": msg, "code": code}
+
+                # Если рассинхрон времени (-1021) — пробуем второй такт с принудительной синхронизацией
+                if code == -1021 and attempt == 0:
+                    last_error = {"error": msg, "code": code}
+                    break
+                return {"error": msg, "code": code}
             except Exception as e:
                 last_error = {"error": sanitize_sensitive_text(str(e))}
                 continue  # Пробуем следующий резервный хост
@@ -1919,19 +2040,13 @@ def process_and_test_api_keys(
         )
         return
 
-    # Сохраняем в память и переменные процесса
     os.environ["BINANCE_API_KEY"] = key
     os.environ["BINANCE_API_SECRET"] = secret
     if "settings" not in state:
         state["settings"] = {}
     state["settings"]["binance_api_key"] = key
     state["settings"]["binance_api_secret"] = secret
-
-    # Сохраняем в bot_state.json и git, чтобы ключи пережили перезапуск бота
     save_state(state, sync_git=True)
-    # Сохраняем в локальный .env (который в .gitignore) для персистентности между рестартами
-    save_local_env_var("BINANCE_API_KEY", key)
-    save_local_env_var("BINANCE_API_SECRET", secret)
 
     msg_id = send_telegram(token, chat_id_local, "⏳ <i>Проверяю ключи на сервере Binance Spot (/api/v3/account)...</i>")
 
@@ -1951,7 +2066,7 @@ def process_and_test_api_keys(
             hint = "\n\n💡 <b>Причина:</b> Рассинхрон системного времени с сервером Binance."
 
         resp_msg = (
-            f"⚠️ <b>Ключи сохранены, но Binance отклонил запрос:</b>\n"
+            f"⚠️ <b>Ключи проверены, но Binance отклонил запрос:</b>\n"
             f"<code>{err}</code>{hint}\n\n"
             f"<i>Убедитесь, что в Binance API Management включены разрешения: «Включить чтение» (Enable Reading) и «Включить спотовую торговлю» (Enable Spot & Margin Trading).</i>"
         )
@@ -1966,11 +2081,12 @@ def process_and_test_api_keys(
         coin_count = sum(1 for k, v in assets.items() if k != "USDT" and float(v.get("total", 0.0)) > 0.0001)
 
         success_msg = (
-            f"✅ <b>API-ключи Binance успешно подключены и проверены!</b>\n\n"
+            f"✅ <b>API-ключи Binance рабочие — проверено живым запросом.</b>\n\n"
             f"• Свободно USDT: <code>{free_usdt:,.2f} USDT</code>\n"
             f"• Всего на балансе: <code>{total_usdt:,.2f} USDT</code>\n"
             f"• Монет на споте: <b>{coin_count}</b> шт.\n\n"
-            f"⚡ Теперь доступны баланс, автоторговля и ручные ордера."
+            f"⚡ Доступны баланс, автоторговля и ручные ордера.\n\n"
+            f"🔒 <i>Ключи сохранены в состоянии бота и переменных сессии.</i>"
         )
         if msg_id:
             edit_message(token, chat_id_local, msg_id, success_msg, reply_markup=main_keyboard())
@@ -5511,6 +5627,7 @@ def execute_scan_and_report(
             min_score=min_score if min_score is not None else s["min_score"],
             min_quote_volume=s.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME),
             strategy=s.get("strategy", DEFAULT_STRATEGY),
+            state=state,
         )
         duration = meta["duration_ms"] / 1000.0
         btc = meta["btc"]
@@ -5523,7 +5640,7 @@ def execute_scan_and_report(
             ) or "<i>нет данных</i>"
             report_text = (
                 f"✅ <b>Скан завершён за {duration:.1f}с</b>\n\n"
-                f"• Просканировано пар: <code>{meta['candidates']}</code> из {meta['universe']}\n"
+                f"• Просканировано пар: <code>{meta['candidates']}</code> (батч по очереди)\n"
                 f"• Порог Score: <code>{meta['min_score']:.0f}</code>\n"
                 f"• BTC: <code>{fmt_price(btc['price'])} USDT</code> ({fmt_pct(btc['change24h'])})\n"
                 f"• Сигналов: <b>0</b> <i>(порог {meta['min_score']:.0f} не превышен)</i>\n\n"
@@ -5588,7 +5705,7 @@ def run_oneshot(token: Optional[str], chat_id: Optional[str]) -> None:
     print("=== Режим разового скана (Oneshot) ===")
     state = load_state()
     min_score = state.get("settings", {}).get("min_score", DEFAULT_MIN_SCORE)
-    signals, meta, top = run_scan(min_score=min_score)
+    signals, meta, top = run_scan(min_score=min_score, state=state)
     print(f"Scan: {meta['duration_ms']/1000:.1f}с, candidates={meta['candidates']}, сигналов={len(signals)}")
 
     if not token or not chat_id:
@@ -5686,6 +5803,7 @@ def autoscan_worker(token: str, primary_chat_id: Union[str, int], state: dict, s
                 min_score=settings.get("min_score", DEFAULT_MIN_SCORE),
                 min_quote_volume=settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME),
                 strategy=settings.get("strategy", DEFAULT_STRATEGY),
+                state=state,
             )
             print(f"[Autoscan] {time.strftime('%H:%M:%S')}: {meta['duration_ms']/1000:.1f}с, "
                   f"candidates={meta['candidates']}, сигналов={len(signals)}")
