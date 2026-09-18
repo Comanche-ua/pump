@@ -1571,6 +1571,43 @@ class TradeSafetyTest(unittest.TestCase):
             pb.get_spot_account_assets = old_get_assets
             pb.get_multiple_prices = old_get_prices
 
+    def test_scan_interval_default_1min_and_round_robin(self):
+        """Проверка интервала по умолчанию 1 мин (60с) и циклического выбора кандидатов."""
+        state = pb.default_state()
+        self.assertEqual(pb.DEFAULT_SCAN_INTERVAL, 60)
+        self.assertEqual(state["settings"]["scan_interval_sec"], 60)
+
+        # 1. Проверяем отображение в settings_text
+        txt = pb.settings_text(state)
+        self.assertIn("каждые 1 мин", txt)
+
+        # 2. Проверяем кнопки интервалов в settings_inline_kb
+        kb = pb.settings_inline_kb(state)
+        buttons = [b for row in kb["inline_keyboard"] for b in row]
+        cb_map = {b.get("callback_data"): b.get("text") for b in buttons if "callback_data" in b}
+        self.assertIn("interval:60", cb_map)
+        self.assertIn("interval:120", cb_map)
+        self.assertIn("interval:180", cb_map)
+        self.assertIn("interval:300", cb_map)
+        self.assertIn("✅", cb_map["interval:60"])
+
+        # 3. Проверяем Round-Robin сканирование для общего рынка
+        tickers = [
+            {"symbol": f"COIN{i}USDT", "quoteVolume": 2000000.0 - i * 1000, "priceChangePercent": 2.0}
+            for i in range(50)
+        ]
+        # Первый батч 20 монет
+        batch1 = pb.pick_candidates(tickers, min_quote_volume=1000000, batch_size=20, state=state)
+        self.assertEqual(len(batch1), 20)
+        self.assertEqual(batch1[0]["symbol"], "COIN0USDT")
+        self.assertEqual(batch1[-1]["symbol"], "COIN19USDT")
+
+        # Второй батч (следующие 20 монет в цикле)
+        batch2 = pb.pick_candidates(tickers, min_quote_volume=1000000, batch_size=20, state=state)
+        self.assertEqual(len(batch2), 20)
+        self.assertEqual(batch2[0]["symbol"], "COIN20USDT")
+        self.assertEqual(batch2[-1]["symbol"], "COIN39USDT")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

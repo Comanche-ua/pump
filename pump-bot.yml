@@ -40,6 +40,7 @@ jobs:
           AUTO_TRADE: "true"
           TRADE_PROFILE: "ultra"
           TRADE_MODE: "all"
+          SCAN_INTERVAL_SEC: "60"
         run: python pump_bot.py --bot
 
       - name: Save portfolio state

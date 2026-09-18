@@ -223,7 +223,7 @@ IS_CI = (
 DEFAULT_RUN_MODE = "oneshot" if IS_CI else "bot"
 RUN_MODE = os.environ.get("RUN_MODE", DEFAULT_RUN_MODE).strip().lower()
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
-DEFAULT_SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
+DEFAULT_SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "60"))
 
 STABLE_OR_FIAT = {
     "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "EUR", "EURI", "AEUR",
@@ -784,9 +784,32 @@ def pick_candidates(
         t for t in tickers
         if t["quoteVolume"] >= min_quote_volume
         and -4.0 <= t["priceChangePercent"] <= ALREADY_PUMPED_MAX
+        and t.get("symbol") != "BTCUSDT"
     ]
     by_vol = sorted(liquid, key=lambda t: t["quoteVolume"], reverse=True)
-    return by_vol[:batch_size]
+    n = len(by_vol)
+    if n <= batch_size:
+        return by_vol
+
+    with _scan_cursor_lock:
+        cursor = 0
+        if state and "scan_cursor" in state:
+            cursor = int(state.get("scan_cursor", 0))
+        else:
+            cursor = _scan_cursor_index
+
+        cursor = cursor % n
+        if cursor + batch_size <= n:
+            selected = by_vol[cursor : cursor + batch_size]
+        else:
+            selected = by_vol[cursor:] + by_vol[: (cursor + batch_size) % n]
+
+        new_cursor = (cursor + batch_size) % n
+        _scan_cursor_index = new_cursor
+        if state is not None:
+            state["scan_cursor"] = new_cursor
+
+    return selected
 
 # ───────────────────────── Klines ─────────────────────────
 
@@ -5347,7 +5370,8 @@ def settings_text(state: dict) -> str:
         entry_label = f"🎯 Откат -{entry_pb:.1f}% (лимитный вход)"
 
     auto_trade_label = f"🟢 Включена (+{tp_pct:.1f}% TP, -{sl_pct:.1f}% SL)" if s.get("auto_trade", False) else "🔴 Выключена"
-    interval_m = s.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL) // 60
+    interval_sec = int(s.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL))
+    interval_str = f"{interval_sec} сек" if interval_sec < 60 else f"{interval_sec // 60} мин"
 
     api_key, api_secret = get_api_credentials(state)
     api_status = "🟢 Подключены" if (api_key and api_secret) else "⚪ Не заданы (только сигналы)"
@@ -5372,7 +5396,7 @@ def settings_text(state: dict) -> str:
         "<b>⚙️ Параметры бота Pump Pulse</b>\n\n"
         f"🏆 <b>Пресет стратегии:</b> <code>{prof_label}</code>\n"
         f"  <i>{prof_desc}</i>\n\n"
-        f"• <b>Автосканирование рынка:</b> {auto_scan_label} (каждые {interval_m} мин)\n"
+        f"• <b>Автосканирование рынка:</b> {auto_scan_label} (каждые {interval_str})\n"
         f"• <b>Порог Score (MIN_SCORE):</b> <code>{s['min_score']:.0f}</code>\n"
         f"• <b>Уведомления:</b> <code>{filt_label}</code>\n"
         f"• <b>Режим стратегии:</b> <code>{strat_label}</code>\n"
@@ -5426,6 +5450,12 @@ def settings_inline_kb(state: dict) -> dict:
     def _entry_btn(label: str, val: float) -> dict:
         active = "✅ " if abs(cur_entry - val) < 0.05 else ""
         return {"text": f"{active}{label}", "callback_data": f"trade:entry:{val:.1f}"}
+
+    def _interval_btn(sec: int) -> dict:
+        cur_sec = int(s.get("scan_interval_sec", DEFAULT_SCAN_INTERVAL))
+        active = "✅ " if cur_sec == sec else ""
+        label = f"{sec}с" if sec < 60 else f"{sec // 60} мин"
+        return {"text": f"{active}⏱ {label}", "callback_data": f"interval:{sec}"}
 
     return {
         "inline_keyboard": [
@@ -5507,9 +5537,10 @@ def settings_inline_kb(state: dict) -> dict:
                 {"text": filter_label, "callback_data": "filter:toggle"},
             ],
             [
-                {"text": "⏱ 3 мин", "callback_data": "interval:180"},
-                {"text": "⏱ 5 мин", "callback_data": "interval:300"},
-                {"text": "⏱ 10 мин", "callback_data": "interval:600"},
+                _interval_btn(60),
+                _interval_btn(120),
+                _interval_btn(180),
+                _interval_btn(300),
             ],
             [
                 {"text": "🔄 Обновить статус", "callback_data": "settings:refresh"},
