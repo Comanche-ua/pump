@@ -2077,7 +2077,7 @@ def binance_signed_request(
                 req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                with urllib.request.urlopen(req, timeout=6) as resp:
                     record_binance_weight(getattr(resp, "headers", None))
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
@@ -2239,9 +2239,7 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
             "или через меню ⚙️ Настройки."
         )
 
-    # Синхронизируем открытые позиции и сделки
-    sync_trades_and_active_positions(state)
-
+    # 1. Быстрый запрос балансов спота (один запрос к /api/v3/account)
     assets, err = get_spot_account_assets(state)
     if err:
         return f"❌ <b>Ошибка получения баланса Binance:</b>\n<code>{err}</code>"
@@ -2254,13 +2252,9 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
     # Собираем список всех ненулевых альткоинов/монет
     non_usdt_assets = {k: v for k, v in assets.items() if k != "USDT" and v["total"] > 0.00000001}
 
-    # Запрашиваем цены в USDT для всех найденных монет
+    # Запрашиваем цены в USDT для всех найденных монет одним пакетным запросом
     symbols_to_fetch = [f"{a}USDT" for a in non_usdt_assets.keys()]
     prices = get_multiple_prices(symbols_to_fetch) if symbols_to_fetch else {}
-
-    # Запрашиваем 24ч статистику
-    tickers = get_24h_tickers()
-    ticker_map = {t["symbol"]: float(t.get("priceChangePercent", 0.0)) for t in tickers if "symbol" in t}
 
     lines = ["💳 <b>Баланс и активы на Binance Spot</b>\n"]
 
@@ -2302,7 +2296,7 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
             tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{pair}"
             binance_url = f"https://www.binance.com/en/trade/{asset}_USDT?type=spot"
 
-            # Определяем цену входа из активных сделок бота, портфеля или Binance API
+            # Определяем цену входа из активных сделок бота или портфеля
             trade_rec = active_trades.get(pair)
             port_rec = portfolio.get(pair)
             buy_price = 0.0
@@ -2310,17 +2304,6 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
                 buy_price = float(trade_rec.get("buy_price", 0.0))
             elif port_rec:
                 buy_price = float(port_rec.get("avg_price", 0.0))
-
-            if buy_price <= 0:
-                try:
-                    my_tr = binance_signed_request("GET", "/api/v3/myTrades", {"symbol": pair, "limit": 5}, state=state)
-                    if isinstance(my_tr, list) and my_tr:
-                        buys = [t for t in my_tr if t.get("isBuyer")]
-                        if buys:
-                            buy_price = float(buys[-1]["price"])
-                            portfolio_add(state, pair, tot_qty, buy_price)
-                except Exception:
-                    pass
 
             pnl_block = []
             if buy_price > 0:
@@ -2338,11 +2321,6 @@ def format_binance_balance_detailed(state: Optional[dict] = None) -> str:
                     tp_id = trade_rec.get("tp_order_id")
                     tp_order_tag = f" [Ордер #{tp_id}]" if tp_id else ""
                     pnl_block.append(f"   ├ 🎯 <b>Тейк-профит:</b> <code>{fmt_price(tp_p)} $</code> (+{((tp_p - buy_price)/buy_price*100):.1f}%){tp_order_tag}")
-            else:
-                chg_24h = ticker_map.get(pair)
-                if chg_24h is not None:
-                    sign = "🟢" if chg_24h >= 0 else "🔴"
-                    pnl_block.append(f"   ├ 📈 <b>Динамика 24ч:</b> {sign} <b>{fmt_pct(chg_24h)}</b>")
 
             pnl_str = ("\n" + "\n".join(pnl_block)) if pnl_block else ""
 
