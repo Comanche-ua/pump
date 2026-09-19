@@ -1705,6 +1705,14 @@ def load_state() -> dict:
         if os.environ.get("TRADE_MODE"):
             d["settings"]["trade_mode"] = os.environ.get("TRADE_MODE").strip().lower()
 
+        if os.environ.get("SCAN_INTERVAL_SEC"):
+            try:
+                d["settings"]["scan_interval_sec"] = int(os.environ.get("SCAN_INTERVAL_SEC", "60"))
+            except ValueError:
+                d["settings"]["scan_interval_sec"] = 60
+        elif d["settings"].get("scan_interval_sec") in (300, None):
+            d["settings"]["scan_interval_sec"] = 60
+
         if d["settings"].get("auto_trade"):
             d["settings"]["strategy_confirmed"] = True
 
@@ -4061,10 +4069,13 @@ def execute_emergency_market_sell(
     min_qty = filters.get("min_qty", 0.0)
     qty_str = fmt_qty_filter(qty_to_sell, step_size)
 
-    if float(qty_str) <= 0 or float(qty_str) < min_qty:
-        err_msg = f"Недостаточно монет {base} на балансе для продажи (доступно: {qty_to_sell})."
-        send_telegram(token, chat_id, f"❌ {err_msg}")
-        return {"error": err_msg}
+    if float(qty_str) <= 0 or (min_qty > 0 and float(qty_str) < min_qty):
+        # Монет на споте нет или осталась пыль (< min_qty) — позиция уже закрыта на бирже!
+        active_trades.pop(symbol, None)
+        portfolio_remove(state, symbol)
+        save_state(state, sync_git=True)
+        print(f"[Emergency Sell {symbol}]: остаток {qty_to_sell} < min_qty — позиция уже закрыта, удалена из активных")
+        return {"success": True, "already_closed": True, "cum_quote": 0.0, "pnl": 0.0, "pnl_pct": 0.0}
 
     # 3. Размещаем MARKET SELL ордер
     sell_params = {
@@ -4165,8 +4176,49 @@ def ensure_position_protected(
     base = base_asset(symbol)
     active_trades = state.setdefault("active_trades", {})
 
+_STALE_ALERT_COOLDOWN: Dict[str, float] = {}
+
+def ensure_position_protected(
+    token: str,
+    chat_id: Union[str, int],
+    state: dict,
+    symbol: str,
+    trade: Optional[dict] = None,
+) -> bool:
+    """
+    Гарантирует, что открытая позиция ВСЕГДА защищена ордером на бирже Binance.
+    Исключает ситуацию, когда монета куплена, а ордера на продажу на бирже нет.
+    """
+    symbol = normalize_symbol(symbol)
+    base = base_asset(symbol)
+    active_trades = state.setdefault("active_trades", {})
+
     if trade is None:
         trade = active_trades.get(symbol)
+
+    # 0. Проверяем реальный баланс актива на споте:
+    cur_p = get_price(symbol) or 0.0
+    filters = get_symbol_filters(symbol)
+    min_qty = float(filters.get("min_qty", 0.0) or 0.0)
+
+    assets, err = get_spot_account_assets(state)
+    if not err and assets:
+        asset_info = assets.get(base, {"free": 0.0, "locked": 0.0, "total": 0.0})
+        tot_qty = float(asset_info.get("total", 0.0))
+        free_qty = float(asset_info.get("free", 0.0))
+        locked_qty = float(asset_info.get("locked", 0.0))
+
+        # Если на споте нет монет или осталась микро-пыль (< 1$ или < min_qty) — позиция уже закрыта!
+        if tot_qty <= 0.00000001 or (cur_p > 0 and tot_qty * cur_p < 1.0) or (min_qty > 0 and tot_qty < min_qty):
+            print(f"[EnsureProtected {symbol}]: баланс {tot_qty} < 1$ / min_qty — позиция уже закрыта, очищаю активные")
+            active_trades.pop(symbol, None)
+            portfolio_remove(state, symbol)
+            save_state(state, sync_git=True)
+            return True
+    else:
+        tot_qty = float(trade.get("qty", 0.0) if trade else 0.0)
+        free_qty = tot_qty
+        locked_qty = 0.0
 
     if trade is None:
         port = state.get("portfolio", {})
@@ -4176,25 +4228,18 @@ def ensure_position_protected(
                 "symbol": symbol,
                 "base": base,
                 "buy_price": float(port_pos.get("avg_price", 0.0)),
-                "qty": float(port_pos.get("qty", 0.0)),
-                "cost_usdt": float(port_pos.get("qty", 0.0)) * float(port_pos.get("avg_price", 0.0)),
+                "qty": tot_qty,
+                "cost_usdt": tot_qty * float(port_pos.get("avg_price", 0.0)),
                 "opened_at": int(time.time()),
             }
             active_trades[symbol] = trade
         else:
-            assets, _ = get_spot_account_assets(state)
-            tot = float(assets.get(base, {}).get("total", 0.0))
-            if tot <= 0.00000001:
-                return False
-            cur_p_temp = get_price(symbol) or 0.0
-            if cur_p_temp * tot < 1.0:
-                return False
             trade = {
                 "symbol": symbol,
                 "base": base,
-                "buy_price": cur_p_temp,
-                "qty": tot,
-                "cost_usdt": cur_p_temp * tot,
+                "buy_price": cur_p,
+                "qty": tot_qty,
+                "cost_usdt": cur_p * tot_qty,
                 "opened_at": int(time.time()),
             }
             active_trades[symbol] = trade
@@ -4203,10 +4248,14 @@ def ensure_position_protected(
     order_list_id = trade.get("order_list_id")
     if order_list_id:
         res = binance_signed_request("GET", "/api/v3/orderList", {"symbol": symbol, "orderListId": order_list_id}, state=state)
-        if "error" not in res and res.get("listOrderStatus") in ("EXEC_STARTED", "ALL_DONE"):
+        if "error" not in res and (res.get("listOrderStatus") in ("EXECUTING", "ALL_DONE") or res.get("listStatusType") in ("EXEC_STARTED", "ALL_DONE")):
             return True
-        trade["order_list_id"] = None
-        trade["sl_order_id"] = None
+        if res.get("code") in ORDER_NOT_FOUND_CODES or res.get("listOrderStatus") == "REJECT":
+            trade["order_list_id"] = None
+            trade["sl_order_id"] = None
+        else:
+            # Сетевой сбой или временная недоступность API — не трогаем живой ордер!
+            return True
 
     # 2. Проверяем, есть ли уже активный одиночный лимитный TP
     tp_order_id = trade.get("tp_order_id")
@@ -4214,10 +4263,16 @@ def ensure_position_protected(
         res = binance_signed_request("GET", "/api/v3/order", {"symbol": symbol, "orderId": tp_order_id}, state=state)
         if "error" not in res and res.get("status") in ("NEW", "PARTIALLY_FILLED", "FILLED"):
             return True
-        trade["tp_order_id"] = None
+        if res.get("code") in ORDER_NOT_FOUND_CODES or res.get("status") in ("CANCELED", "EXPIRED", "REJECTED"):
+            trade["tp_order_id"] = None
+        else:
+            return True
+
+    # 2b. Если монеты заблокированы в ордере на бирже (locked_qty > 0) — ордер уже стоит!
+    if locked_qty > 0 and (cur_p <= 0 or locked_qty * cur_p >= 1.0):
+        return True
 
     # 3. На бирже НЕТ ордера на продажу! Получаем текущую цену
-    cur_p = get_price(symbol)
     buy_p = float(trade.get("buy_price", 0.0) or cur_p or 0.0)
     settings = state.get("settings", {})
     tp_pct = float(trade.get("tp_pct") or settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
@@ -4229,7 +4284,7 @@ def ensure_position_protected(
     if cur_p and tp_price > 0 and cur_p >= tp_price:
         print(f"[EnsureProtected {symbol}]: цена {cur_p} >= TP {tp_price} — фиксация прибыли по рынку!")
         sell_res = execute_emergency_market_sell(token, chat_id, state, symbol)
-        if chat_id and "error" not in sell_res:
+        if chat_id and sell_res.get("success") and not sell_res.get("already_closed"):
             pnl_pct = ((cur_p - buy_p) / buy_p * 100.0) if buy_p > 0 else 0.0
             send_telegram(
                 token, chat_id,
@@ -4246,7 +4301,7 @@ def ensure_position_protected(
     if cur_p and sl_price > 0 and cur_p <= sl_price:
         print(f"[EnsureProtected {symbol}]: цена {cur_p} <= SL {sl_price} — стоп-лосс по рынку!")
         sell_res = execute_emergency_market_sell(token, chat_id, state, symbol)
-        if chat_id and "error" not in sell_res:
+        if chat_id and sell_res.get("success") and not sell_res.get("already_closed"):
             pnl_pct = ((cur_p - buy_p) / buy_p * 100.0) if buy_p > 0 else 0.0
             send_telegram(
                 token, chat_id,
@@ -4259,12 +4314,10 @@ def ensure_position_protected(
         return True
 
     # 3c. Цена в нормальном диапазоне. Выставляем OCO-защиту на бирже!
-    filters = get_symbol_filters(symbol)
-    qty = float(trade.get("qty", 0.0))
+    qty = free_qty if free_qty > 0 else tot_qty
     if qty <= 0.00000001:
-        assets, _ = get_spot_account_assets(state)
-        qty = float(assets.get(base, {}).get("free", 0.0))
-        trade["qty"] = qty
+        qty = float(trade.get("qty", 0.0))
+    trade["qty"] = qty
 
     oco = {}
     use_oco = bool(settings.get("use_oco", DEFAULT_USE_OCO))
@@ -4294,36 +4347,36 @@ def ensure_position_protected(
         tick_size = filters.get("tick_size", 0.01)
         tp_price_str = fmt_price_filter(tp_price, tick_size)
         tp_qty_str = fmt_qty_filter(qty, step_size)
-        sell_params = {
-            "symbol": symbol, "side": "SELL", "type": "LIMIT",
-            "timeInForce": "GTC", "quantity": tp_qty_str, "price": tp_price_str,
-        }
-        sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
-        if "error" in sell_res:
-            reduced = fmt_qty_filter(qty * 0.9985, step_size)
-            if float(reduced) > 0 and reduced != tp_qty_str:
-                sell_params["quantity"] = reduced
-                sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
-        tp_order_id = sell_res.get("orderId")
-        if tp_order_id:
-            trade["tp_order_id"] = tp_order_id
-            trade["tp_price"] = float(tp_price_str)
-            trade["status"] = "tp_placed"
-            save_state(state, sync_git=True)
-            if chat_id:
-                send_telegram(
-                    token, chat_id,
-                    f"🎯 <b>Выставлен биржевой Take-Profit для {base}/USDT</b>\n"
-                    f"• Цена TP: <code>{tp_price_str} $</code>\n"
-                    f"<i>Ордер активен на Binance.</i>"
-                )
-            return True
+        if float(tp_qty_str) > 0 and (min_qty <= 0 or float(tp_qty_str) >= min_qty):
+            sell_params = {
+                "symbol": symbol, "side": "SELL", "type": "LIMIT",
+                "timeInForce": "GTC", "quantity": tp_qty_str, "price": tp_price_str,
+            }
+            sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+            if "error" in sell_res:
+                reduced = fmt_qty_filter(qty * 0.9985, step_size)
+                if float(reduced) > 0 and reduced != tp_qty_str:
+                    sell_params["quantity"] = reduced
+                    sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+            tp_order_id = sell_res.get("orderId")
+            if tp_order_id:
+                trade["tp_order_id"] = tp_order_id
+                trade["tp_price"] = float(tp_price_str)
+                trade["status"] = "tp_placed"
+                save_state(state, sync_git=True)
+                if chat_id:
+                    send_telegram(
+                        token, chat_id,
+                        f"🎯 <b>Выставлен биржевой Take-Profit для {base}/USDT</b>\n"
+                        f"• Цена TP: <code>{tp_price_str} $</code>\n"
+                        f"<i>Ордер активен на Binance.</i>"
+                    )
+                return True
 
-    # 3e. Если БИРЖА ОТВЕРГЛА ВСЕ ОРДЕРА — аварийно закрываем монету!
-    # Ни одной секунды без защиты депозита!
-    print(f"[EnsureProtected CRITICAL {symbol}]: биржа отвергла все ордера защиты — немедленный аварийный сброс!")
+    # 3e. Если БИРЖА ОТВЕРГЛА ВСЕ ОРДЕРА — только тогда аварийно закрываем монету!
+    print(f"[EnsureProtected CRITICAL {symbol}]: не удалось выставить ордер защиты — сброс позиции по рынку")
     sell_res = execute_emergency_market_sell(token, chat_id, state, symbol)
-    if chat_id:
+    if chat_id and sell_res.get("success") and not sell_res.get("already_closed"):
         send_telegram(
             token, chat_id,
             f"⚠️ <b>Аварийное закрытие {base}/USDT по рынку</b>\n"
@@ -4341,10 +4394,16 @@ def check_stale_unprotected_positions(token: str, chat_id: Union[str, int], stat
     active_trades = state.get("active_trades", {})
     if not active_trades:
         return
+    now = time.time()
     for symbol, trade in list(active_trades.items()):
         has_oco = bool(trade.get("order_list_id") and trade.get("sl_order_id"))
         has_tp = bool(trade.get("tp_order_id"))
         if not has_oco and not has_tp:
+            # Защита от спама: не чаще раза в 180 секунд на одну монету
+            last_check = _STALE_ALERT_COOLDOWN.get(symbol, 0.0)
+            if now - last_check < 180.0:
+                continue
+            _STALE_ALERT_COOLDOWN[symbol] = now
             print(f"[Watchdog] Обнаружена незащищенная позиция {symbol} — активирую защиту!")
             ensure_position_protected(token, chat_id, state, symbol, trade)
 
