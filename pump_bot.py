@@ -6547,7 +6547,22 @@ def send_telegram(token: str, chat_id: Union[str, int], text: str, reply_markup:
                 time.sleep(0.5 * attempt)
     return first_id
 
-def edit_message(token: str, chat_id: Union[str, int], message_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
+def edit_message(token: str, chat_id: Union[str, int], message_id: int, text: str, reply_markup: Optional[dict] = None) -> bool:
+    """
+    Надёжное редактирование сообщения:
+    1. Если длина > 4000 — удаляет черновик и отправляет частями через send_telegram.
+    2. При ошибке парсинга HTML — пробует без parse_mode.
+    3. При любой другой ошибке — отправляет текст новым сообщением через send_telegram,
+       чтобы пользователь гарантированно получил ответ бота.
+    """
+    if len(text) > 4000:
+        try:
+            api_call(token, "deleteMessage", {"chat_id": chat_id, "message_id": message_id}, retries=1)
+        except Exception:
+            pass
+        send_telegram(token, chat_id, text, reply_markup=reply_markup)
+        return True
+
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -6557,10 +6572,35 @@ def edit_message(token: str, chat_id: Union[str, int], message_id: int, text: st
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
+
     try:
-        api_call(token, "editMessageText", payload, retries=1)
+        res = api_call(token, "editMessageText", payload, retries=1)
+        if res.get("ok"):
+            return True
+        desc = str(res.get("description", "")).lower()
+        if "entit" in desc or "parse" in desc or "tag" in desc:
+            payload.pop("parse_mode", None)
+            res2 = api_call(token, "editMessageText", payload, retries=1)
+            if res2.get("ok"):
+                return True
     except Exception as e:
-        print(f"Telegram edit error: {e}", file=sys.stderr)
+        desc = str(e).lower()
+        if "entit" in desc or "parse" in desc or "tag" in desc or "400" in desc:
+            try:
+                payload.pop("parse_mode", None)
+                res2 = api_call(token, "editMessageText", payload, retries=1)
+                if res2.get("ok"):
+                    return True
+            except Exception:
+                pass
+
+    # Фолбэк: если отредактировать не удалось — отправляем новым сообщением
+    try:
+        send_telegram(token, chat_id, text, reply_markup=reply_markup)
+        return True
+    except Exception as e:
+        print(f"Telegram edit fallback send error: {e}", file=sys.stderr)
+        return False
 
 def answer_callback(token: str, callback_id: str, text: Optional[str] = None, show_alert: bool = False) -> None:
     payload: Dict[str, Any] = {"callback_query_id": callback_id}
@@ -7575,7 +7615,10 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
             elif "баланс" in text_lower or "balance" in text_lower or cmd in ("balance", "баланс"):
                 print(f"-> Детальный баланс для {chat_id_local}")
                 msg_id = send_telegram(token, chat_id_local, "⏳ <i>Запрашиваю детальный баланс Binance...</i>")
-                bal_text = format_binance_balance_detailed(state)
+                try:
+                    bal_text = format_binance_balance_detailed(state)
+                except Exception as e:
+                    bal_text = f"❌ <b>Не удалось загрузить баланс Binance:</b>\n<code>{e}</code>"
                 if msg_id:
                     edit_message(token, chat_id_local, msg_id, bal_text, reply_markup=balance_inline_kb(state))
                 else:
@@ -7589,7 +7632,10 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
             ):
                 print(f"-> Статистика автоторговли для {chat_id_local}")
                 msg_id = send_telegram(token, chat_id_local, "⏳ <i>Загружаю статистику сделок и профита...</i>")
-                stats_text = format_trades_and_profit_stats(state)
+                try:
+                    stats_text = format_trades_and_profit_stats(state)
+                except Exception as e:
+                    stats_text = f"❌ <b>Не удалось сформировать статистику сделок:</b>\n<code>{e}</code>"
                 if msg_id:
                     edit_message(token, chat_id_local, msg_id, stats_text, reply_markup=trades_stats_inline_kb(state))
                 else:
@@ -7650,7 +7696,10 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
 
             elif cb_data in ("port:trades_stats", "trades:refresh"):
                 answer_callback(token, cb_id, "Статистика сделок...")
-                stats_text = format_trades_and_profit_stats(state)
+                try:
+                    stats_text = format_trades_and_profit_stats(state)
+                except Exception as e:
+                    stats_text = f"❌ <b>Не удалось сформировать статистику:</b>\n<code>{e}</code>"
                 if msg_id:
                     edit_message(token, cb_chat, msg_id, stats_text, reply_markup=trades_stats_inline_kb(state))
                 else:
