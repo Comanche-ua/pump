@@ -12,6 +12,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   run-bot:
@@ -30,6 +31,7 @@ jobs:
 
       - name: Run Telegram Bot 24/7
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
@@ -40,8 +42,9 @@ jobs:
           AUTO_TRADE: "true"
           TRADE_PROFILE: "ultra"
           TRADE_MODE: "all"
+          ENTRY_PULLBACK_PCT: "0.0"
           SCAN_INTERVAL_SEC: "60"
-        run: python pump_bot.py --bot
+        run: python -u pump_bot.py --bot
 
       - name: Save portfolio state
         if: always()

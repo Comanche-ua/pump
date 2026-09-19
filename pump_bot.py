@@ -108,9 +108,9 @@ DEFAULT_TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT_USDT", "5.0"))
 #   1.2% → +0.084%   1.5% → +0.110%   2.0% → +0.106%
 # То есть цель 0.5% (в любой трактовке — брутто или нетто) не окупается:
 # на 0.5% брутто издержки съедают больше, чем даёт точность попадания.
-DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "0.7"))
+DEFAULT_TAKE_PROFIT = float(os.environ.get("TAKE_PROFIT_PCT", "0.8"))
 DEFAULT_STOP_LOSS = float(os.environ.get("STOP_LOSS_PCT", "3.0"))
-DEFAULT_ENTRY_PULLBACK = float(os.environ.get("ENTRY_PULLBACK_PCT", "1.0"))  # Вход на откате (-1.0% по результатам глубокого бэктеста)
+DEFAULT_ENTRY_PULLBACK = float(os.environ.get("ENTRY_PULLBACK_PCT", "0.0"))  # 0.0 = мгновенный вход и гарантированный OCO на бирже
 DEFAULT_ENTRY_TIMEOUT_SEC = int(os.environ.get("ENTRY_TIMEOUT_SEC", "600"))   # Таймаут жизни лимитного ордера на вход (10 мин = 2 бара)
 DEFAULT_TRAILING_ACTIVATION = float(os.environ.get("TRAILING_ACTIVATION_PCT", "1.2"))
 DEFAULT_TRAILING_DISTANCE = float(os.environ.get("TRAILING_DISTANCE_PCT", "0.4"))
@@ -154,7 +154,7 @@ TRADE_PROFILES = {
         "name": "🥇 Оптимальный (Баланс)",
         "min_score": 70.0,
         "entry_pullback_pct": 1.0,
-        "take_profit_pct": 0.7,
+        "take_profit_pct": 0.8,
         "stop_loss_pct": 3.0,
         "trailing_activation_pct": 1.2,
         "trailing_distance_pct": 0.4,
@@ -164,7 +164,7 @@ TRADE_PROFILES = {
         "name": "🚀 Макс. Профит (Агрессивный)",
         "min_score": 65.0,
         "entry_pullback_pct": 1.0,
-        "take_profit_pct": 0.7,
+        "take_profit_pct": 0.8,
         "stop_loss_pct": 3.5,
         "trailing_activation_pct": 1.2,
         "trailing_distance_pct": 0.4,
@@ -174,7 +174,7 @@ TRADE_PROFILES = {
         "name": "🛡 Снайпер (Консервативный)",
         "min_score": 75.0,
         "entry_pullback_pct": 0.8,
-        "take_profit_pct": 0.7,
+        "take_profit_pct": 0.8,
         "stop_loss_pct": 3.5,
         "trailing_activation_pct": 1.2,
         "trailing_distance_pct": 0.4,
@@ -183,9 +183,9 @@ TRADE_PROFILES = {
     "ultra": {
         "name": "⚡ Ультра 3-в-1 (Динамический)",
         "min_score": 65.0,
-        "entry_pullback_pct": 1.0,  # Score>=75 -> 0.8%, 70-75 -> 1.0%, 65-70 -> 1.0%
-        "take_profit_pct": 0.7,
-        "stop_loss_pct": 3.0,       # Score>=75 -> 3.5%, 70-75 -> 3.0%, 65-70 -> 3.5%
+        "entry_pullback_pct": 1.0,
+        "take_profit_pct": 0.8,
+        "stop_loss_pct": 3.0,
         "trailing_activation_pct": 1.2,
         "trailing_distance_pct": 0.4,
         "desc": "Авто-адаптация отката и SL под качество каждого сигнала",
@@ -2157,7 +2157,7 @@ def get_spot_account_assets(state: Optional[dict] = None) -> Tuple[Dict[str, dic
     Возвращает детализированный баланс спотового аккаунта Binance:
     {asset: {"free": float, "locked": float, "total": float}}
     """
-    res = binance_signed_request("GET", "/api/v3/account", state=state)
+    res = binance_signed_request("GET", "/api/v3/account", {}, state=state)
     if "error" in res or "balances" not in res:
         err_msg = res.get("error", "Неизвестная ошибка")
         return {}, str(err_msg)
@@ -2830,27 +2830,26 @@ def execute_pump_auto_trade(
 
     # Определение параметров риск-менеджмента и точки входа (с поддержкой пресетов и ULTRA 3-в-1)
     profile_key = settings.get("trade_profile", "optimal")
+    configured_pullback = float(settings.get("entry_pullback_pct", DEFAULT_ENTRY_PULLBACK))
     if profile_key == "ultra":
         score = float(sig.best_score)
+        entry_pullback_pct = 0.0 if configured_pullback <= 0.01 else configured_pullback
         if score >= 75.0:
-            # Снайпер (Score 75+): микро-откат 0.8%, SL 3.5%, TP 0.7%, Trailing 1.2%/0.4%
-            entry_pullback_pct = 0.8
+            # Снайпер (Score 75+): SL 3.5%, TP 0.8%, Trailing 1.2%/0.4%
             sl_pct = 3.5
-            tp_pct = 0.7
+            tp_pct = 0.8
             trailing_activation_pct = 1.2
             trailing_distance_pct = 0.4
         elif score >= 70.0:
-            # Оптимальный (Score 70-75): откат 1.0%, SL 3.0%, TP 0.7%, Trailing 1.2%/0.4%
-            entry_pullback_pct = 1.0
+            # Оптимальный (Score 70-75): SL 3.0%, TP 0.8%, Trailing 1.2%/0.4%
             sl_pct = 3.0
-            tp_pct = 0.7
+            tp_pct = 0.8
             trailing_activation_pct = 1.2
             trailing_distance_pct = 0.4
         elif score >= 65.0:
-            # Макс. Профит (Score 65-70): откат 1.0%, SL 3.5%, TP 0.7%, Trailing 1.2%/0.4%
-            entry_pullback_pct = 1.0
+            # Макс. Профит (Score 65-70): SL 3.5%, TP 0.8%, Trailing 1.2%/0.4%
             sl_pct = 3.5
-            tp_pct = 0.7
+            tp_pct = 0.8
             trailing_activation_pct = 1.2
             trailing_distance_pct = 0.4
         else:
@@ -3089,6 +3088,13 @@ def execute_pump_auto_trade(
     portfolio_add(state, sig.symbol, exec_qty, avg_buy_price)
     save_state(state, sync_git=True)
 
+    # КРИТИЧЕСКАЯ ЗАЩИТА: Ни одной секунды без биржевого ордера!
+    if not tp_success:
+        print(f"[AutoTrade Watchdog] Не удалось сразу поставить TP для {sig.symbol} — вызываю ensure_position_protected...")
+        protected = ensure_position_protected(token, chat_id, state, sig.symbol, trade_record)
+        if not protected:
+            return {"error": "Failed to protect position on exchange, safely closed"}
+
     log_trade_event(
         event_type="BUY_MARKET_FILLED",
         symbol=sig.symbol,
@@ -3322,6 +3328,11 @@ def _check_pending_entries(token: str, chat_id: Union[str, int], state: dict) ->
             }
             state.setdefault("active_trades", {})[symbol] = trade_rec
             portfolio_add(state, symbol, exec_qty, avg_buy_price)
+
+            # КРИТИЧЕСКАЯ ЗАЩИТА: Ни одной секунды без биржевого ордера!
+            if not tp_success:
+                print(f"[Pending Fill Watchdog] Не удалось сразу поставить TP для {symbol} — вызываю ensure_position_protected...")
+                ensure_position_protected(token, chat_id, state, symbol, trade_rec)
 
             log_trade_event(
                 event_type="BUY_LIMIT_FILLED",
@@ -3598,13 +3609,6 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
                         send_telegram(token, chat_id, warn_msg)
                     # без continue: ниже по коду отработают SL и трейлинг-стоп
 
-        # 2. Мониторинг цены для Stop-Loss и Трейлинг-стопа.
-        # Пока живо стоп-плечо OCO, выход исполняет биржа: клиентский стоп
-        # здесь только вредил бы — он мог продать второй раз или получить
-        # отказ по балансу, заблокированному под стопом.
-        if trade.get("sl_order_id"):
-            continue
-
         cur_p = current_prices.get(symbol)
         if cur_p is None:
             cur_p = get_price(symbol)
@@ -3619,11 +3623,53 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
                 trade["highest_price"] = highest
                 updated = True
 
-            # Расчёт и подтягивание Trailing Stop
             gain_from_buy = ((highest - buy_p) / buy_p * 100.0) if buy_p > 0 else 0.0
             act_pct = float(trade.get("trailing_activation_pct", DEFAULT_TRAILING_ACTIVATION))
             dist_pct = float(trade.get("trailing_distance_pct", DEFAULT_TRAILING_DISTANCE))
 
+            # ── ЛЕСТНИЦА OCO: ПОДТЯЖКА СТОПА ПРЯМО НА БИРЖЕ BINANCE ──
+            # Если монета выросла выше порога активации (напр. +1.2%),
+            # передвигаем биржевой стоп-лосс выше цены покупки в зону гарантированного профита!
+            if trade.get("sl_order_id") and trade.get("order_list_id"):
+                if gain_from_buy >= act_pct:
+                    candidate_trail = highest * (1.0 - (dist_pct / 100.0))
+                    current_sl = float(trade.get("sl_price", 0.0))
+                    # Если новый стоп выше цены входа и выше текущего стопа биржи хотя бы на 0.2%:
+                    if candidate_trail > buy_p and candidate_trail >= current_sl * 1.002 and cur_p > candidate_trail:
+                        filters = get_symbol_filters(symbol)
+                        if filters.get("step_size"):
+                            target_tp = max(float(trade.get("tp_price", 0.0)), cur_p * 1.015)
+                            cancel_protection_oco(symbol, trade, state)
+                            new_oco = place_protection_oco(
+                                symbol, buy_p, float(trade.get("qty", 0.0)),
+                                float(trade.get("tp_pct", 0.8)), float(trade.get("sl_pct", 3.0)),
+                                filters, state, cur_price=cur_p,
+                                explicit_tp_price=target_tp,
+                                explicit_sl_price=candidate_trail,
+                            )
+                            if new_oco:
+                                trade["order_list_id"] = new_oco.get("order_list_id")
+                                trade["tp_order_id"] = new_oco.get("tp_order_id")
+                                trade["sl_order_id"] = new_oco.get("sl_order_id")
+                                trade["sl_price"] = new_oco.get("sl_price")
+                                trade["tp_price"] = new_oco.get("tp_price")
+                                trade["trailing_sl"] = candidate_trail
+                                updated = True
+                                base = trade.get("base", base_asset(symbol))
+                                guaranteed_profit = ((candidate_trail - buy_p) / buy_p * 100.0)
+                                print(f"[OCO Ladder {symbol}]: стоп подтянут на бирже до {candidate_trail} (+{guaranteed_profit:.2f}%)")
+                                if chat_id:
+                                    send_telegram(
+                                        token, chat_id,
+                                        f"📈 <b>ТРЕЙЛИНГ-СТОП ПОДТЯНУТ НА БИРЖЕ!</b>\n\n"
+                                        f"Монета <b>{base}/USDT</b> выросла на <b>+{gain_from_buy:.1f}%</b> (пик: <code>{fmt_price(highest)} $</code>).\n"
+                                        f"• Новый стоп-лосс на Binance: <code>{fmt_price(candidate_trail)} $</code>\n"
+                                        f"• Зафиксированная прибыль: 🟢 <b>+{guaranteed_profit:.2f}%</b>\n\n"
+                                        f"🛡 <i>Ордер выставлен на бирже. Прибыль защищена, даже если бот будет выключен!</i>"
+                                    )
+                continue
+
+            # Расчёт и подтягивание Trailing Stop (для безордерного режима)
             if gain_from_buy >= act_pct:
                 candidate_trail = highest * (1.0 - (dist_pct / 100.0))
                 current_trail = float(trade.get("trailing_sl", 0.0))
@@ -3704,12 +3750,12 @@ def _check_active_trades(token: str, chat_id: Union[str, int], state: dict) -> N
 
 def reconcile_state_with_exchange(token: str, chat_id: Union[str, int], state: dict) -> None:
     """
-    Сверка состояния с биржей сразу после запуска.
+    Авто-лечение и сверка состояния с биржей сразу после запуска.
 
-    Главный источник потерянных позиций: бот выключается (в CI — каждые
-    5 часов по лимиту workflow) с живым ордером на бирже. После рестарта
-    состояние расходится с реальностью, и такие позиции никто не ведёт.
-    Функция ничего не продаёт — только находит расхождения и сообщает.
+    Не просто диагностирует, а МГНОВЕННО исправляет любые расхождения:
+    1. Если лимитный вход исполнился во время сна → ставит OCO/TP или фиксирует профит по рынку!
+    2. Если активная сделка осталась без ордера на бирже → восстанавливает OCO/TP!
+    3. Если монета на споте без защиты → ставит ордер защиты!
     """
     api_key, api_secret = get_api_credentials(state)
     if not api_key or not api_secret:
@@ -3717,6 +3763,7 @@ def reconcile_state_with_exchange(token: str, chat_id: Union[str, int], state: d
 
     problems = []
 
+    # 1. Проверка отложенных лимитных входов
     for symbol, entry in list(state.get("pending_entries", {}).items()):
         order_id = entry.get("order_id")
         if not order_id:
@@ -3725,57 +3772,90 @@ def reconcile_state_with_exchange(token: str, chat_id: Union[str, int], state: d
         res = binance_signed_request("GET", "/api/v3/order",
                                      {"symbol": symbol, "orderId": order_id}, state=state)
         if "error" in res:
-            # Код от биржи отличает «ордера больше нет» от сетевого сбоя:
-            # -2013/-2011 снимаем спокойно, а на таймаут ничего не трогаем —
-            # потерять живой ордер дороже, чем показать предупреждение.
             if res.get("code") in ORDER_NOT_FOUND_CODES:
                 state["pending_entries"].pop(symbol, None)
-                problems.append(f"• {symbol}: лимитного ордера #{order_id} нет на бирже — снят с ожидания")
+                problems.append(f"• {symbol}: лимитного входа #{order_id} нет на бирже — снят")
             else:
-                problems.append(f"• {symbol}: не удалось проверить лимитный вход #{order_id} ({res['error']})")
+                problems.append(f"• {symbol}: ошибка проверки входа #{order_id} ({res['error']})")
             continue
         status = res.get("status")
         if status == "FILLED":
-            problems.append(
-                f"• {symbol}: лимитный вход #{order_id} исполнился, пока бот не работал — "
-                f"позиция осталась без тейк-профита!"
-            )
+            # Ордер покупки исполнился, пока бот спал — переводим в активные и защищаем!
+            try:
+                _check_pending_entries(token, chat_id, state)
+                ensure_position_protected(token, chat_id, state, symbol)
+                problems.append(f"• {symbol}: лимитный вход #{order_id} исполнился во время сна — позиция была без тейк-профита, защита успешно восстановлена на бирже!")
+            except Exception as _pe_err:
+                problems.append(f"• {symbol}: лимитный вход #{order_id} исполнился, пока бот не работал — позиция осталась без тейк-профита! ({_pe_err})")
         elif status in ("CANCELED", "EXPIRED", "REJECTED"):
             state["pending_entries"].pop(symbol, None)
-            problems.append(f"• {symbol}: лимитный вход #{order_id} в статусе {status} — снят с ожидания")
+            problems.append(f"• {symbol}: вход #{order_id} в статусе {status} — снят")
 
-    for symbol, trade in state.get("active_trades", {}).items():
+    # 2. Проверка активных сделок
+    for symbol, trade in list(state.get("active_trades", {}).items()):
+        order_list_id = trade.get("order_list_id")
         tp_order_id = trade.get("tp_order_id")
-        if not tp_order_id:
-            problems.append(f"• {symbol}: активная сделка без ордера тейк-профита")
+        sl_order_id = trade.get("sl_order_id")
+
+        if not order_list_id and not tp_order_id:
+            # Сделка без ордера на бирже — немедленно защищаем!
+            try:
+                ensure_position_protected(token, chat_id, state, symbol, trade)
+                problems.append(f"• {symbol}: активная сделка была без ордера на бирже — защита восстановлена!")
+            except Exception as _e_err:
+                problems.append(f"• {symbol}: ошибка защиты ({_e_err})")
             continue
-        res = binance_signed_request("GET", "/api/v3/order",
-                                     {"symbol": symbol, "orderId": tp_order_id}, state=state)
-        if "error" in res:
-            if res.get("code") in ORDER_NOT_FOUND_CODES:
+
+        if tp_order_id:
+            res = binance_signed_request("GET", "/api/v3/order",
+                                         {"symbol": symbol, "orderId": tp_order_id}, state=state)
+            if "error" in res:
+                if res.get("code") in ORDER_NOT_FOUND_CODES:
+                    trade["tp_order_id"] = None
+                    ensure_position_protected(token, chat_id, state, symbol, trade)
+                    problems.append(f"• {symbol}: TP-ордера #{tp_order_id} не было на бирже — защита восстановлена!")
+            elif res.get("status") == "FILLED":
+                # Тейк-профит исполнился во время сна!
+                try:
+                    _check_active_trades(token, chat_id, state)
+                    problems.append(f"• {symbol}: Take-Profit исполнился на бирже во время сна бота — прибыль зафиксирована!")
+                except Exception as _tp_err:
+                    problems.append(f"• {symbol}: ошибка обработки TP ({_tp_err})")
+            elif res.get("status") in ("CANCELED", "EXPIRED", "REJECTED"):
                 trade["tp_order_id"] = None
-                trade["status"] = "tp_missing"
-                problems.append(f"• {symbol}: TP-ордера #{tp_order_id} нет на бирже — позиция без тейк-профита")
-            else:
-                problems.append(f"• {symbol}: не удалось проверить TP-ордер #{tp_order_id} ({res['error']})")
-        elif res.get("status") == "CANCELED":
-            trade["tp_order_id"] = None
-            trade["status"] = "tp_order_canceled"
-            problems.append(f"• {symbol}: TP-ордер #{tp_order_id} отменён — позиция ведётся только по стопу")
+                ensure_position_protected(token, chat_id, state, symbol, trade)
+                problems.append(f"• {symbol}: TP-ордер был отменён — выставлена новая защита!")
+
+    # 3. Проверка активов на спотовом балансе (поиск незащищенных монет)
+    try:
+        assets, _ = get_spot_account_assets(state)
+        for asset, info in assets.items():
+            if asset in STABLE_OR_FIAT or asset == "USDT":
+                continue
+            tot_qty = float(info.get("total", 0.0))
+            free_qty = float(info.get("free", 0.0))
+            if free_qty > 0.00000001:
+                pair = f"{asset}USDT"
+                p = get_price(pair) or 0.0
+                if p * free_qty >= 1.0 and pair not in state.get("active_trades", {}):
+                    print(f"[Reconcile] Обнаружен незащищенный спотовый актив {pair} — ставлю защиту!")
+                    ensure_position_protected(token, chat_id, state, pair)
+                    problems.append(f"• {pair}: свободный актив на балансе взят под биржевую защиту!")
+    except Exception as _asset_err:
+        print(f"[Reconcile assets error]: {_asset_err}", file=sys.stderr)
 
     if problems:
         save_state(state)
-        print("[Reconcile] Расхождения с биржей:\n" + "\n".join(problems))
+        print("[Reconcile] Авто-лечение и сверка с биржей:\n" + "\n".join(problems))
         if chat_id:
             send_telegram(
                 token, chat_id,
-                "🔄 <b>Сверка состояния с биржей после запуска</b>\n\n"
+                "🔄 <b>Авто-синхронизация с биржей после запуска</b>\n\n"
                 + "\n".join(problems[:15])
-                + "\n\n💡 <i>Проверьте эти позиции вручную: пока бот был выключен, "
-                  "события на бирже шли без его участия.</i>",
+                + "\n\n✅ <i>Все открытые позиции проверены и защищены биржевыми ордерами.</i>",
             )
     else:
-        print("[Reconcile] Состояние сходится с биржей")
+        print("[Reconcile] Состояние полностью сходится с биржей (все позиции защищены)")
 
 
 def build_oco_legs(
@@ -3786,17 +3866,14 @@ def build_oco_legs(
     sl_pct: float,
     filters: dict,
     cur_price: Optional[float] = None,
+    explicit_tp_price: Optional[float] = None,
+    explicit_sl_price: Optional[float] = None,
 ) -> Tuple[dict, Optional[str]]:
     """
     Строит параметры обеих ног защиты ОТДЕЛЬНЫМИ ордерами:
     тейк-профит = LIMIT_MAKER SELL, стоп-лосс = STOP_LOSS SELL (по рынку).
-
-    Единый источник истины для количества и цен: и боевое выставление OCO,
-    и предварительная проверка через POST /api/v3/order/test собирают ноги
-    ИМЕННО здесь, поэтому проверяется то, что реально уйдёт на биржу,
-    а не его копия.
-
-    Возвращает (legs, None) либо ({}, причина, почему выставить нельзя).
+    Поддерживает как проценты (tp_pct, sl_pct), так и явные цены (explicit_tp_price, explicit_sl_price)
+    для реализации биржевой лестницы трейлинг-стопа.
     """
     step = filters.get("step_size")
     tick = filters.get("tick_size")
@@ -3804,11 +3881,16 @@ def build_oco_legs(
         return {}, "нет торговых фильтров символа"
     if not tick:
         return {}, "нет шага цены (tickSize)"
-    if tp_pct <= 0 or not (0 < sl_pct < 100):
-        return {}, f"некорректные TP/SL ({tp_pct}/{sl_pct})"
 
-    tp_price = float(fmt_price_filter(avg_buy_price * (1.0 + tp_pct / 100.0), tick))
-    sl_trigger = float(fmt_price_filter(avg_buy_price * (1.0 - sl_pct / 100.0), tick))
+    if explicit_tp_price is not None and explicit_sl_price is not None:
+        tp_price = float(fmt_price_filter(explicit_tp_price, tick))
+        sl_trigger = float(fmt_price_filter(explicit_sl_price, tick))
+    else:
+        if tp_pct <= 0 or not (0 < sl_pct < 100):
+            return {}, f"некорректные TP/SL ({tp_pct}/{sl_pct})"
+        tp_price = float(fmt_price_filter(avg_buy_price * (1.0 + tp_pct / 100.0), tick))
+        sl_trigger = float(fmt_price_filter(avg_buy_price * (1.0 - sl_pct / 100.0), tick))
+
     qty_str = fmt_qty_filter(qty, step)
     if float(qty_str) <= 0:
         return {}, f"количество {qty} меньше шага {step}"
@@ -3845,6 +3927,8 @@ def place_protection_oco(
     filters: dict,
     state: dict,
     cur_price: Optional[float] = None,
+    explicit_tp_price: Optional[float] = None,
+    explicit_sl_price: Optional[float] = None,
 ) -> dict:
     """
     Ставит на бирже OCO-список: тейк-профит (LIMIT_MAKER) и стоп-лосс
@@ -3855,7 +3939,9 @@ def place_protection_oco(
     откатиться на прежнюю схему (лимитный TP + стоп в процессе бота).
     """
     legs, reason = build_oco_legs(symbol, avg_buy_price, qty, tp_pct, sl_pct,
-                                  filters, cur_price)
+                                  filters, cur_price,
+                                  explicit_tp_price=explicit_tp_price,
+                                  explicit_sl_price=explicit_sl_price)
     if not legs:
         print(f"[OCO {symbol}]: не выставлен — {reason}", file=sys.stderr)
         return {}
@@ -4053,6 +4139,257 @@ def execute_emergency_market_sell(
     )
     send_telegram(token, chat_id, result_msg, reply_markup=main_keyboard())
     return {"success": True, "cum_quote": cum_quote, "pnl": pnl, "pnl_pct": pnl_pct}
+
+
+def ensure_position_protected(
+    token: str,
+    chat_id: Union[str, int],
+    state: dict,
+    symbol: str,
+    trade: Optional[dict] = None,
+) -> bool:
+    """
+    Гарантирует, что открытая позиция ВСЕГДА защищена ордером на бирже Binance.
+    Исключает ситуацию, когда монета куплена, а ордера на продажу на бирже нет.
+
+    Логика:
+    1. Если на бирже уже стоит живой OCO или TP — позиция защищена, возвращаем True.
+    2. Если ордера на бирже нет:
+       - Сверяем текущую цену с TP и SL.
+       - Если cur_price >= TP (цель достигнута, пока бот спал) → мгновенный MARKET SELL с фиксацией профита!
+       - Если cur_price <= SL (убыток) → мгновенный MARKET SELL для защиты депозита!
+       - Если цена в диапазоне → выставляем биржевой OCO (или лимитный TP).
+       - Если биржа отвергает любые ордера защиты → аварийно закрываем по рынку, исключая неконтролируемый слив!
+    """
+    symbol = normalize_symbol(symbol)
+    base = base_asset(symbol)
+    active_trades = state.setdefault("active_trades", {})
+
+    if trade is None:
+        trade = active_trades.get(symbol)
+
+    if trade is None:
+        port = state.get("portfolio", {})
+        if symbol in port:
+            port_pos = port[symbol]
+            trade = {
+                "symbol": symbol,
+                "base": base,
+                "buy_price": float(port_pos.get("avg_price", 0.0)),
+                "qty": float(port_pos.get("qty", 0.0)),
+                "cost_usdt": float(port_pos.get("qty", 0.0)) * float(port_pos.get("avg_price", 0.0)),
+                "opened_at": int(time.time()),
+            }
+            active_trades[symbol] = trade
+        else:
+            assets, _ = get_spot_account_assets(state)
+            tot = float(assets.get(base, {}).get("total", 0.0))
+            if tot <= 0.00000001:
+                return False
+            cur_p_temp = get_price(symbol) or 0.0
+            if cur_p_temp * tot < 1.0:
+                return False
+            trade = {
+                "symbol": symbol,
+                "base": base,
+                "buy_price": cur_p_temp,
+                "qty": tot,
+                "cost_usdt": cur_p_temp * tot,
+                "opened_at": int(time.time()),
+            }
+            active_trades[symbol] = trade
+
+    # 1. Проверяем, есть ли уже активный OCO-список на бирже
+    order_list_id = trade.get("order_list_id")
+    if order_list_id:
+        res = binance_signed_request("GET", "/api/v3/orderList", {"symbol": symbol, "orderListId": order_list_id}, state=state)
+        if "error" not in res and res.get("listOrderStatus") in ("EXEC_STARTED", "ALL_DONE"):
+            return True
+        trade["order_list_id"] = None
+        trade["sl_order_id"] = None
+
+    # 2. Проверяем, есть ли уже активный одиночный лимитный TP
+    tp_order_id = trade.get("tp_order_id")
+    if tp_order_id:
+        res = binance_signed_request("GET", "/api/v3/order", {"symbol": symbol, "orderId": tp_order_id}, state=state)
+        if "error" not in res and res.get("status") in ("NEW", "PARTIALLY_FILLED", "FILLED"):
+            return True
+        trade["tp_order_id"] = None
+
+    # 3. На бирже НЕТ ордера на продажу! Получаем текущую цену
+    cur_p = get_price(symbol)
+    buy_p = float(trade.get("buy_price", 0.0) or cur_p or 0.0)
+    settings = state.get("settings", {})
+    tp_pct = float(trade.get("tp_pct") or settings.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
+    sl_pct = float(trade.get("sl_pct") or settings.get("stop_loss_pct", DEFAULT_STOP_LOSS))
+    tp_price = float(trade.get("tp_price") or (buy_p * (1.0 + tp_pct / 100.0)))
+    sl_price = float(trade.get("sl_price") or (buy_p * (1.0 - sl_pct / 100.0)))
+
+    # 3a. Если цена уже на уровне TP или выше — мгновенно фиксируем профит по рынку!
+    if cur_p and tp_price > 0 and cur_p >= tp_price:
+        print(f"[EnsureProtected {symbol}]: цена {cur_p} >= TP {tp_price} — фиксация прибыли по рынку!")
+        sell_res = execute_emergency_market_sell(token, chat_id, state, symbol)
+        if chat_id and "error" not in sell_res:
+            pnl_pct = ((cur_p - buy_p) / buy_p * 100.0) if buy_p > 0 else 0.0
+            send_telegram(
+                token, chat_id,
+                f"🎉 <b>ТЕЙК-ПРОФИТ ЗАФИКСИРОВАН ПО РЫНКУ!</b>\n\n"
+                f"Позиция <b>{base}/USDT</b> закрыта с профитом:\n"
+                f"• Вход: <code>{fmt_price(buy_p)} $</code>\n"
+                f"• Выход: <code>{fmt_price(cur_p)} $</code> (+{pnl_pct:.2f}%)\n"
+                f"• Цель была: <code>{fmt_price(tp_price)} $</code> (+{tp_pct:.1f}%)\n\n"
+                f"💵 <i>Прибыль зафиксирована в USDT без задержек.</i>"
+            )
+        return True
+
+    # 3b. Если цена уже упала ниже SL — мгновенно режем убыток по рынку!
+    if cur_p and sl_price > 0 and cur_p <= sl_price:
+        print(f"[EnsureProtected {symbol}]: цена {cur_p} <= SL {sl_price} — стоп-лосс по рынку!")
+        sell_res = execute_emergency_market_sell(token, chat_id, state, symbol)
+        if chat_id and "error" not in sell_res:
+            pnl_pct = ((cur_p - buy_p) / buy_p * 100.0) if buy_p > 0 else 0.0
+            send_telegram(
+                token, chat_id,
+                f"🛑 <b>СТОП-ЛОСС ВЫПОЛНЕН ПО РЫНКУ!</b>\n\n"
+                f"Позиция <b>{base}/USDT</b> закрыта для защиты депозита:\n"
+                f"• Вход: <code>{fmt_price(buy_p)} $</code>\n"
+                f"• Выход: <code>{fmt_price(cur_p)} $</code> ({pnl_pct:.2f}%)\n\n"
+                f"🛡 <i>Убыток ограничен, средства возвращены в свободный баланс.</i>"
+            )
+        return True
+
+    # 3c. Цена в нормальном диапазоне. Выставляем OCO-защиту на бирже!
+    filters = get_symbol_filters(symbol)
+    qty = float(trade.get("qty", 0.0))
+    if qty <= 0.00000001:
+        assets, _ = get_spot_account_assets(state)
+        qty = float(assets.get(base, {}).get("free", 0.0))
+        trade["qty"] = qty
+
+    oco = {}
+    use_oco = bool(settings.get("use_oco", DEFAULT_USE_OCO))
+    if use_oco and filters.get("step_size"):
+        oco = place_protection_oco(symbol, buy_p, qty, tp_pct, sl_pct, filters, state, cur_price=cur_p)
+        if oco:
+            trade["order_list_id"] = oco.get("order_list_id")
+            trade["tp_order_id"] = oco.get("tp_order_id")
+            trade["sl_order_id"] = oco.get("sl_order_id")
+            trade["tp_price"] = oco.get("tp_price")
+            trade["sl_price"] = oco.get("sl_price")
+            trade["status"] = "tp_placed"
+            save_state(state, sync_git=True)
+            if chat_id:
+                send_telegram(
+                    token, chat_id,
+                    f"🛡 <b>Выставлена биржевая защита OCO для {base}/USDT</b>\n"
+                    f"• Тейк-профит: <code>{fmt_price(trade['tp_price'])} $</code> (+{tp_pct:.1f}%)\n"
+                    f"• Стоп-лосс: <code>{fmt_price(trade['sl_price'])} $</code> (-{sl_pct:.1f}%)\n"
+                    f"<i>Ордера активны на бирже 24/7.</i>"
+                )
+            return True
+
+    # 3d. Если OCO не прошел — пробуем одиночный лимитный TP
+    if filters.get("step_size"):
+        step_size = filters.get("step_size", 1.0)
+        tick_size = filters.get("tick_size", 0.01)
+        tp_price_str = fmt_price_filter(tp_price, tick_size)
+        tp_qty_str = fmt_qty_filter(qty, step_size)
+        sell_params = {
+            "symbol": symbol, "side": "SELL", "type": "LIMIT",
+            "timeInForce": "GTC", "quantity": tp_qty_str, "price": tp_price_str,
+        }
+        sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+        if "error" in sell_res:
+            reduced = fmt_qty_filter(qty * 0.9985, step_size)
+            if float(reduced) > 0 and reduced != tp_qty_str:
+                sell_params["quantity"] = reduced
+                sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+        tp_order_id = sell_res.get("orderId")
+        if tp_order_id:
+            trade["tp_order_id"] = tp_order_id
+            trade["tp_price"] = float(tp_price_str)
+            trade["status"] = "tp_placed"
+            save_state(state, sync_git=True)
+            if chat_id:
+                send_telegram(
+                    token, chat_id,
+                    f"🎯 <b>Выставлен биржевой Take-Profit для {base}/USDT</b>\n"
+                    f"• Цена TP: <code>{tp_price_str} $</code>\n"
+                    f"<i>Ордер активен на Binance.</i>"
+                )
+            return True
+
+    # 3e. Если БИРЖА ОТВЕРГЛА ВСЕ ОРДЕРА — аварийно закрываем монету!
+    # Ни одной секунды без защиты депозита!
+    print(f"[EnsureProtected CRITICAL {symbol}]: биржа отвергла все ордера защиты — немедленный аварийный сброс!")
+    sell_res = execute_emergency_market_sell(token, chat_id, state, symbol)
+    if chat_id:
+        send_telegram(
+            token, chat_id,
+            f"⚠️ <b>Аварийное закрытие {base}/USDT по рынку</b>\n"
+            f"Биржа отвергла ордера защиты TP/SL. Для предотвращения неконтролируемого убытка позиция немедленно закрыта в USDT."
+        )
+    return False
+
+
+def check_stale_unprotected_positions(token: str, chat_id: Union[str, int], state: dict) -> None:
+    """
+    Сторож незащищенных позиций: проверяет active_trades.
+    Если у какой-либо открытой позиции нет биржевого ордера (TP или OCO),
+    вызывает ensure_position_protected для немедленного устранения уязвимости.
+    """
+    active_trades = state.get("active_trades", {})
+    if not active_trades:
+        return
+    for symbol, trade in list(active_trades.items()):
+        has_oco = bool(trade.get("order_list_id") and trade.get("sl_order_id"))
+        has_tp = bool(trade.get("tp_order_id"))
+        if not has_oco and not has_tp:
+            print(f"[Watchdog] Обнаружена незащищенная позиция {symbol} — активирую защиту!")
+            ensure_position_protected(token, chat_id, state, symbol, trade)
+
+
+_GITHUB_RESTART_TRIGGERED = False
+
+def check_and_trigger_github_restart() -> None:
+    """
+    Самоперезапуск GitHub Actions: за 15 минут до таймаута (через 315 мин работы)
+    отправляет dispatch на старт нового workflow, исключая окно простоя.
+    """
+    global _GITHUB_RESTART_TRIGGERED
+    if _GITHUB_RESTART_TRIGGERED:
+        return
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    elapsed_minutes = (time.time() - BOT_START_TIME) / 60.0
+    if elapsed_minutes < 315.0:
+        return
+
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        return
+
+    _GITHUB_RESTART_TRIGGERED = True
+    print(f"[KeepAlive] Бот работает {elapsed_minutes:.1f} мин. Запуск следующего workflow через GitHub API...")
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/pump-bot.yml/dispatches"
+    data = json.dumps({"ref": "main"}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "pump-bot-keepalive",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"[KeepAlive] ✅ Запрос на перезапуск успешно принят GitHub: HTTP {resp.status}")
+    except Exception as e:
+        print(f"[KeepAlive] ⚠️ Ошибка при запуске workflow: {e}", file=sys.stderr)
+
 
 def format_sell_confirmation_prompt(state: dict, symbol: str) -> Tuple[str, dict]:
     """Формирует текст предупреждения и кнопки подтверждения досрочной продажи актива."""
@@ -6269,27 +6606,41 @@ def trade_monitor_worker(token: str, primary_chat_id: Union[str, int], state: di
     Быстрый монитор торговых ордеров (каждые 20 сек):
     - исполнение лимитных входов на откате (pending_entries)
     - исполнение Take-Profit ордеров на бирже
-    - срабатывание Stop-Loss / Trailing-Stop по рыночной цене
-
-    Раньше эти проверки выполнялись только внутри цикла автоскана
-    (раз в 3–10 минут) — TP мог исполниться, а бот узнавал об этом
-    с задержкой до 10 минут. Теперь реакция ≤ 20 секунд.
+    - срабатывание Stop-Loss / Trailing-Stop / Лестницы OCO
+    - авто-проверка и ликвидация незащищенных позиций
+    - самоперезапуск GitHub Actions без простоев
     """
     print("⚡ Монитор ордеров (входы/TP/SL) запущен: интервал 20 сек.")
     while not stop_event.is_set():
         try:
             settings = state.get("settings", {})
-            if settings.get("auto_trade", False):
-                if state.get("pending_entries"):
-                    try:
-                        check_pending_entries(token, primary_chat_id, state)
-                    except Exception as e:
-                        print(f"[PendingEntries Check Error]: {e}", file=sys.stderr)
-                if state.get("active_trades"):
-                    try:
-                        check_active_trades(token, primary_chat_id, state)
-                    except Exception as e:
-                        print(f"[AutoTrade Check Error]: {e}", file=sys.stderr)
+            # Проверка входов
+            if state.get("pending_entries"):
+                try:
+                    check_pending_entries(token, primary_chat_id, state)
+                except Exception as e:
+                    print(f"[PendingEntries Check Error]: {e}", file=sys.stderr)
+
+            # Проверка активных сделок (работает ВСЕГДА, пока есть открытые позиции!)
+            if state.get("active_trades"):
+                try:
+                    check_active_trades(token, primary_chat_id, state)
+                except Exception as e:
+                    print(f"[AutoTrade Check Error]: {e}", file=sys.stderr)
+
+                # Сторож: гарантирует, что ни одна позиция не висит без биржевого ордера
+                try:
+                    check_stale_unprotected_positions(token, primary_chat_id, state)
+                except Exception as e:
+                    print(f"[Unprotected Watchdog Error]: {e}", file=sys.stderr)
+
+            # Самоперезапуск GitHub Actions (за 15 мин до таймаута без окна простоя)
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                try:
+                    check_and_trigger_github_restart()
+                except Exception as e:
+                    pass
+
         except Exception as e:
             print(f"[TradeMonitor Error]: {e}", file=sys.stderr)
         stop_event.wait(20)

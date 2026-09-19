@@ -67,6 +67,7 @@ class TradeSafetyTest(unittest.TestCase):
         self._old_filters = pb.get_symbol_filters
         self._old_fetch = pb.fetch_klines
         self._old_emergency = pb.execute_emergency_market_sell
+        self._old_place_oco = pb.place_protection_oco
         pb.send_telegram = lambda token, chat, text, **kw: self.sent.append(text)
         self.price = 99.0
         pb.get_price = lambda sym: self.price
@@ -87,6 +88,7 @@ class TradeSafetyTest(unittest.TestCase):
         pb.get_symbol_filters = self._old_filters
         pb.fetch_klines = self._old_fetch
         pb.execute_emergency_market_sell = self._old_emergency
+        pb.place_protection_oco = self._old_place_oco
         for _k, _v in self._old_env.items():
             if _v is None:
                 os.environ.pop(_k, None)
@@ -1607,6 +1609,65 @@ class TradeSafetyTest(unittest.TestCase):
         self.assertEqual(len(batch2), 20)
         self.assertEqual(batch2[0]["symbol"], "COIN20USDT")
         self.assertEqual(batch2[-1]["symbol"], "COIN39USDT")
+
+    def test_ensure_position_protected_market_sells_when_price_above_tp(self):
+        """Когда цена выше цели TP, ensure_position_protected немедленно фиксирует профит по рынку."""
+        state = pb.default_state()
+        self.set_api_keys()
+        state["active_trades"]["BANKUSDT"] = {
+            "symbol": "BANKUSDT", "base": "BANK",
+            "buy_price": 0.0308, "qty": 200.0, "cost_usdt": 6.16,
+            "tp_price": 0.0310, "sl_price": 0.0298,
+            "tp_order_id": None, "order_list_id": None,
+        }
+        # Цена уже выше TP (0.0315 >= 0.0310)
+        pb.get_price = lambda sym: 0.0315
+        emergency_called = []
+        pb.execute_emergency_market_sell = lambda tok, cid, st, sym: emergency_called.append(sym) or {"success": True}
+
+        res = pb.ensure_position_protected("tok", "1", state, "BANKUSDT")
+        self.assertTrue(res)
+        self.assertIn("BANKUSDT", emergency_called)
+        self.assertTrue(any("ТЕЙК-ПРОФИТ ЗАФИКСИРОВАН" in m for m in self.sent))
+
+    def test_ensure_position_protected_places_oco_in_normal_range(self):
+        """Когда цена в нормальном диапазоне, ensure_position_protected ставит OCO на бирже."""
+        state = pb.default_state()
+        self.set_api_keys()
+        state["active_trades"]["TESTUSDT"] = {
+            "symbol": "TESTUSDT", "base": "TEST",
+            "buy_price": 100.0, "qty": 1.0, "cost_usdt": 100.0,
+            "tp_price": 100.8, "sl_price": 97.0,
+            "tp_order_id": None, "order_list_id": None,
+        }
+        pb.get_price = lambda sym: 100.2
+        pb.get_symbol_filters = lambda sym: {"step_size": 1.0, "tick_size": 0.1, "min_qty": 0.1}
+        pb.place_protection_oco = lambda sym, bp, q, tp, sl, f, s, **kw: {
+            "order_list_id": 999, "tp_order_id": 11, "sl_order_id": 22,
+            "tp_price": 100.8, "sl_price": 97.0, "qty": 1.0,
+        }
+
+        res = pb.ensure_position_protected("tok", "1", state, "TESTUSDT")
+        self.assertTrue(res)
+        trade = state["active_trades"]["TESTUSDT"]
+        self.assertEqual(trade["order_list_id"], 999)
+        self.assertEqual(trade["tp_order_id"], 11)
+        self.assertEqual(trade["sl_order_id"], 22)
+
+    def test_build_oco_legs_explicit_prices_for_ladder(self):
+        """Проверка расчета ног OCO с явными ценами для подтяжки стопа в плюс (лестница OCO)."""
+        filters = {"step_size": 1.0, "tick_size": 0.0001}
+        # Цена входа 0.0308, текущий рынок 0.0315, новый стоп 0.0312 (в плюс!), новый TP 0.0320
+        legs, err = pb.build_oco_legs(
+            "BANKUSDT", avg_buy_price=0.0308, qty=200.0,
+            tp_pct=0.8, sl_pct=3.0, filters=filters, cur_price=0.0315,
+            explicit_tp_price=0.0320, explicit_sl_price=0.0312
+        )
+        self.assertIsNone(err)
+        self.assertEqual(legs["tp_price"], 0.0320)
+        self.assertEqual(legs["sl_price"], 0.0312)
+        # Стоп выше цены входа (гарантия профита на бирже!)
+        self.assertGreater(legs["sl_price"], 0.0308)
 
 
 if __name__ == "__main__":
