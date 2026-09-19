@@ -2776,22 +2776,27 @@ def execute_pump_auto_trade(
     # Проверка наличия API-ключей
     api_key, api_secret = get_api_credentials(state)
     if not api_key or not api_secret:
-        msg = (
-            "⚠️ <b>Автоторговля: API-ключи Binance не настроены!</b>\n\n"
-            "Для автоматических сделок укажите ключи в <code>.env</code>:\n"
-            "<code>BINANCE_API_KEY=...</code>\n"
-            "<code>BINANCE_API_SECRET=...</code>\n"
-            "или введите команду <code>/api КЛЮЧ СЕКРЕТ</code> в чате бота."
-        )
-        send_telegram(token, chat_id, msg)
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+        if manual_amount is not None:
+            msg = (
+                "⚠️ <b>Автоторговля: API-ключи Binance не настроены!</b>\n\n"
+                "Для автоматических сделок укажите ключи в <code>.env</code>:\n"
+                "<code>BINANCE_API_KEY=...</code>\n"
+                "<code>BINANCE_API_SECRET=...</code>\n"
+                "или введите команду <code>/api КЛЮЧ СЕКРЕТ</code> в чате бота."
+            )
+            send_telegram(token, chat_id, msg)
+        else:
+            print(f"[AutoTrade] API-ключи не настроены — авто-вход в {sig.symbol} пропущен")
         return {"error": "API keys not configured"}
 
     # Разрешение суммы ставки по режиму
+    free_usdt_now = get_free_usdt_balance(state)
     if manual_amount is not None:
         trade_amt = float(manual_amount)
     else:
         trade_mode = settings.get("trade_mode", "fixed")
-        free_usdt_now = get_free_usdt_balance(state)
         if trade_mode == "all":
             trade_amt = max(0.0, free_usdt_now - 0.01)  # оставляем 0.01 USDT для комиссий
         elif trade_mode.startswith("pct:"):
@@ -2804,24 +2809,31 @@ def execute_pump_auto_trade(
             trade_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
 
     # Проверка свободного баланса USDT
-    free_usdt = get_free_usdt_balance(state)
-    if free_usdt < max(trade_amt, 1.0):
-        msg = (
-            f"⚠️ <b>Автоторговля: Недостаточно USDT для входа в {sig.base}!</b>\n\n"
-            f"• Требуется: <code>{trade_amt:.2f} USDT</code>\n"
-            f"• Свободно на споте: <code>{free_usdt:.2f} USDT</code>\n\n"
-            f"💡 Пополните баланс USDT на Binance или выберите меньший процент ставки в настройках."
-        )
-        send_telegram(token, chat_id, msg)
+    free_usdt = free_usdt_now
+    if free_usdt < max(trade_amt, 1.0) or trade_amt < 1.0:
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+        if manual_amount is not None:
+            msg = (
+                f"⚠️ <b>Недостаточно USDT для входа в {sig.base}!</b>\n\n"
+                f"• Требуется: <code>{trade_amt:.2f} USDT</code>\n"
+                f"• Свободно на споте: <code>{free_usdt:.2f} USDT</code>\n\n"
+                f"💡 Пополните баланс USDT на Binance или выберите меньший процент ставки в настройках."
+            )
+            send_telegram(token, chat_id, msg)
+        else:
+            print(f"[AutoTrade] Пропуск {sig.symbol}: средства заняты или недостаточно USDT (свободно {free_usdt:.2f} USDT)")
         return {"error": "Insufficient USDT balance"}
 
     # Получение фильтров торговой пары
     filters = get_symbol_filters(sig.symbol)
     if not filters.get("step_size"):
-        # Без точных фильтров считать количество нельзя: биржа отвергнет ордер
-        # по LOT_SIZE/PRICE_FILTER, а вход уже будет считаться начатым.
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
         return {"error": f"Не удалось получить торговые фильтры {sig.symbol} — вход отменён"}
     if filters.get("status") != "TRADING":
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
         return {"error": f"Пара {sig.symbol} временно не торгуется на бирже"}
     if filters.get("stale"):
         print(f"[AutoTrade] {sig.symbol}: фильтры из кэша (сеть недоступна) — "
@@ -2829,14 +2841,19 @@ def execute_pump_auto_trade(
 
     min_notional = float(filters.get("min_notional", 5.0))
     if trade_amt < min_notional:
-        msg = (
-            f"⚠️ <b>Сумма ордера меньше минимума биржи!</b>\n\n"
-            f"• Выбранная сумма: <code>{trade_amt:.2f} USDT</code>\n"
-            f"• Минимальный ордер Binance для {sig.base}/USDT: <code>{min_notional:.1f} USDT</code>\n"
-            f"• Свободно на споте: <code>{free_usdt:.2f} USDT</code>\n\n"
-            f"💡 <i>Биржа Binance требует минимум {min_notional:.0f} USDT на один ордер. Пополните баланс спота хотя бы до {min_notional:.0f} USDT.</i>"
-        )
-        send_telegram(token, chat_id, msg)
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+        if manual_amount is not None:
+            msg = (
+                f"⚠️ <b>Сумма ордера меньше минимума биржи!</b>\n\n"
+                f"• Выбранная сумма: <code>{trade_amt:.2f} USDT</code>\n"
+                f"• Минимальный ордер Binance для {sig.base}/USDT: <code>{min_notional:.1f} USDT</code>\n"
+                f"• Свободно на споте: <code>{free_usdt:.2f} USDT</code>\n\n"
+                f"💡 <i>Биржа Binance требует минимум {min_notional:.0f} USDT на один ордер. Пополните баланс спота хотя бы до {min_notional:.0f} USDT.</i>"
+            )
+            send_telegram(token, chat_id, msg)
+        else:
+            print(f"[AutoTrade] Пропуск {sig.symbol}: сумма {trade_amt:.2f} < мин. лота {min_notional:.1f} USDT (свободно {free_usdt:.2f} USDT)")
         return {"error": f"Filter failure: NOTIONAL (amount {trade_amt:.2f} < min {min_notional:.1f} USDT)"}
 
     step_size = filters.get("step_size", 1.0)
@@ -6669,11 +6686,15 @@ def autoscan_worker(token: str, primary_chat_id: Union[str, int], state: dict, s
                 trade_min_score = settings.get("trade_min_score", DEFAULT_TRADE_MIN_SCORE)
                 if auto_trade_enabled and sig.best_score >= trade_min_score:
                     if primary_str:
-                        try:
-                            print(f"[AutoTrade] Вход по сигналу {sig.symbol} (score {sig.best_score:.1f})...")
-                            execute_pump_auto_trade(token, primary_str, state, sig)
-                        except Exception as e:
-                            print(f"[AutoTrade Error for {sig.symbol}]: {e}", file=sys.stderr)
+                        free_usdt_quick = get_free_usdt_balance(state)
+                        if free_usdt_quick < 5.0:
+                            print(f"[AutoTrade] Пропуск {sig.symbol}: средства в сделках/ордерах (свободно {free_usdt_quick:.2f} USDT < 5.0)")
+                        else:
+                            try:
+                                print(f"[AutoTrade] Вход по сигналу {sig.symbol} (score {sig.best_score:.1f})...")
+                                execute_pump_auto_trade(token, primary_str, state, sig)
+                            except Exception as e:
+                                print(f"[AutoTrade Error for {sig.symbol}]: {e}", file=sys.stderr)
 
             if new_alerts_count > 0:
                 save_state(state, sync_git=True)
