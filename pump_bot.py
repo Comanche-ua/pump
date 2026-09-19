@@ -1770,8 +1770,10 @@ def _git_sync_state() -> None:
         subprocess.run(["git", "config", "user.name", "github-actions[bot]"], capture_output=True, timeout=5)
         subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], capture_output=True, timeout=5)
         subprocess.run(["git", "add", STATE_FILE], capture_output=True, timeout=5)
-        subprocess.run(["git", "commit", "-m", "Auto-update portfolio [skip ci]"], capture_output=True, timeout=5)
-        subprocess.run(["git", "push"], capture_output=True, timeout=10)
+        res = subprocess.run(["git", "commit", "-m", "Auto-update portfolio [skip ci]"], capture_output=True, timeout=5)
+        if res.returncode == 0:
+            subprocess.run(["git", "pull", "--rebase", "origin", "main"], capture_output=True, timeout=10)
+            subprocess.run(["git", "push"], capture_output=True, timeout=10)
     except Exception:
         pass
 
@@ -1865,6 +1867,9 @@ def record_closed_trade(state: dict, closed_rec: dict) -> None:
     """Сохраняет закрытую сделку в историю и обновляет кумулятивную статистику за всё время."""
     with STATE_LOCK:
         history = state.setdefault("trade_history", [])
+        t_id = closed_rec.get("trade_id")
+        if t_id and any(h.get("trade_id") == t_id for h in history):
+            return
         history.append(closed_rec)
         if len(history) > 100:
             history.pop(0)
@@ -1879,6 +1884,7 @@ def record_closed_trade(state: dict, closed_rec: dict) -> None:
         stats["total_pnl"] = float(stats.get("total_pnl", 0.0)) + pnl
         if pnl > 0:
             stats["winning_trades"] = int(stats.get("winning_trades", 0)) + 1
+    save_state(state, sync_git=True)
 
 def record_signal_history(state: dict, sig: Any) -> None:
     """Сохраняет сигнал в историю за последнюю неделю (7 дней)."""
@@ -4948,10 +4954,23 @@ def _sync_trades_and_active_positions(state: dict) -> None:
                 active_trades.pop(sym, None)
 
         # 4. Синхронизируем историю закрытых сделок через Binance myTrades
-        all_traded_syms = list(set(list(portfolio.keys()) + [f"{a}USDT" for a in valid_assets.keys()] + ["TRXUSDT", "BTCUSDT", "SOLUSDT"]))
+        candidate_bases = set(["BANK", "TRX", "BTC", "ETH", "SOL"])
+        for a, a_info in assets.items():
+            if a not in STABLE_OR_FIAT and a != "USDT":
+                candidate_bases.add(a)
+        for s in list(portfolio.keys()) + list(active_trades.keys()):
+            candidate_bases.add(base_asset(s))
+        for sig in state.get("signals_history", []):
+            if isinstance(sig, dict) and sig.get("base"):
+                candidate_bases.add(sig["base"])
+        for h in history:
+            if isinstance(h, dict) and h.get("base"):
+                candidate_bases.add(h["base"])
+
+        all_traded_syms = list(set([f"{b}USDT" for b in candidate_bases if b]))
         for sym in all_traded_syms:
             try:
-                my_trades = binance_signed_request("GET", "/api/v3/myTrades", {"symbol": sym, "limit": 15}, state=state)
+                my_trades = binance_signed_request("GET", "/api/v3/myTrades", {"symbol": sym, "limit": 20}, state=state)
                 if not isinstance(my_trades, list):
                     continue
 
@@ -4970,13 +4989,13 @@ def _sync_trades_and_active_positions(state: dict) -> None:
                     s_quote = float(s_trade.get("quoteQty", s_price * s_qty))
 
                     # Ищем предшествующую покупку
-                    prev_buys = [b for b in buys if b.get("time", 0) < s_trade.get("time", 0)]
+                    prev_buys = [b for b in buys if int(b.get("time", 0)) <= int(s_trade.get("time", 0))]
                     if prev_buys:
                         b_trade = prev_buys[-1]
-                        b_price = float(b_trade.get("price", s_price * (1 - DEFAULT_STOP_LOSS / 100)))
+                        b_price = float(b_trade.get("price", 0.0)) or (float(b_trade.get("quoteQty", 0.0)) / max(float(b_trade.get("qty", 1.0)), 0.0000001))
                         b_time = int(b_trade.get("time", 0)) // 1000
                     else:
-                        b_price = s_price * (1 - DEFAULT_STOP_LOSS / 100)
+                        b_price = s_price * 0.993
                         b_time = s_time - 3600
 
                     cost = s_qty * b_price
@@ -5007,7 +5026,7 @@ def _sync_trades_and_active_positions(state: dict) -> None:
         if len(history) > 100:
             del history[:-100]
 
-        save_state(state)
+        save_state(state, sync_git=True)
     except Exception as e:
         print(f"⚠️ Ошибка синхронизации сделок с Binance: {e}", file=sys.stderr)
 
@@ -5176,11 +5195,18 @@ def format_portfolio(state: dict) -> str:
 def format_trades_and_profit_stats(state: dict) -> str:
     """
     Компактный журнал сделок по дням (сегодня / вчера).
-    НЕ вызывает sync — работает только с данными state + один batch-запрос цен для открытых позиций.
+    Если история пуста, автоматически опрашивает Binance myTrades для восстановления.
     """
+    history = state.get("trade_history", [])
+    if not history:
+        try:
+            _sync_trades_and_active_positions(state)
+        except Exception:
+            pass
+        history = state.get("trade_history", [])
+
     active_trades = state.get("active_trades", {})
     portfolio     = state.get("portfolio", {})
-    history       = state.get("trade_history", [])
     settings      = state.get("settings", {})
 
     trade_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
