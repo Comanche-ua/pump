@@ -2126,7 +2126,7 @@ def binance_signed_request(
         p["timestamp"] = int(time.time() * 1000) + offset
         p["recvWindow"] = 10000
 
-        query_str = urllib.parse.urlencode(p)
+        query_str = urllib.parse.urlencode(p, doseq=True)
         sig = hmac.new(api_secret.encode("utf-8"), query_str.encode("utf-8"), hashlib.sha256).hexdigest()
         signed_query = f"{query_str}&signature={sig}"
 
@@ -2531,25 +2531,56 @@ def get_dust_assets(state: dict, min_usdt: float = 1.0) -> list:
 
 def clean_dust_balances(token: str, chat_id: int, state: dict, min_usdt: float = 1.0) -> None:
     """
-    Находит и продает по MARKET все dust-активы (стоимость < min_usdt USDT),
-    которые не являются активными позициями. Отправляет отчет в Telegram.
+    Конвертирует криптопыль (остатки < min_usdt USDT) в BNB через официальный Binance SAPI (/sapi/v1/asset/dust).
+    Если SAPI недоступен — пробует рыночную продажу.
     """
     dust_list = get_dust_assets(state, min_usdt)
 
     if not dust_list:
         send_telegram(token, chat_id,
                       "✅ <b>Пыль не найдена.</b>\n\n"
-                      f"Все монеты (кроме USDT) стоят ≥ {min_usdt} USDT, "
+                      f"Все монеты стоят ≥ {min_usdt} USDT, "
                       "или это активные позиции бота.")
         return
 
-    # Показываем что будет продано
+    # Фильтруем монеты для конвертации в BNB (исключаем BNB и стейблкоины)
+    dust_candidates = [d for d in dust_list if d["asset"] not in ("BNB", "USDT", "USDC", "FDUSD", "BUSD") and d["free"] > 0.00000001]
+
     lines = [f"🧹 <b>Найдена пыль ({len(dust_list)} монет):</b>\n"]
     for d in dust_list:
         lines.append(f"• <b>{d['asset']}</b>: {fmt_qty(d['qty'])} ≈ <code>{d['val_usdt']:.4f} USDT</code>")
-    lines.append("\n⏳ <i>Продаю...</i>")
+    lines.append("\n⏳ <i>Конвертирую в BNB через Binance Dust API...</i>")
     msg_id = send_telegram(token, chat_id, "\n".join(lines))
 
+    # 1. Пробуем официальную пакетную конвертацию в BNB (/sapi/v1/asset/dust)
+    assets_to_convert = [d["asset"] for d in dust_candidates]
+    converted_bnb = 0.0
+    dust_res = {}
+    if assets_to_convert:
+        dust_res = binance_signed_request("POST", "/sapi/v1/asset/dust", {"asset": assets_to_convert}, state=state)
+
+    if isinstance(dust_res, dict) and "totalTransfered" in dust_res:
+        converted_bnb = float(dust_res.get("totalTransfered", 0.0))
+        details = dust_res.get("transferResult", [])
+        result_lines = [
+            "✨ <b>Криптопыль успешно конвертирована в BNB!</b>\n",
+            f"🟡 <b>Получено:</b> <code>{converted_bnb:.6f} BNB</code>",
+            f"📦 <b>Конвертировано активов:</b> {len(details)}\n",
+        ]
+        for item in details:
+            from_a = item.get("fromAsset", "")
+            amt = float(item.get("amount", 0.0))
+            result_lines.append(f"• <b>{from_a}</b>: <code>{fmt_qty(amt)} {from_a}</code> → BNB")
+
+        result_lines.append("\n💡 <i>BNB можно использовать для 25% скидки на комиссии или обменять на USDT через Binance Convert.</i>")
+        result_text = "\n".join(result_lines)
+        if msg_id:
+            edit_message(token, chat_id, msg_id, result_text, reply_markup=balance_inline_kb(state))
+        else:
+            send_telegram(token, chat_id, result_text, reply_markup=balance_inline_kb(state))
+        return
+
+    # 2. Фолбэк: поштучная продажа по рынку если SAPI dust недоступен
     sold_ok = []
     failed = []
 
@@ -2577,10 +2608,9 @@ def clean_dust_balances(token: str, chat_id: int, state: dict, min_usdt: float =
             failed.append(f"{base}: кол-во {free_qty} ниже min_qty {min_qty}")
             continue
 
-        # Проверяем notional (qty * price >= minNotional)
         price = get_price(symbol)
         if price and qty_f * price < min_notional:
-            failed.append(f"{base}: слишком мало ({qty_f * price:.5f} USDT < min {min_notional})")
+            failed.append(f"{base}: остаток {qty_f * price:.4f}$ меньше минимума спота ({min_notional}$)")
             continue
 
         sell_res = binance_signed_request(
@@ -2589,7 +2619,6 @@ def clean_dust_balances(token: str, chat_id: int, state: dict, min_usdt: float =
             state=state,
         )
         if "error" in sell_res:
-            # Пробуем 99.8% от количества (комиссия)
             red = fmt_qty_filter(qty_f * 0.998, step_size)
             if float(red) > 0 and red != qty_str:
                 sell_res = binance_signed_request(
@@ -2603,23 +2632,18 @@ def clean_dust_balances(token: str, chat_id: int, state: dict, min_usdt: float =
         else:
             cum = float(sell_res.get("cummulativeQuoteQty", 0.0))
             sold_ok.append(f"✅ {base}: продано за <code>{cum:.4f} USDT</code>")
-            log_trade_event(
-                event_type="DUST_CLEANED",
-                symbol=symbol,
-                order_id=sell_res.get("orderId"),
-                price=price or 0.0,
-                qty=float(sell_res.get("executedQty", qty_f)),
-                quote_amount=cum,
-            )
 
     result_lines = ["🧹 <b>Очистка пыли завершена!</b>\n"]
+    if dust_res and "error" in dust_res:
+        result_lines.append(f"ℹ️ <i>BNB-конвертер: {dust_res.get('error')}</i>\n")
     if sold_ok:
-        result_lines.append("<b>Продано:</b>")
+        result_lines.append("<b>Продано по рынку:</b>")
         result_lines.extend(sold_ok)
     if failed:
-        result_lines.append("\n<b>Не удалось продать:</b>")
+        result_lines.append("\n<b>Не удалось продать (слишком мелкие суммы):</b>")
         for f in failed:
-            result_lines.append(f"⚠️ {f}")
+            result_lines.append(f"• {f}")
+        result_lines.append("\n💡 <i>Сконвертируйте их в BNB в приложении Binance: «Кошелек» → «Спотовый» → «Конвертировать маленькие балансы в BNB».</i>")
     if not sold_ok and not failed:
         result_lines.append("Ничего не продано.")
 
