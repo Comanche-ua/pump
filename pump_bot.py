@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Dict, Tuple, Any, Set, Union
 
+import swing_engine as se
+
 # Настройка UTF-8 вывода для Windows консоли
 if sys.platform == "win32":
     try:
@@ -139,6 +141,15 @@ STRATEGY_LABELS = {
     "volume": "📊 Объём + свеча",
     "dump": "📉 Дамп → отскок вверх",
 }
+
+# ── 3 Режима торговли: Скальп (спот), Лонг-Свинг (+20%+), Оба режима ──
+DEFAULT_TRADE_STRATEGY_MODE = (os.environ.get("TRADE_STRATEGY_MODE") or "scalp").strip().lower()
+STRATEGY_MODE_LABELS = {
+    "scalp": "⚡ Скальп / Спот",
+    "swing": "🚀 Лонг-Свинг (+20%+)",
+    "both": "💎 Оба режима",
+}
+
 DEFAULT_RSI_MIN = float(os.environ.get("RSI_MIN", "55"))
 # Порог входа для режима «объём + свеча»: ниже 2.0 — шум объёма,
 # выше 4 — редкость на ликвидных парах.
@@ -1645,6 +1656,7 @@ def default_state() -> dict:
             "max_open_trades": 3,
             "trade_min_score": DEFAULT_TRADE_MIN_SCORE,
             "trade_profile": DEFAULT_TRADE_PROFILE,
+            "trade_strategy_mode": DEFAULT_TRADE_STRATEGY_MODE,  # "scalp" | "swing" | "both"
         },
         "active_trades": {},      # symbol -> trade dict
         "trade_history": [],      # list of closed trades
@@ -1692,6 +1704,8 @@ def load_state() -> dict:
             d["settings"]["trade_mode"] = "all"
         if "trade_profile" not in d["settings"]:
             d["settings"]["trade_profile"] = DEFAULT_TRADE_PROFILE
+        if "trade_strategy_mode" not in d["settings"]:
+            d["settings"]["trade_strategy_mode"] = DEFAULT_TRADE_STRATEGY_MODE
 
         # Сохранение активного автотрейда и профиля при рестартах (включая CI / 24-7)
         if os.environ.get("AUTO_TRADE") is not None:
@@ -1701,6 +1715,9 @@ def load_state() -> dict:
 
         if os.environ.get("TRADE_PROFILE"):
             d["settings"]["trade_profile"] = os.environ.get("TRADE_PROFILE").strip().lower()
+
+        if os.environ.get("TRADE_STRATEGY_MODE"):
+            d["settings"]["trade_strategy_mode"] = os.environ.get("TRADE_STRATEGY_MODE").strip().lower()
 
         if os.environ.get("TRADE_MODE"):
             d["settings"]["trade_mode"] = os.environ.get("TRADE_MODE").strip().lower()
@@ -3181,6 +3198,225 @@ def execute_pump_auto_trade(
     )
     send_telegram(token, chat_id, trade_alert)
     return trade_record
+
+
+def format_swing_alert(sig: se.SwingSignal) -> str:
+    """Форматирует расширенное Telegram-уведомление для сигнала Лонг-Свинг (+20%+)."""
+    lines = [
+        "🚀 <b>СВИНГ-СИГНАЛ В ЛОНГ (+20%+)</b>\n",
+        f"💎 <b>Актив:</b> <code>{sig.symbol}</code> (<code>{sig.base}</code>)",
+        f"📊 <b>Score силы сетапа:</b> <code>{sig.score:.1f}/100</code>",
+        f"💵 <b>Текущая цена:</b> <code>{fmt_price(sig.price)} $</code>\n",
+        "🎯 <b>ЦЕЛИ И РИСК-МЕНЕДЖМЕНТ:</b>",
+        f"• 🎯 <b>Take-Profit (+{sig.estimated_target_pct:.1f}%):</b> <code>{fmt_price(sig.target_price)} $</code>",
+        f"• 🛑 <b>Stop-Loss (-{sig.sl_pct:.1f}%):</b> <code>{fmt_price(sig.sl_price)} $</code>",
+        f"• 🛡️ <b>Безубыток (BE):</b> при <code>+{sig.be_activation_pct:.1f}%</code>",
+        f"• 📈 <b>Trailing Stop:</b> старт от <code>+{sig.trailing_activation_pct:.1f}%</code> (отступ <code>{sig.trailing_distance_pct:.1f}%</code>)\n",
+        "🔍 <b>МУЛЬТИ-ТАЙМФРЕЙМ АНАЛИЗ (5m-4h):</b>",
+    ]
+    for k, v in (sig.timeframe_grades or {}).items():
+        lines.append(f"• {v}")
+
+    lines.append("\n⏳ <i>Потенциал движения: +20%+ с удержанием от нескольких часов до дней.</i>")
+    return "\n".join(lines)
+
+
+def swing_signal_inline_kb(sig: se.SwingSignal, state: dict) -> dict:
+    """Inline-кнопки для свинг-сигнала."""
+    symbol = sig.symbol
+    binance_url = f"https://www.binance.com/en/trade/{sig.base}_USDT?type=spot"
+    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+
+    rows = [
+        [
+            {"text": f"🛒 Купить {sig.base}", "callback_data": f"trade_buy_menu:{symbol}"},
+            {"text": f"📈 TV Chart", "url": tv_url},
+            {"text": f"🟡 Binance", "url": binance_url},
+        ]
+    ]
+    return {"inline_keyboard": rows}
+
+
+def execute_swing_auto_trade(
+    token: str,
+    chat_id: Union[str, int],
+    state: dict,
+    sig: se.SwingSignal,
+    manual_amount: Optional[float] = None,
+) -> Optional[dict]:
+    """
+    Выполняет покупку на Binance Spot по маркету для стратегии Лонг-Свинг (+20%+)
+    и ставит биржевую защиту OCO / Stop Loss с широким целевым потенциалом (+18..+35%).
+    """
+    settings = state.get("settings", {})
+    max_trades = int(settings.get("max_open_trades", 3))
+
+    active_trades = state.setdefault("active_trades", {})
+    pending_entries = state.setdefault("pending_entries", {})
+    portfolio = state.get("portfolio", {})
+
+    with STATE_LOCK:
+        error = None
+        cooldown_until = is_symbol_in_sl_cooldown(state, sig.symbol)
+        if cooldown_until:
+            cooldown_left = max(1, int(cooldown_until - time.time()))
+            error = f"Монета {sig.symbol} в кулдауне после Stop-Loss (осталось {cooldown_left}с)"
+        elif sig.symbol in pending_entries:
+            error = f"По монете {sig.symbol} уже выставлен ордер"
+        elif sig.symbol in active_trades:
+            error = f"По монете {sig.symbol} уже есть открытая позиция"
+        elif sig.symbol in portfolio:
+            error = f"Монета {sig.symbol} уже в портфеле"
+        elif len(active_trades) + len(pending_entries) >= max_trades:
+            error = f"Достигнут лимит активных сделок ({len(active_trades) + len(pending_entries)}/{max_trades})"
+        else:
+            pending_entries[sig.symbol] = {"order_id": None, "reserved_at": int(time.time())}
+
+    if error:
+        print(f"[SwingAutoTrade] Пропуск {sig.symbol}: {error}")
+        return {"error": error}
+
+    api_key, api_secret = get_api_credentials(state)
+    if not api_key or not api_secret:
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+        return {"error": "API keys not configured"}
+
+    free_usdt_now = get_free_usdt_balance(state)
+    if manual_amount is not None:
+        trade_amt = float(manual_amount)
+    else:
+        trade_mode = settings.get("trade_mode", "fixed")
+        if trade_mode == "all":
+            trade_amt = max(0.0, free_usdt_now - 0.01)
+        elif trade_mode.startswith("pct:"):
+            try:
+                pct = float(trade_mode.split(":")[1]) / 100.0
+            except (IndexError, ValueError):
+                pct = 0.1
+            trade_amt = round(free_usdt_now * pct, 2)
+        else:
+            trade_amt = float(settings.get("trade_amount_usdt", DEFAULT_TRADE_AMOUNT))
+
+    if free_usdt_now < max(trade_amt, 1.0) or trade_amt < 1.0:
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+        return {"error": "Insufficient USDT balance"}
+
+    filters = get_symbol_filters(sig.symbol)
+    if not filters.get("step_size") or filters.get("status") != "TRADING":
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+        return {"error": f"Фильтры пары {sig.symbol} недоступны"}
+
+    min_notional = float(filters.get("min_notional", 5.0))
+    if trade_amt < min_notional:
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+        return {"error": f"Сумма {trade_amt:.2f} < мин. лота {min_notional:.1f} USDT"}
+
+    step_size = filters.get("step_size", 1.0)
+    tick_size = filters.get("tick_size", 0.01)
+
+    quote_str = fmt_price_filter(trade_amt, 0.01)
+    buy_params = {
+        "symbol": sig.symbol,
+        "side": "BUY",
+        "type": "MARKET",
+        "quoteOrderQty": quote_str,
+    }
+    buy_res = binance_signed_request("POST", "/api/v3/order", buy_params, state=state)
+    if "error" in buy_res:
+        with _PENDING_LOCK:
+            state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+        return {"error": buy_res.get("error")}
+
+    buy_order_id = buy_res.get("orderId")
+    exec_qty = float(buy_res.get("executedQty", 0.0))
+    cum_quote = float(buy_res.get("cummulativeQuoteQty", 0.0))
+    avg_buy_price = (cum_quote / exec_qty) if exec_qty > 0 else float(sig.price)
+
+    tp_pct = float(sig.estimated_target_pct)
+    sl_pct = float(sig.sl_pct)
+    tp_price = avg_buy_price * (1.0 + tp_pct / 100.0)
+    sl_price = avg_buy_price * (1.0 - sl_pct / 100.0)
+
+    tp_price_str = fmt_price_filter(tp_price, tick_size)
+    sell_qty_str = fmt_qty_filter(exec_qty, step_size)
+
+    oco = {}
+    use_oco = bool(settings.get("use_oco", DEFAULT_USE_OCO))
+    if use_oco:
+        oco = place_protection_oco(
+            sig.symbol, avg_buy_price, exec_qty, tp_pct, sl_pct,
+            filters, state, cur_price=avg_buy_price,
+            explicit_tp_price=float(tp_price_str),
+            explicit_sl_price=sl_price,
+        )
+
+    tp_order_id = oco.get("tp_order_id") if oco else None
+    if not tp_order_id and float(sell_qty_str) > 0:
+        sell_params = {
+            "symbol": sig.symbol,
+            "side": "SELL",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": sell_qty_str,
+            "price": tp_price_str,
+        }
+        sell_res = binance_signed_request("POST", "/api/v3/order", sell_params, state=state)
+        tp_order_id = sell_res.get("orderId")
+
+    trade_record = {
+        "symbol": sig.symbol,
+        "base": sig.base,
+        "buy_order_id": buy_order_id,
+        "tp_order_id": tp_order_id,
+        "order_list_id": oco.get("order_list_id"),
+        "sl_order_id": oco.get("sl_order_id"),
+        "buy_price": avg_buy_price,
+        "highest_price": avg_buy_price,
+        "tp_price": float(tp_price_str),
+        "sl_price": sl_price,
+        "trailing_sl": sl_price,
+        "sl_pct": sl_pct,
+        "tp_pct": tp_pct,
+        "be_activation_pct": sig.be_activation_pct,
+        "trailing_activation_pct": sig.trailing_activation_pct,
+        "trailing_distance_pct": sig.trailing_distance_pct,
+        "qty": exec_qty,
+        "cost_usdt": cum_quote,
+        "opened_at": int(time.time()),
+        "signal_score": sig.score,
+        "signal_source": "swing_mtf",
+        "strategy_type": "swing",
+        "status": "tp_placed" if tp_order_id else "unhedged_buy",
+    }
+    active_trades[sig.symbol] = trade_record
+    state.setdefault("pending_entries", {}).pop(sig.symbol, None)
+    portfolio_add(state, sig.symbol, exec_qty, avg_buy_price)
+    save_state(state, sync_git=True)
+
+    if not tp_order_id:
+        ensure_position_protected(token, chat_id, state, sig.symbol, trade_record)
+
+    trade_alert = (
+        f"🚀 <b>ЛОНГ-СВИНГ СДЕЛКА ИСПОЛНЕНА НА BINANCE!</b>\n\n"
+        f"🟢 <b>Покупка:</b> <b>{sig.base}/USDT</b>\n"
+        f"• Потрачено: <code>{cum_quote:.2f} USDT</code>\n"
+        f"• Куплено: <code>{fmt_qty(exec_qty)} {sig.base}</code>\n"
+        f"• Вход: <code>{fmt_price(avg_buy_price)} $</code>\n"
+        f"• Score силы: <b>{sig.score:.1f}/100</b>\n\n"
+        f"🎯 <b>Целевой Take-Profit (+{tp_pct:.1f}%):</b> <code>{tp_price_str} $</code>\n"
+        f"🛑 <b>Stop-Loss (-{sl_pct:.1f}%):</b> <code>{fmt_price(sl_price)} $</code>\n"
+        f"🛡️ <b>Безубыток (BE):</b> перенос стопа при <code>+{sig.be_activation_pct:.1f}%</code>\n"
+        f"📈 <b>Trailing Stop:</b> активация от <code>+{sig.trailing_activation_pct:.1f}%</code> (отступ <code>{sig.trailing_distance_pct:.1f}%</code>)\n\n"
+        f"<i>Позиция находится под активным мониторингом до полного закрытия.</i>"
+    )
+    if chat_id:
+        send_telegram(token, chat_id, trade_alert)
+    return trade_record
+
 
 def check_pending_entries(token: str, chat_id: Union[str, int], state: dict) -> None:
     """
@@ -5846,25 +6082,28 @@ def settings_text(state: dict) -> str:
     prof_label = prof_info["name"]
     prof_desc = prof_info["desc"]
 
+    strat_mode = s.get("trade_strategy_mode", DEFAULT_TRADE_STRATEGY_MODE)
+    strat_mode_label = STRATEGY_MODE_LABELS.get(strat_mode, STRATEGY_MODE_LABELS["scalp"])
+
     return (
         "<b>⚙️ Параметры бота Pump Pulse</b>\n\n"
-        f"🏆 <b>Пресет стратегии:</b> <code>{prof_label}</code>\n"
+        f"🎯 <b>Режим торговли:</b> <code>{strat_mode_label}</code>\n"
+        f"🏆 <b>Пресет скальпинга:</b> <code>{prof_label}</code>\n"
         f"  <i>{prof_desc}</i>\n\n"
         f"• <b>Автосканирование рынка:</b> {auto_scan_label} (каждые {interval_str})\n"
         f"• <b>Порог Score (MIN_SCORE):</b> <code>{s['min_score']:.0f}</code>\n"
         f"• <b>Уведомления:</b> <code>{filt_label}</code>\n"
-        f"• <b>Режим стратегии:</b> <code>{strat_label}</code>\n"
-        f"  <i>«Памп-скор» ищет всплеск объёма и пробой, «RSI + Стохастик» — импульс по индикаторам.</i>\n\n"
+        f"• <b>Режим стратегии:</b> <code>{strat_label}</code>\n\n"
         "<b>⚡ Спотовая торговля Binance:</b>\n"
-        f"• <b>Автоторговля пампов:</b> {auto_trade_label}\n"
+        f"• <b>Автоторговля:</b> {auto_trade_label}\n"
         f"• <b>Размер ставки:</b> <code>{trade_size_label}</code>\n"
         f"• <b>Точка входа:</b> <code>{entry_label}</code>\n"
-        f"• <b>Базовый Take-Profit:</b> <code>+{tp_pct:.1f}%</code>\n"
+        f"• <b>Базовый Take-Profit:</b> <code>+{tp_pct:.1f}%</code> (для свинга <code>+18..+35%</code>)\n"
         f"• <b>Умный ATR Take-Profit:</b> <code>{dyn_tp_label}</code>\n"
         f"• <b>Stop-Loss:</b> <code>-{sl_pct:.1f}%</code>\n"
         f"• <b>Trailing Stop:</b> автоподтяжка при <code>+{trail_act:.1f}%</code> (отступ <code>{trail_dist:.1f}%</code>)\n"
         f"• <b>Статус API Binance:</b> {api_status}\n\n"
-        "<i>Выберите готовый пресет стратегии кнопками ниже:</i>"
+        "<i>Выберите режим торговли и пресет кнопками ниже:</i>"
     )
 
 def settings_inline_kb(state: dict) -> dict:
@@ -5879,6 +6118,11 @@ def settings_inline_kb(state: dict) -> dict:
     cur_tp = float(s.get("take_profit_pct", DEFAULT_TAKE_PROFIT))
     cur_entry = float(s.get("entry_pullback_pct", DEFAULT_ENTRY_PULLBACK))
     cur_prof = s.get("trade_profile", DEFAULT_TRADE_PROFILE)
+    cur_strat_mode = s.get("trade_strategy_mode", DEFAULT_TRADE_STRATEGY_MODE)
+
+    def _strat_mode_btn(mode: str, label: str) -> dict:
+        active = "✅ " if cur_strat_mode == mode else ""
+        return {"text": f"{active}{label}", "callback_data": f"trade_strat_mode:set:{mode}"}
 
     def _prof_btn(key: str, label: str) -> dict:
         active = "✅ " if cur_prof == key else ""
@@ -5915,6 +6159,12 @@ def settings_inline_kb(state: dict) -> dict:
         "inline_keyboard": [
             [
                 {"text": autotrade_label, "callback_data": "trade:toggle"},
+            ],
+            # --- 3 Режима торговли: Скальп (спот) / Лонг-Свинг (+20%+) / Оба режима ---
+            [
+                _strat_mode_btn("scalp", "⚡ 1. Скальп"),
+                _strat_mode_btn("swing", "🚀 2. Свинг (+20%)"),
+                _strat_mode_btn("both", "💎 3. Оба режима"),
             ],
             # --- 4 Пресета торговых стратегий ---
             [
@@ -6641,60 +6891,118 @@ def autoscan_worker(token: str, primary_chat_id: Union[str, int], state: dict, s
                 if cid_str and cid_str != "12345" and (cid_str.lstrip("-").isdigit() or cid_str.startswith("@")):
                     target_chats.add(cid_str)
 
-            # Проверка ордеров (входы/TP/SL) вынесена в trade_monitor_worker (каждые 20 сек) —
-            # здесь не дублируем, чтобы не было гонок при выставлении TP.
+            # 0. Проверка баланса перед сканированием:
+            # Если включена автоторговля и нет свободных средств (< 5 USDT) или достигнут лимит позиций,
+            # сканирование и алерты временно приостанавливаются (ждём завершения текущих сделок).
+            api_key, api_secret = get_api_credentials(state)
+            if api_key and api_secret and settings.get("auto_trade", False):
+                free_usdt = get_free_usdt_balance(state)
+                active_cnt = len(state.get("active_trades", {}))
+                pending_cnt = len(state.get("pending_entries", {}))
+                max_trades = int(settings.get("max_open_trades", 3))
 
-            # 1. Скан пампов
-            signals, meta, _top = run_scan(
-                min_score=settings.get("min_score", DEFAULT_MIN_SCORE),
-                min_quote_volume=settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME),
-                strategy=settings.get("strategy", DEFAULT_STRATEGY),
-                state=state,
-            )
-            print(f"[Autoscan] {time.strftime('%H:%M:%S')}: {meta['duration_ms']/1000:.1f}с, "
-                  f"candidates={meta['candidates']}, сигналов={len(signals)}")
+                if free_usdt < 5.0 or (active_cnt + pending_cnt >= max_trades):
+                    reason = f"свободно {free_usdt:.2f} USDT < 5.0" if free_usdt < 5.0 else f"лимит сделок ({active_cnt + pending_cnt}/{max_trades})"
+                    print(f"[Autoscan] Пауза сканирования: {reason} — ожидание завершения сделок/освобождения баланса.")
+                    stop_event.wait(min(interval, 20))
+                    continue
 
             filter_level = settings.get("filter_level", "strong_and_watch")
             sent: dict = state.setdefault("sent_alerts", {})
             sym_cooldown: dict = state.setdefault("symbol_alert_cooldown", {})
             new_alerts_count = 0
+            strat_mode = settings.get("trade_strategy_mode", DEFAULT_TRADE_STRATEGY_MODE)
 
-            for sig in signals:
-                if filter_level == "strong_only" and sig.grade != "strong":
-                    continue
-                if sig.alert_key in sent:
-                    continue
-                # Анти-спам: не более 1 алерта на монету за 30 минут
-                # (иначе при продолжающемся пампе алерт прилетал на каждом новом 5м баре)
-                if now - int(sym_cooldown.get(sig.symbol, 0)) < 1800:
-                    continue
+            # 1. Скальп-скан (если режим "scalp" или "both")
+            if strat_mode in ("scalp", "both"):
+                signals, meta, _top = run_scan(
+                    min_score=settings.get("min_score", DEFAULT_MIN_SCORE),
+                    min_quote_volume=settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME),
+                    strategy=settings.get("strategy", DEFAULT_STRATEGY),
+                    state=state,
+                )
+                print(f"[Autoscan Scalp] {time.strftime('%H:%M:%S')}: {meta['duration_ms']/1000:.1f}с, "
+                      f"candidates={meta['candidates']}, сигналов={len(signals)}")
 
-                sent[sig.alert_key] = now
-                sym_cooldown[sig.symbol] = now
-                record_signal_history(state, sig)
-                new_alerts_count += 1
-                kb = signal_inline_kb(sig, state)
+                for sig in signals:
+                    if filter_level == "strong_only" and sig.grade != "strong":
+                        continue
+                    if sig.alert_key in sent:
+                        continue
+                    # Анти-спам: не более 1 алерта на монету за 30 минут
+                    if now - int(sym_cooldown.get(sig.symbol, 0)) < 1800:
+                        continue
 
-                for cid in target_chats:
-                    try:
-                        send_telegram(token, cid, format_alert(sig), reply_markup=kb)
-                    except Exception as e:
-                        print(f"Ошибка отправки в {cid}: {e}", file=sys.stderr)
+                    sent[sig.alert_key] = now
+                    sym_cooldown[sig.symbol] = now
+                    record_signal_history(state, sig)
+                    new_alerts_count += 1
+                    kb = signal_inline_kb(sig, state)
 
-                # Автоторговля по сигналу
-                auto_trade_enabled = settings.get("auto_trade", False)
-                trade_min_score = settings.get("trade_min_score", DEFAULT_TRADE_MIN_SCORE)
-                if auto_trade_enabled and sig.best_score >= trade_min_score:
-                    if primary_str:
-                        free_usdt_quick = get_free_usdt_balance(state)
-                        if free_usdt_quick < 5.0:
-                            print(f"[AutoTrade] Пропуск {sig.symbol}: средства в сделках/ордерах (свободно {free_usdt_quick:.2f} USDT < 5.0)")
-                        else:
-                            try:
-                                print(f"[AutoTrade] Вход по сигналу {sig.symbol} (score {sig.best_score:.1f})...")
-                                execute_pump_auto_trade(token, primary_str, state, sig)
-                            except Exception as e:
-                                print(f"[AutoTrade Error for {sig.symbol}]: {e}", file=sys.stderr)
+                    for cid in target_chats:
+                        try:
+                            send_telegram(token, cid, format_alert(sig), reply_markup=kb)
+                        except Exception as e:
+                            print(f"Ошибка отправки в {cid}: {e}", file=sys.stderr)
+
+                    # Автоторговля по сигналу
+                    auto_trade_enabled = settings.get("auto_trade", False)
+                    trade_min_score = settings.get("trade_min_score", DEFAULT_TRADE_MIN_SCORE)
+                    if auto_trade_enabled and sig.best_score >= trade_min_score:
+                        if primary_str:
+                            free_usdt_quick = get_free_usdt_balance(state)
+                            if free_usdt_quick < 5.0:
+                                print(f"[AutoTrade] Пропуск {sig.symbol}: средства в сделках/ордерах (свободно {free_usdt_quick:.2f} USDT < 5.0)")
+                            else:
+                                try:
+                                    print(f"[AutoTrade] Вход по сигналу {sig.symbol} (score {sig.best_score:.1f})...")
+                                    execute_pump_auto_trade(token, primary_str, state, sig)
+                                except Exception as e:
+                                    print(f"[AutoTrade Error for {sig.symbol}]: {e}", file=sys.stderr)
+
+            # 2. Лонг-Свинг скан (+20%+) (если режим "swing" или "both")
+            if strat_mode in ("swing", "both"):
+                try:
+                    all_tickers = get_24h_tickers()
+                    swing_candidates = [
+                        t["symbol"] for t in all_tickers
+                        if t["symbol"].endswith("USDT")
+                        and float(t.get("quoteVolume", 0.0)) >= settings.get("min_quote_volume", DEFAULT_MIN_QUOTE_VOLUME)
+                        and t["symbol"] != "BTCUSDT"
+                    ][:25]
+
+                    for sym in swing_candidates:
+                        if sym in state.get("active_trades", {}) or sym in state.get("portfolio", {}):
+                            continue
+                        if now - int(sym_cooldown.get(f"swing:{sym}", 0)) < 1800:
+                            continue
+
+                        raw_c = fetch_klines(sym, limit=350)
+                        if not raw_c or len(raw_c) < 300:
+                            continue
+
+                        swing_sig = se.analyze_swing_setup(sym, k_list)
+                        if swing_sig:
+                            sym_cooldown[f"swing:{sym}"] = now
+                            new_alerts_count += 1
+                            kb = swing_signal_inline_kb(swing_sig, state)
+                            for cid in target_chats:
+                                try:
+                                    send_telegram(token, cid, format_swing_alert(swing_sig), reply_markup=kb)
+                                except Exception as e:
+                                    print(f"Ошибка отправки swing алерта в {cid}: {e}", file=sys.stderr)
+
+                            auto_trade_enabled = settings.get("auto_trade", False)
+                            if auto_trade_enabled and primary_str:
+                                free_usdt_quick = get_free_usdt_balance(state)
+                                if free_usdt_quick >= 5.0:
+                                    try:
+                                        print(f"[SwingAutoTrade] Вход в {swing_sig.symbol} (score {swing_sig.score:.1f}, target +{swing_sig.estimated_target_pct:.1f}%)...")
+                                        execute_swing_auto_trade(token, primary_str, state, swing_sig)
+                                    except Exception as e:
+                                        print(f"[SwingAutoTrade Error for {swing_sig.symbol}]: {e}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[SwingScan Error]: {e}", file=sys.stderr)
 
             if new_alerts_count > 0:
                 save_state(state, sync_git=True)
@@ -7506,6 +7814,17 @@ def run_bot(token: str, chat_id: Union[str, int]) -> None:
                     edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
                 else:
                     send_telegram(token, cb_chat, settings_text(state), reply_markup=settings_inline_kb(state))
+
+            elif cb_data.startswith("trade_strat_mode:set:"):
+                mode = cb_data.split(":", 2)[2]
+                if mode not in STRATEGY_MODE_LABELS:
+                    answer_callback(token, cb_id, "Неизвестный режим", show_alert=True)
+                    return
+                settings["trade_strategy_mode"] = mode
+                save_state(state)
+                answer_callback(token, cb_id, f"Режим: {STRATEGY_MODE_LABELS[mode]}")
+                if msg_id:
+                    edit_message(token, cb_chat, msg_id, settings_text(state), reply_markup=settings_inline_kb(state))
 
             elif cb_data == "autoscan:toggle":
                 settings["autoscan"] = not settings.get("autoscan", True)
