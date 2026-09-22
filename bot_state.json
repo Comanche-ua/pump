@@ -293,12 +293,27 @@
       "pnl_pct": -0.07331378299120686,
       "ending_balance": 0.53559411,
       "status": "market_sell"
+    },
+    {
+      "symbol": "TRUMPUSDT",
+      "base": "TRUMP",
+      "trade_id": 227182062,
+      "opened_at": 1789497942,
+      "closed_at": 1789501542,
+      "buy_price": 1.877763,
+      "sell_price": 1.891,
+      "qty": 52.209,
+      "cost_usdt": 98.03612846700001,
+      "pnl": 0.6910905329999935,
+      "pnl_pct": 0.7049345417925411,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 16,
-    "winning_trades": 9,
-    "total_pnl": -1.617106799999994
+    "total_trades": 17,
+    "winning_trades": 10,
+    "total_pnl": -0.9260162670000005
   },
   "signals_history": [],
   "sent_alerts": {},
