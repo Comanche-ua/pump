@@ -83,12 +83,27 @@
       "pnl_pct": 0.7049345417925317,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "DODOUSDT",
+      "base": "DODO",
+      "trade_id": 59642233,
+      "opened_at": 1789288754,
+      "closed_at": 1789311186,
+      "buy_price": 0.01806,
+      "sell_price": 0.01851,
+      "qty": 608.3,
+      "cost_usdt": 10.985897999999999,
+      "pnl": 0.2737350000000003,
+      "pnl_pct": 2.491694352159471,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 2,
-    "winning_trades": 2,
-    "total_pnl": 0.5648761999999934
+    "total_trades": 3,
+    "winning_trades": 3,
+    "total_pnl": 0.8386111999999937
   },
   "signals_history": [],
   "sent_alerts": {},
