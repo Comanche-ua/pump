@@ -98,12 +98,27 @@
       "pnl_pct": 2.491694352159471,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "PROMUSDT",
+      "base": "PROM",
+      "trade_id": 64183409,
+      "opened_at": 1789317683,
+      "closed_at": 1789318195,
+      "buy_price": 5.699,
+      "sell_price": 5.756,
+      "qty": 1.92,
+      "cost_usdt": 10.942079999999999,
+      "pnl": 0.10944000000000109,
+      "pnl_pct": 1.000175469380603,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 3,
-    "winning_trades": 3,
-    "total_pnl": 0.8386111999999937
+    "total_trades": 4,
+    "winning_trades": 4,
+    "total_pnl": 0.9480511999999948
   },
   "signals_history": [],
   "sent_alerts": {},
