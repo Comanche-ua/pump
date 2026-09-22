@@ -203,12 +203,27 @@
       "pnl_pct": -0.7269555103227581,
       "ending_balance": 0.53559411,
       "status": "market_sell"
+    },
+    {
+      "symbol": "KATUSDT",
+      "base": "KAT",
+      "trade_id": 7759458,
+      "opened_at": 1789224224,
+      "closed_at": 1789248066,
+      "buy_price": 0.00492,
+      "sell_price": 0.00477,
+      "qty": 17061.0,
+      "cost_usdt": 83.94012,
+      "pnl": -2.5591499999999883,
+      "pnl_pct": -3.0487804878048643,
+      "ending_balance": 0.53559411,
+      "status": "market_sell"
     }
   ],
   "all_time_stats": {
-    "total_trades": 10,
+    "total_trades": 11,
     "winning_trades": 7,
-    "total_pnl": 1.3111911999999961
+    "total_pnl": -1.2479587999999922
   },
   "signals_history": [],
   "sent_alerts": {},
