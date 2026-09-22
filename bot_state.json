@@ -263,12 +263,27 @@
       "pnl_pct": 0.7932804479701316,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "DJTBUSDT",
+      "base": "DJTB",
+      "trade_id": 49647,
+      "opened_at": 1789835187,
+      "closed_at": 1789979703,
+      "buy_price": 8.9,
+      "sell_price": 8.97,
+      "qty": 0.6,
+      "cost_usdt": 5.34,
+      "pnl": 0.041999999999999815,
+      "pnl_pct": 0.7865168539325809,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 14,
-    "winning_trades": 8,
-    "total_pnl": -1.645146799999993
+    "total_trades": 15,
+    "winning_trades": 9,
+    "total_pnl": -1.603146799999993
   },
   "signals_history": [],
   "sent_alerts": {},
