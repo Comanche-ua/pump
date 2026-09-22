@@ -308,12 +308,27 @@
       "pnl_pct": 0.7049345417925411,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "MARSCOINUSDT",
+      "base": "MARSCOIN",
+      "trade_id": 3082809,
+      "opened_at": 1789259912,
+      "closed_at": 1789261973,
+      "buy_price": 0.1187,
+      "sell_price": 0.115,
+      "qty": 92.5,
+      "cost_usdt": 10.97975,
+      "pnl": -0.34224999999999994,
+      "pnl_pct": -3.117101937657961,
+      "ending_balance": 0.53559411,
+      "status": "market_sell"
     }
   ],
   "all_time_stats": {
-    "total_trades": 17,
+    "total_trades": 18,
     "winning_trades": 10,
-    "total_pnl": -0.9260162670000005
+    "total_pnl": -1.2682662670000004
   },
   "signals_history": [],
   "sent_alerts": {},
