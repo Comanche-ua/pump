@@ -173,12 +173,42 @@
       "pnl_pct": -0.4048582995951477,
       "ending_balance": 0.53559411,
       "status": "market_sell"
+    },
+    {
+      "symbol": "TRXUSDT",
+      "base": "TRX",
+      "trade_id": 406972082,
+      "opened_at": 1789157157,
+      "closed_at": 1789191120,
+      "buy_price": 0.3371,
+      "sell_price": 0.3438,
+      "qty": 32.5,
+      "cost_usdt": 10.95575,
+      "pnl": 0.21775000000000055,
+      "pnl_pct": 1.987540789083363,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
+    },
+    {
+      "symbol": "TRXUSDT",
+      "base": "TRX",
+      "trade_id": 407050321,
+      "opened_at": 1789191147,
+      "closed_at": 1789331863,
+      "buy_price": 0.3439,
+      "sell_price": 0.3414,
+      "qty": 31.9,
+      "cost_usdt": 10.97041,
+      "pnl": -0.07974999999999888,
+      "pnl_pct": -0.7269555103227581,
+      "ending_balance": 0.53559411,
+      "status": "market_sell"
     }
   ],
   "all_time_stats": {
-    "total_trades": 8,
-    "winning_trades": 6,
-    "total_pnl": 1.1731911999999944
+    "total_trades": 10,
+    "winning_trades": 7,
+    "total_pnl": 1.3111911999999961
   },
   "signals_history": [],
   "sent_alerts": {},
