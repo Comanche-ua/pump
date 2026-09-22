@@ -128,12 +128,27 @@
       "pnl_pct": 1.3793103448275783,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "SOPHUSDT",
+      "base": "SOPH",
+      "trade_id": 15154339,
+      "opened_at": 1789257879,
+      "closed_at": 1789258597,
+      "buy_price": 0.00476,
+      "sell_price": 0.00481,
+      "qty": 2302.0,
+      "cost_usdt": 10.95752,
+      "pnl": 0.11509999999999998,
+      "pnl_pct": 1.0504201680672267,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 5,
-    "winning_trades": 5,
-    "total_pnl": 1.099491199999994
+    "total_trades": 6,
+    "winning_trades": 6,
+    "total_pnl": 1.2145911999999939
   },
   "signals_history": [],
   "sent_alerts": {},
