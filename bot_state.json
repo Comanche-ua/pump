@@ -362,12 +362,36 @@
     "winning_trades": 14,
     "total_pnl": -0.46787126700000226
   },
-  "signals_history": [],
-  "sent_alerts": {},
+  "signals_history": [
+    {
+      "symbol": "1MBABYDOGEUSDT",
+      "base": "1MBABYDOGE",
+      "score": 58.000202097694405,
+      "grade": "watch",
+      "tf": "5m",
+      "price": 0.0004152,
+      "timestamp": 1790038792,
+      "strategy_tier": "profit"
+    },
+    {
+      "symbol": "AMATBUSDT",
+      "base": "AMATB",
+      "score": 67.48205439085645,
+      "grade": "late",
+      "tf": "5m",
+      "price": 471.22,
+      "timestamp": 1790038793,
+      "strategy_tier": "profit"
+    }
+  ],
+  "sent_alerts": {
+    "1MBABYDOGEUSDT:5m:1790038500000": 1790038792,
+    "AMATBUSDT:5m:1790038500000": 1790038792
+  },
   "pending_entries": {},
   "symbol_alert_cooldown": {},
   "allowed_chats": [
     "1920596593"
   ],
-  "scan_cursor": 0
+  "scan_cursor": 30
 }
