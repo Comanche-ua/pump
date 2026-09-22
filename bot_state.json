@@ -248,12 +248,27 @@
       "pnl_pct": -3.646805455850684,
       "ending_balance": 0.53559411,
       "status": "market_sell"
+    },
+    {
+      "symbol": "BANDUSDT",
+      "base": "BAND",
+      "trade_id": 65561020,
+      "opened_at": 1790004059,
+      "closed_at": 1790005194,
+      "buy_price": 0.2143,
+      "sell_price": 0.216,
+      "qty": 26.1,
+      "cost_usdt": 5.59323,
+      "pnl": 0.0443699999999998,
+      "pnl_pct": 0.7932804479701316,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 13,
-    "winning_trades": 7,
-    "total_pnl": -1.6895167999999927
+    "total_trades": 14,
+    "winning_trades": 8,
+    "total_pnl": -1.645146799999993
   },
   "signals_history": [],
   "sent_alerts": {},
