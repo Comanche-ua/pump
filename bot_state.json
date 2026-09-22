@@ -218,12 +218,27 @@
       "pnl_pct": -3.0487804878048643,
       "ending_balance": 0.53559411,
       "status": "market_sell"
+    },
+    {
+      "symbol": "MTLUSDT",
+      "base": "MTL",
+      "trade_id": 56061106,
+      "opened_at": 1789750240,
+      "closed_at": 1789756166,
+      "buy_price": 0.293,
+      "sell_price": 0.291,
+      "qty": 20.5,
+      "cost_usdt": 6.0065,
+      "pnl": -0.04100000000000037,
+      "pnl_pct": -0.6825938566552963,
+      "ending_balance": 0.53559411,
+      "status": "market_sell"
     }
   ],
   "all_time_stats": {
-    "total_trades": 11,
+    "total_trades": 12,
     "winning_trades": 7,
-    "total_pnl": -1.2479587999999922
+    "total_pnl": -1.2889587999999925
   },
   "signals_history": [],
   "sent_alerts": {},
