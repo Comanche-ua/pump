@@ -1,12 +1,20 @@
 {
-  "portfolio": {},
+  "portfolio": {
+    "DJTBUSDT": {
+      "symbol": "DJTBUSDT",
+      "base": "DJTB",
+      "qty": 0.0993,
+      "avg_price": 8.9,
+      "added_at": 1789835187
+    }
+  },
   "settings": {
     "min_score": 58.0,
     "min_quote_volume": 1200000.0,
     "autoscan": true,
-    "scan_interval_sec": 300,
+    "scan_interval_sec": 60,
     "filter_level": "strong_and_watch",
-    "auto_trade": false,
+    "auto_trade": true,
     "trade_mode": "all",
     "trade_amount_usdt": 5.0,
     "take_profit_pct": 0.7,
@@ -17,12 +25,72 @@
     "trailing_distance_pct": 0.4,
     "use_oco": true,
     "strategy": "pump",
-    "strategy_confirmed": false,
+    "strategy_confirmed": true,
     "max_open_trades": 3,
-    "trade_min_score": 70.0
+    "trade_min_score": 70.0,
+    "trade_profile": "ultra",
+    "trade_strategy_mode": "scalp",
+    "trade_defaults_migrated": true
   },
-  "active_trades": {},
-  "trade_history": [],
+  "active_trades": {
+    "DJTBUSDT": {
+      "symbol": "DJTBUSDT",
+      "base": "DJTB",
+      "buy_order_id": null,
+      "tp_order_id": null,
+      "buy_price": 8.9,
+      "highest_price": 9.13,
+      "tp_price": 8.962299999999999,
+      "sl_price": 8.633000000000001,
+      "trailing_sl": 8.633000000000001,
+      "sl_pct": 3.0,
+      "trailing_activation_pct": 1.2,
+      "trailing_distance_pct": 0.4,
+      "qty": 0.0993,
+      "cost_usdt": 0.8837700000000001,
+      "tp_pct": 0.6999999999999853,
+      "opened_at": 1789835187,
+      "status": "holding"
+    }
+  },
+  "trade_history": [
+    {
+      "symbol": "PENDLEUSDT",
+      "base": "PENDLE",
+      "trade_id": 114875846,
+      "opened_at": 1789216028,
+      "closed_at": 1789219628,
+      "buy_price": 2.185593,
+      "sell_price": 2.201,
+      "qty": 16.6,
+      "cost_usdt": 36.2808438,
+      "pnl": 0.25575620000000043,
+      "pnl_pct": 0.704934541792549,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
+    },
+    {
+      "symbol": "PENDLEUSDT",
+      "base": "PENDLE",
+      "trade_id": 114876066,
+      "opened_at": 1789216088,
+      "closed_at": 1789219688,
+      "buy_price": 2.1925440000000003,
+      "sell_price": 2.208,
+      "qty": 20.0,
+      "cost_usdt": 43.850880000000004,
+      "pnl": 0.30911999999999296,
+      "pnl_pct": 0.7049345417925317,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
+    }
+  ],
+  "all_time_stats": {
+    "total_trades": 2,
+    "winning_trades": 2,
+    "total_pnl": 0.5648761999999934
+  },
+  "signals_history": [],
   "sent_alerts": {},
   "pending_entries": {},
   "symbol_alert_cooldown": {},
