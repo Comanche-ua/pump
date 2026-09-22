@@ -295,12 +295,27 @@
       "pnl_pct": -3.117101937657961,
       "ending_balance": 0.53559411,
       "status": "market_sell"
+    },
+    {
+      "symbol": "INJUSDT",
+      "base": "INJ",
+      "trade_id": 166533288,
+      "opened_at": 1789308476,
+      "closed_at": 1789311072,
+      "buy_price": 6.094,
+      "sell_price": 6.161,
+      "qty": 1.79,
+      "cost_usdt": 10.90826,
+      "pnl": 0.11993000000000009,
+      "pnl_pct": 1.099442074171317,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 18,
-    "winning_trades": 10,
-    "total_pnl": -1.2682662670000004
+    "total_trades": 19,
+    "winning_trades": 11,
+    "total_pnl": -1.1483362670000004
   },
   "signals_history": [],
   "sent_alerts": {},
