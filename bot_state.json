@@ -1,13 +1,5 @@
 {
-  "portfolio": {
-    "DJTBUSDT": {
-      "symbol": "DJTBUSDT",
-      "base": "DJTB",
-      "qty": 0.0993,
-      "avg_price": 8.9,
-      "added_at": 1789835187
-    }
-  },
+  "portfolio": {},
   "settings": {
     "min_score": 58.0,
     "min_quote_volume": 1200000.0,
@@ -32,27 +24,7 @@
     "trade_strategy_mode": "scalp",
     "trade_defaults_migrated": true
   },
-  "active_trades": {
-    "DJTBUSDT": {
-      "symbol": "DJTBUSDT",
-      "base": "DJTB",
-      "buy_order_id": null,
-      "tp_order_id": null,
-      "buy_price": 8.9,
-      "highest_price": 9.13,
-      "tp_price": 8.962299999999999,
-      "sl_price": 8.633000000000001,
-      "trailing_sl": 9.093480000000001,
-      "sl_pct": 3.0,
-      "trailing_activation_pct": 1.2,
-      "trailing_distance_pct": 0.4,
-      "qty": 0.0993,
-      "cost_usdt": 0.8837700000000001,
-      "tp_pct": 0.6999999999999853,
-      "opened_at": 1789835187,
-      "status": "holding"
-    }
-  },
+  "active_trades": {},
   "trade_history": [
     {
       "symbol": "PENDLEUSDT",
