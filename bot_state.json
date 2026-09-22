@@ -325,12 +325,27 @@
       "pnl_pct": 2.0958083832335275,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "ASTERUSDT",
+      "base": "ASTER",
+      "trade_id": 46149246,
+      "opened_at": 1789248592,
+      "closed_at": 1789269780,
+      "buy_price": 0.689,
+      "sell_price": 0.696,
+      "qty": 23.55,
+      "cost_usdt": 16.22595,
+      "pnl": 0.16484999999999772,
+      "pnl_pct": 1.015965166908549,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 20,
-    "winning_trades": 12,
-    "total_pnl": -1.0784412670000005
+    "total_trades": 21,
+    "winning_trades": 13,
+    "total_pnl": -0.9135912670000028
   },
   "signals_history": [],
   "sent_alerts": {},
