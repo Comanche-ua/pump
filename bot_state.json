@@ -278,12 +278,27 @@
       "pnl_pct": 0.7865168539325809,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "GRAMUSDT",
+      "base": "GRAM",
+      "trade_id": 4525808,
+      "opened_at": 1789331879,
+      "closed_at": 1789331900,
+      "buy_price": 1.364,
+      "sell_price": 1.363,
+      "qty": 13.96,
+      "cost_usdt": 19.04144,
+      "pnl": -0.01396000000000086,
+      "pnl_pct": -0.07331378299120686,
+      "ending_balance": 0.53559411,
+      "status": "market_sell"
     }
   ],
   "all_time_stats": {
-    "total_trades": 15,
+    "total_trades": 16,
     "winning_trades": 9,
-    "total_pnl": -1.603146799999993
+    "total_pnl": -1.617106799999994
   },
   "signals_history": [],
   "sent_alerts": {},
