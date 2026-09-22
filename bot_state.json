@@ -310,12 +310,27 @@
       "pnl_pct": 1.099442074171317,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "PEPEUSDT",
+      "base": "PEPE",
+      "trade_id": 560911130,
+      "opened_at": 1789194650,
+      "closed_at": 1789201039,
+      "buy_price": 3.34e-06,
+      "sell_price": 3.41e-06,
+      "qty": 998500.0,
+      "cost_usdt": 3.3349900000000003,
+      "pnl": 0.06989499999999982,
+      "pnl_pct": 2.0958083832335275,
+      "ending_balance": 0.53559411,
+      "status": "tp_filled"
     }
   ],
   "all_time_stats": {
-    "total_trades": 19,
-    "winning_trades": 11,
-    "total_pnl": -1.1483362670000004
+    "total_trades": 20,
+    "winning_trades": 12,
+    "total_pnl": -1.0784412670000005
   },
   "signals_history": [],
   "sent_alerts": {},
