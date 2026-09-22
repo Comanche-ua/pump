@@ -233,12 +233,27 @@
       "pnl_pct": -0.6825938566552963,
       "ending_balance": 0.53559411,
       "status": "market_sell"
+    },
+    {
+      "symbol": "KAVAUSDT",
+      "base": "KAVA",
+      "trade_id": 100274984,
+      "opened_at": 1789311443,
+      "closed_at": 1789312727,
+      "buy_price": 0.06965,
+      "sell_price": 0.06711,
+      "qty": 157.7,
+      "cost_usdt": 10.983805,
+      "pnl": -0.4005580000000002,
+      "pnl_pct": -3.646805455850684,
+      "ending_balance": 0.53559411,
+      "status": "market_sell"
     }
   ],
   "all_time_stats": {
-    "total_trades": 12,
+    "total_trades": 13,
     "winning_trades": 7,
-    "total_pnl": -1.2889587999999925
+    "total_pnl": -1.6895167999999927
   },
   "signals_history": [],
   "sent_alerts": {},
