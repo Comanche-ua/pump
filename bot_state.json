@@ -143,12 +143,42 @@
       "pnl_pct": 1.0504201680672267,
       "ending_balance": 0.53559411,
       "status": "tp_filled"
+    },
+    {
+      "symbol": "FETUSDT",
+      "base": "FET",
+      "trade_id": 281218184,
+      "opened_at": 1789320667,
+      "closed_at": 1789331923,
+      "buy_price": 0.1729,
+      "sell_price": 0.1723,
+      "qty": 30.5,
+      "cost_usdt": 5.2734499999999995,
+      "pnl": -0.018299999999999095,
+      "pnl_pct": -0.34702139965296147,
+      "ending_balance": 0.53559411,
+      "status": "market_sell"
+    },
+    {
+      "symbol": "FETUSDT",
+      "base": "FET",
+      "trade_id": 281218185,
+      "opened_at": 1789320667,
+      "closed_at": 1789331923,
+      "buy_price": 0.1729,
+      "sell_price": 0.1722,
+      "qty": 33.0,
+      "cost_usdt": 5.7057,
+      "pnl": -0.023100000000000342,
+      "pnl_pct": -0.4048582995951477,
+      "ending_balance": 0.53559411,
+      "status": "market_sell"
     }
   ],
   "all_time_stats": {
-    "total_trades": 6,
+    "total_trades": 8,
     "winning_trades": 6,
-    "total_pnl": 1.2145911999999939
+    "total_pnl": 1.1731911999999944
   },
   "signals_history": [],
   "sent_alerts": {},
